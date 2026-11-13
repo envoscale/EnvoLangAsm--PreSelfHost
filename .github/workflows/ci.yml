@@ -99,4 +99,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" build/seed-release/* \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes "Seed compilers for EnvoScale, built from assembly by this tag's CI run on Linux and Windows (byte-identical on both). EnvoScale commit: $(cat envoscale.ref)"
+            --notes "Seed compilers for EnvoLang, built from assembly by this tag's CI run on Linux and Windows (byte-identical on both). EnvoLang commit: $(cat envolang.ref)"

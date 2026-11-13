@@ -1,13 +1,13 @@
-# Stage 0 — `envoc0`
+# Stage 0: `envoc0`
 
 > **Status:** In progress (M1). `envoc0 build` compiles Envo-Core programs to working
 > x86-64 executables for Windows and Linux; lexer, parser, checker, code generator and
 > writers are all tested. What remains of M1 is a broader Envo-Core test suite.
 > See [the README](../README.md) for how it is tested.
 
-`envoc0` compiles **Envo-Core** ([Envo-Core](https://github.com/envoscale/EnvoScale/blob/main/docs/spec/envo-core.md))
+`envoc0` compiles **Envo-Core** ([Envo-Core](https://github.com/envoscale/EnvoLang/blob/main/spec/envo-core.md))
 to x86-64 executables for Windows (PE) and Linux (ELF). It is written in `.eas`
-([`docs/eas.md`](../docs/eas.md)), a strict subset of NASM syntax, and has
+([`docs/eas.md`](https://github.com/envoscale/EnvoScale/blob/main/bootstrap/eas.md)), a strict subset of NASM syntax, and has
 no dependencies beyond the OS.
 
 Goal: **correct, small and auditable, not fast.** Target: under ~15k lines of
@@ -51,7 +51,7 @@ From the repository root:
 | `platform/runtime-abi.eas` | The interface between compiled code and the runtime blocks |
 
 How it fits together, and why it is built this way:
-[`docs/bootstrap.md`](../docs/bootstrap.md).
+[`docs/bootstrap.md`](https://github.com/envoscale/EnvoScale/blob/main/bootstrap/bootstrap.md).
 
 ## Usage (today)
 

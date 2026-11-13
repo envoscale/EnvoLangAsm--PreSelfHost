@@ -1,10 +1,10 @@
-# Stage S — the hex seed
+# Stage S: the hex seed
 
 > **Status:** Done (M13, PLAN D67). Checked in CI on every push.
 
 The seed lets EnvoScale be built from nothing but the operating system: no NASM, no
 other compiler. It is **asm0**, an assembler for the Stage 0 subset of EAS
-([`docs/eas.md`](../docs/eas.md)), written down as commented hexadecimal:
+([`docs/eas.md`](https://github.com/envoscale/EnvoScale/blob/main/bootstrap/eas.md)), written down as commented hexadecimal:
 
 | File | What it is |
 |---|---|

@@ -310,7 +310,7 @@ u32 ParseFunction(*Parser p) {
     PExpect(p, TK_LPAREN);
     while (PKind(p) != TK_RPAREN) {
         u16 k = PKind(p);
-        // parameter modes and receivers are full Envol
+        // parameter modes and receivers are full EnvoL
         if (k == TK_KW_IN || k == TK_KW_REF || k == TK_KW_OUT || k == TK_KW_THIS) PErrNotCore(p, "", PPos(p));
         u32 ptype = ParseDeclType(p);
         u32 param = NodeNew(p, NK_PARAM, PExpect(p, TK_IDENT));
@@ -470,7 +470,7 @@ u32 ParseType(*Parser p) {
     return t;
 }
 
-// A Type in a declaration, where full Envol could continue with '?' or '<'.
+// A Type in a declaration, where full EnvoL could continue with '?' or '<'.
 u32 ParseDeclType(*Parser p) {
     u32 t = ParseType(p);
     bool core;
@@ -882,7 +882,7 @@ u32 ParsePrimary(*Parser p) {
     }
     if (k == TK_FLOAT) PErrNotCore(p, "floating-point literals", PPos(p));
     if (k == TK_LBRACKET) PErrNotCore(p, "array literals", PPos(p));
-    // [core.syntax.5] a keyword only full Envol has
+    // [core.syntax.5] a keyword only full EnvoL has
     if (k >= TK_KW_FIRST && k <= TK_KW_LAST && TokClass(k) & TC_CORE_KW == 0) PErrNotCore(p, "", PPos(p));
     PErrExpected(p, "an expression");
     return 0;

@@ -43,21 +43,21 @@ request.
 
 The identifier LicenseRef-EnvoScale-Commercial refers to that agreement; see
 LICENSES/LicenseRef-EnvoScale-Commercial.md. The licensing page,
-https://github.com/envoscale/EnvoScale/blob/main/docs/legal/licensing.md, explains in plain words who needs which license and how to obtain one.
+https://github.com/envoscale/EnvoScale/blob/main/legal/licensing.md, explains in plain words who needs which license and how to obtain one.
 
 
 3. Trademarks
 -------------
 
 Neither license grants rights to the EnvoScale name or logos, except as the trademark policy,
-https://github.com/envoscale/EnvoScale/blob/main/docs/legal/trademarks.md, allows.
+https://github.com/envoscale/EnvoScale/blob/main/legal/trademarks.md, allows.
 
 
 4. Contributions
 ----------------
 
 Contributions are accepted only under the Contributor License Agreement at
-https://github.com/envoscale/EnvoScale/blob/main/docs/legal/cla.md, which lets the licensor offer contributed work under both licenses
+https://github.com/envoscale/EnvoScale/blob/main/legal/cla.md, which lets the licensor offer contributed work under both licenses
 above.
 
 

@@ -12,8 +12,8 @@ POSIX twin; keep the two in step.
   .\bootstrap.ps1 check       every jump in the .eas sources states its size
   .\bootstrap.ps1 clean
 
-The compiler's sources come from EnvoScale at the commit in envoscale.ref: from
-$env:ENVOSCALE if set, else .\envoscale, cloned on first use (needs git).
+The compiler's sources come from EnvoLang at the commit in envolang.ref: from
+$env:ENVOLANG if set, else .\envolang, cloned on first use (needs git).
 #>
 param([string]$Command = 'help')
 
@@ -29,21 +29,21 @@ $Utf8 = New-Object System.Text.UTF8Encoding($false)
 function Say([string]$msg) { Write-Host $msg }
 function Fail([string]$msg) { [Console]::Error.WriteLine("error: $msg"); exit 1 }
 
-# The EnvoScale checkout the compiler is built from, at envoscale.ref.
-$Ref = (Get-Content -LiteralPath (Join-Path $Root 'envoscale.ref') -Raw).Trim()
-if ($env:ENVOSCALE) {
-    $Es = (Resolve-Path -LiteralPath $env:ENVOSCALE).Path
+# The EnvoLang checkout the compiler is built from, at envolang.ref.
+$Ref = (Get-Content -LiteralPath (Join-Path $Root 'envolang.ref') -Raw).Trim()
+if ($env:ENVOLANG) {
+    $Es = (Resolve-Path -LiteralPath $env:ENVOLANG).Path
 } else {
-    $Es = Join-Path $Root 'envoscale'
+    $Es = Join-Path $Root 'envolang'
     if (-not (Test-Path -LiteralPath (Join-Path $Es '.git'))) {
-        Say 'clone     https://github.com/envoscale/EnvoScale -> envoscale\'
-        & git clone -q https://github.com/envoscale/EnvoScale $Es
-        if ($LASTEXITCODE -ne 0) { Fail 'cloning EnvoScale failed' }
+        Say 'clone     https://github.com/envoscale/EnvoLang -> envolang\'
+        & git clone -q https://github.com/envoscale/EnvoLang $Es
+        if ($LASTEXITCODE -ne 0) { Fail 'cloning EnvoLang failed' }
     }
     if ((& git -C $Es rev-parse HEAD) -ne $Ref) {
         & git -C $Es fetch -q origin
         & git -C $Es -c advice.detachedHead=false checkout -q $Ref
-        if ($LASTEXITCODE -ne 0) { Fail "envoscale\: cannot check out $Ref" }
+        if ($LASTEXITCODE -ne 0) { Fail "envolang\: cannot check out $Ref" }
     }
 }
 $Stage2 = Join-Path $Es 'compiler'
@@ -103,7 +103,7 @@ function Invoke-Build {
     $files = @(Get-Content -LiteralPath (Join-Path $Stage2 'files.txt') | Where-Object { $_.Trim() -ne '' })
     foreach ($u in @(@{ Target = 'x86_64-windows'; Out = 'envoc.exe' }, @{ Target = 'x86_64-linux'; Out = 'envoc' })) {
         $out = Join-Path $Build2 $u.Out
-        Say "build     envoscale/compiler -> build/stage2/$($u.Out)"
+        Say "build     envolang/compiler -> build/stage2/$($u.Out)"
         $r = Invoke-Tool $envoc1 (@('build') + $files + @('-o', $out, '--target', $u.Target)) $Stage2
         if ($r.Code -ne 0) { Fail "building Stage 2 ($($u.Target)) failed: $($r.Err.Trim())" }
         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $out).Hash.ToLowerInvariant()
@@ -669,7 +669,7 @@ function Invoke-Test {
 function Invoke-Check {
     $problems = New-Object System.Collections.Generic.List[string]
     # docs/eas.md: every jump states its size, so the bytes depend on the source alone.
-    foreach ($f in Get-ChildItem -LiteralPath (Join-Path $Root '.') -Recurse -Filter '*.eas' | Where-Object { $_.FullName -notmatch '\\(build|envoscale)\\' }) {
+    foreach ($f in Get-ChildItem -LiteralPath (Join-Path $Root '.') -Recurse -Filter '*.eas' | Where-Object { $_.FullName -notmatch '\\(build|envolang)\\' }) {
         $hits = Select-String -LiteralPath $f.FullName -CaseSensitive -Pattern '^\s*j[a-z]+\s+[.A-Za-z_]' |
             Where-Object { $_.Line -notmatch '^\s*j[a-z]+\s+((short|near)\s|r[a-z0-9]+\s*(;|$))' }
         foreach ($h in $hits) { $problems.Add("jump without short/near: $($f.FullName.Substring($Root.Length + 1)):$($h.LineNumber)") }

@@ -1,11 +1,11 @@
-# Stage 1 — `envoc1`
+# Stage 1: `envoc1`
 
 > **Status:** Support library (M2.2), lexer (M2.3), parser (M2.4), Envo-Core checker
 > (M2.5), EIR v1 (M2.6) and code generation (M2.7) done: `envoc1` compiles every Envo-Core
 > test program with the same results as `envoc0`. Generics and interfaces are next (M2.8). The
-> plan, increments and decisions D11–D15 are in [EnvoScale's plan](https://github.com/envoscale/EnvoScale/blob/main/docs/PLAN.md). It
-> accepts [Envo-S1](https://github.com/envoscale/EnvoScale/blob/main/docs/spec/envo-s1.md) and compiles through
-> [EIR v1](https://github.com/envoscale/EnvoScale/blob/main/docs/spec/eir.md).
+> plan, increments and decisions D11–D15 are in [EnvoScale's plan](https://github.com/envoscale/EnvoScale/blob/main/project/plan.md). It
+> accepts [Envo-S1](https://github.com/envoscale/EnvoLang/blob/main/spec/envo-s1.md) and compiles through
+> [EIR v1](https://github.com/envoscale/EnvoLang/blob/main/spec/eir.md).
 
 A fuller compiler written in Envo-Core and built by `envoc0`. It adds generics, interfaces, closures, a basic borrow checker and EIR, which is enough to compile the real compiler in `compiler/`. It stays buildable forever as part of the diverse double-compiling trust check.
 

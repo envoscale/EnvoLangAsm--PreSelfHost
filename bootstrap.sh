@@ -12,8 +12,8 @@
 #   ./bootstrap.sh check       every jump in the .eas sources states its size
 #   ./bootstrap.sh clean
 #
-# The compiler's sources come from EnvoScale at the commit in envoscale.ref: from
-# $ENVOSCALE if set, else ./envoscale, cloned on first use.
+# The compiler's sources come from EnvoLang at the commit in envolang.ref: from
+# $ENVOLANG if set, else ./envolang, cloned on first use.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -26,25 +26,25 @@ STAGE1="$ROOT/stage1"
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# envoscale: the EnvoScale checkout the compiler is built from, at envoscale.ref.
-envoscale() {
-    ref=$(tr -d '\r\n ' < "$ROOT/envoscale.ref")
-    if [ -n "${ENVOSCALE:-}" ]; then
-        ES=$(cd "$ENVOSCALE" && pwd)
+# envolang: the EnvoLang checkout the compiler is built from, at envolang.ref.
+envolang() {
+    ref=$(tr -d '\r\n ' < "$ROOT/envolang.ref")
+    if [ -n "${ENVOLANG:-}" ]; then
+        ES=$(cd "$ENVOLANG" && pwd)
     else
-        ES="$ROOT/envoscale"
+        ES="$ROOT/envolang"
         if [ ! -d "$ES/.git" ]; then
-            say "clone     https://github.com/envoscale/EnvoScale -> envoscale/"
-            git clone -q https://github.com/envoscale/EnvoScale "$ES" || fail 'cloning EnvoScale failed'
+            say "clone     https://github.com/envoscale/EnvoLang -> envolang/"
+            git clone -q https://github.com/envoscale/EnvoLang "$ES" || fail 'cloning EnvoLang failed'
         fi
         if [ "$(git -C "$ES" rev-parse HEAD)" != "$ref" ]; then
             git -C "$ES" fetch -q origin || true
-            git -C "$ES" -c advice.detachedHead=false checkout -q "$ref" || fail "envoscale/: cannot check out $ref"
+            git -C "$ES" -c advice.detachedHead=false checkout -q "$ref" || fail "envolang/: cannot check out $ref"
         fi
     fi
     STAGE2="$ES/compiler"
 }
-envoscale
+envolang
 
 sha256() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
@@ -128,7 +128,7 @@ do_build() {
     for unit in "x86_64-linux:envoc" "x86_64-windows:envoc.exe"; do
         target=${unit%%:*}
         out=${unit#*:}
-        say "build     envoscale/compiler -> build/stage2/$out"
+        say "build     envolang/compiler -> build/stage2/$out"
         (cd "$STAGE2" && "$envoc1" build "$@" -o "$BUILD2/$out" --target "$target") \
             || fail "building Stage 2 ($target) failed"
         size=$(wc -c < "$BUILD2/$out" | tr -d ' ')
