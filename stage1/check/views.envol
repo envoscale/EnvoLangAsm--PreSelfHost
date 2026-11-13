@@ -1,4 +1,4 @@
-// Envo-S1 views and slicing (RFC 0002, RFC 0004 [view.*]; docs/architecture/stage1.md,
+// Envo-S1 views and slicing (RFC 0002, RFC 0004 [view.*]; EnvoScale/bootstrap/stage1.md,
 // "Views"): `T[]` is a shared view and `mut T[]` an exclusive one, both { ptr, len };
 // `a[lo..hi]` makes a view of an array, a view or a `str`.
 

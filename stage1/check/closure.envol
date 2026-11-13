@@ -1,4 +1,4 @@
-// Envo-S1 function types, lambdas and function values (RFC 0003; docs/architecture/
+// Envo-S1 function types, lambdas and function values (RFC 0003; EnvoScale/architecture/
 // stage1.md, "Closures"). Stage 1 represents every function-typed value the same way, as a
 // function value { code, env } ([fn.abi.2]); a lambda passed straight to a function-typed
 // parameter borrows its captures ([fn.pos.1], [fn.cap.1]), any other lambda copies them

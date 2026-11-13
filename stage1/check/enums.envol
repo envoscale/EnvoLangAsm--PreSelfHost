@@ -1,5 +1,5 @@
 // Envo-S1 enums with payloads and `match` with payload patterns ([item.enum.1]–[item.enum.3],
-// [s1.expr.1]; docs/architecture/stage1.md, "Enums"). An enum with a payload on any variant,
+// [s1.expr.1]; EnvoScale/bootstrap/stage1.md, "Enums"). An enum with a payload on any variant,
 // or with type parameters, is a tagged value (TYK_UNION): a u32 tag (the variant's index),
 // then the payload of the variant it holds, laid out like a struct of its fields. Fieldless
 // enums stay integers, exactly as in Envo-Core.

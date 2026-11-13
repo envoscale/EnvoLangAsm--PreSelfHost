@@ -1,4 +1,4 @@
-// Envo-S1 generics, methods and interfaces (docs/architecture/stage1.md, "Generics and
+// Envo-S1 generics, methods and interfaces (EnvoScale/bootstrap/stage1.md, "Generics and
 // methods"): type parameters and generic instances, substitution and inference, method
 // tables, interface implementations, and the instantiation pass that lists every function
 // body to compile with its type arguments (monomorphization, PLAN D13).

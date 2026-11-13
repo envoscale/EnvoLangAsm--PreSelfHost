@@ -1,4 +1,4 @@
-// Envo-S1 namespaces, `use` and visibility ([s1.item.1], [s1.item.2]; docs/architecture/
+// Envo-S1 namespaces, `use` and visibility ([s1.item.1], [s1.item.2]; EnvoScale/architecture/
 // stage1.md, "Namespaces"). A file may start with `namespace a.b;`; its items are then
 // `a.b.X` in program scope. All files still form one program. An unqualified name is
 // looked up in the file's namespace and the namespaces around it, then in what the file

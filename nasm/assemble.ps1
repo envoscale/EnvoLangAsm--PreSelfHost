@@ -28,7 +28,7 @@ if (-not $nasm) {
 
 # NASM requires the include prefix to end with a path separator.
 $inc = $IncludeDir.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-# In EAS a `near` jump is always rel32 (docs/spec/eas.md). NASM 3.01 treats `near` as a
+# In EAS a `near` jump is always rel32 (EnvoLang/spec/eas.md). NASM 3.01 treats `near` as a
 # hint and shortens jumps that fit in rel8; "strict near" keeps the EAS meaning in every
 # NASM version, and leaves the bytes of versions that already honour `near` unchanged.
 & $nasm -f bin -w+all '-dnear=strict near' -I $inc -o $OutputFile $InputFile

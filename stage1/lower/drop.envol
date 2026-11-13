@@ -1,4 +1,4 @@
-// Lowering drops ([own.drop.1], [s1.own.2]; docs/architecture/stage1.md, "Ownership").
+// Lowering drops ([own.drop.1], [s1.own.2]; EnvoScale/bootstrap/stage1.md, "Ownership").
 // A local whose type needs a drop (it, or a field, implements `IDrop`) gets a drop flag,
 // set when it is initialized and cleared where the move checker marked a move (NMove 1).
 // At each scope exit (the end of a block, `break`, `continue`, `return`, the end of the

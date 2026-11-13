@@ -1,4 +1,4 @@
-// Lowering tagged enums and Envo-S1 `match` (docs/architecture/stage1.md, "Enums"). A tagged
+// Lowering tagged enums and Envo-S1 `match` (EnvoScale/bootstrap/stage1.md, "Enums"). A tagged
 // enum is the EIR struct { u32 tag, [K x word] } (word: the largest payload alignment);
 // variant V's payload is the struct of its fields, laid over the words.
 

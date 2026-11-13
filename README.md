@@ -65,4 +65,4 @@ compare against `SHA256SUMS`.
 
 ## License
 
-Same as EnvoScale: see [LICENSE](LICENSE).
+Same as EnvoLang: see [LICENSE](LICENSE).

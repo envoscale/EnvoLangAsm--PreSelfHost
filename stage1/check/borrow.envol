@@ -1,4 +1,4 @@
-// Basic borrow checking ([own.borrow.*], [s1.own.3], RFC 0004; docs/architecture/
+// Basic borrow checking ([own.borrow.*], [s1.own.3], RFC 0004; EnvoScale/architecture/
 // stage1.md, "Ownership"). Stage 1 checks borrows that a call creates for its own duration,
 // and keeps borrowed closures from escaping:
 //

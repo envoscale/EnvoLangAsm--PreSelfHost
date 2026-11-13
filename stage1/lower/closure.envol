@@ -1,4 +1,4 @@
-// Lowering function types and lambdas (RFC 0003, docs/architecture/stage1.md, "Closures").
+// Lowering function types and lambdas (RFC 0003, EnvoScale/bootstrap/stage1.md, "Closures").
 // A function value is $fnv = { code: ptr, env: ptr } ([fn.abi.2]). Code takes the
 // hidden result pointer (for an aggregate result), then env, then the parameters. A lambda
 // becomes a function of its own; its environment is a struct of its captures: pointers to

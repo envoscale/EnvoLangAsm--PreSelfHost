@@ -1,4 +1,4 @@
-// The x86-64 backend (docs/architecture/stage1.md): every SSA value lives in its own rbp
+// The x86-64 backend (EnvoScale/bootstrap/stage1.md): every SSA value lives in its own rbp
 // slot; each instruction loads its operands into fixed registers, computes and stores
 // its result. Values are kept canonical (sign- or zero-extended to 64 bits), so overflow
 // checks are the CPU flags for 64-bit types and "does it survive re-normalization" for

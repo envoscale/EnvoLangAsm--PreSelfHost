@@ -1,4 +1,4 @@
-// Lowering: the checked Envo-Core tree to EIR (docs/architecture/stage1.md). Every local
+// Lowering: the checked Envo-Core tree to EIR (EnvoScale/bootstrap/stage1.md). Every local
 // lives in a slot; scalar expressions become values; aggregates (str, slices, arrays,
 // structs) are handled by address. Checks are EIR's checked instructions, so programs
 // panic where Stage 0's do, with the same reasons.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# EnvoScaleAsm: builds the Envol compiler up from assembly, for Linux and Windows
+# EnvoScaleAsm: builds the EnvoL compiler up from assembly, for Linux and Windows
 # (Git Bash). bootstrap.ps1 is the Windows PowerShell twin; keep the two in step.
 #
 #   ./bootstrap.sh build       stage 0 from assembly (NASM, or the hex seed without it),
@@ -57,7 +57,7 @@ host_suffix() {
     case "$(uname -s)" in
         Linux) printf '' ;;
         MINGW*|MSYS*|CYGWIN*) printf '.exe' ;;
-        *) fail "no native Stage 0 for $(uname -s) yet (supported: Linux, Windows); see docs/porting/CHECKLIST.md" ;;
+        *) fail "no native Stage 0 for $(uname -s) yet (supported: Linux, Windows); see EnvoScale/porting/CHECKLIST.md" ;;
     esac
 }
 
@@ -691,7 +691,7 @@ do_test() {
 # ------------------------------------------------------------------- check
 do_check() {
     # docs/eas.md: every jump states its size, so the bytes depend on the source alone.
-    # docs/spec/eas.md: every jump states its size, so the bytes depend on the source alone.
+    # EnvoLang/spec/eas.md: every jump states its size, so the bytes depend on the source alone.
     unsized=$(find "$ROOT/seed" "$ROOT/stage0" -name '*.eas' -exec grep -n -E '^[[:space:]]*j[a-z]+[[:space:]]+[.A-Za-z_]' /dev/null {} + \
         | grep -v -E ':[[:space:]]*j[a-z]+[[:space:]]+((short|near)[[:space:]]|r[a-z0-9]+[[:space:]]*(;|$))' || true)
     [ -z "$unsized" ] || problem "jumps without short/near: $unsized"
@@ -737,7 +737,7 @@ do_compare() {
     files='stage0/envoc0 stage0/envoc0.exe stage1/envoc1 stage1/envoc1.exe stage2/envoc stage2/envoc.exe'
     # after `fixedpoint`, the fixed-point compilers too
     [ -d "$1/stage2c" ] && files="$files stage2c/envoc stage2c/envoc.exe"
-    # after `dist`, the release archive's digest (docs/guides/offline-install.md)
+    # after `dist`, the release archive's digest (EnvoScale/guides/offline-install.md)
     [ -f "$1/dist/SHA256SUMS" ] && files="$files dist/SHA256SUMS"
     for f in $files; do
         [ -f "$1/$f" ] || fail "missing $1/$f"

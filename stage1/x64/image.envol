@@ -2,7 +2,7 @@
 // execute, the data read and write (W^X), loaded at an address the system chooses (ASLR):
 // Linux programs are position-independent (ET_DYN) and relocate their few absolute
 // addresses themselves (RelocStub); Windows programs carry base relocations. Stage 0's
-// own executables keep one read-write-execute section (docs/architecture/bootstrap.md). Windows images import from
+// own executables keep one read-write-execute section (EnvoScale/bootstrap/bootstrap.md). Windows images import from
 // KERNEL32.dll and ADVAPI32.dll; the runtime and the native adapters reach import k
 // through `wincall`, where k is the import's slot in the address table: KERNEL32's
 // functions are 0-27, slot 28 ends them, ADVAPI32's SystemFunction036 (RtlGenRandom) is

@@ -1,4 +1,4 @@
-// Envo-S1 ownership (chapter 5, [s1.own.*]; docs/architecture/stage1.md, "Ownership"):
+// Envo-S1 ownership (chapter 5, [s1.own.*]; EnvoScale/bootstrap/stage1.md, "Ownership"):
 // which types are `Copy`, which need a drop, and the move checker.
 
 // Is node n an item of the S1 prelude?

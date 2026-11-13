@@ -525,7 +525,7 @@ void InitScope(*Checker c) {
     bool runtime;
     unsafe { runtime = c.Runtime; }
     if (runtime) {
-        // target intrinsics for the runtime's OS layer (docs/architecture/stage1.md)
+        // target intrinsics for the runtime's OS layer (EnvoScale/bootstrap/stage1.md)
         AddBuiltinN(c, "__syscall", B_SYSCALL, T_I64, 7, T_I64);
         AddBuiltinN(c, "__wincall", B_WINCALL, T_I64, 11, T_I64);     // import slot and up to 10 arguments
         AddBuiltinN(c, "__wincall12", B_WINCALL, T_I64, 13, T_I64);   // import slot and 12 arguments

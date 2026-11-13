@@ -1,5 +1,5 @@
 <#
-EnvoScaleAsm: builds the Envol compiler up from assembly, on Windows with only what
+EnvoScaleAsm: builds the EnvoL compiler up from assembly, on Windows with only what
 Windows ships (PowerShell 5.1 or 7), plus NASM if it is installed. bootstrap.sh is the
 POSIX twin; keep the two in step.
 

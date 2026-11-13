@@ -1,4 +1,4 @@
-// The move checker ([own.move.2], [own.move.3], [s1.own.1]; docs/architecture/stage1.md,
+// The move checker ([own.move.2], [own.move.3], [s1.own.1]; EnvoScale/bootstrap/stage1.md,
 // "Ownership"). It runs over each function body after the body is type-checked, following
 // the structured control flow with one state per tracked place: a local that is not
 // `Copy`, or one field of such a local (a partial move). Where branches meet, a place moved
