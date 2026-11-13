@@ -1,0 +1,63 @@
+// Operations on str. A str is a pointer and a length into memory that is never freed
+// (string literals, source files and the arena), so views stay valid for the whole run.
+
+bool StrEq(str a, str b) {
+    if (a.Len != b.Len) return false;
+    unsafe { return MemEqual(a.Ptr, b.Ptr, a.Len); }
+}
+
+bool StrStartsWith(str s, str prefix) {
+    if (prefix.Len > s.Len) return false;
+    unsafe { return MemEqual(s.Ptr, prefix.Ptr, prefix.Len); }
+}
+
+bool StrEndsWith(str s, str suffix) {
+    if (suffix.Len > s.Len) return false;
+    unsafe { return MemEqual(&s.Ptr[s.Len - suffix.Len], suffix.Ptr, suffix.Len); }
+}
+
+// The bytes lo..hi of s. Panics if the range is out of bounds; the caller keeps the
+// cut on a character boundary.
+str StrSub(str s, usize lo, usize hi) {
+    if (lo > hi || hi > s.Len) panic("StrSub: index out of bounds");
+    unsafe { return str_from(&s.Ptr[lo], hi - lo); }
+}
+
+// The first index of byte c in s at or after from, or s.Len if there is none.
+usize StrFind(str s, u8 c, usize from) {
+    usize i = from;
+    while (i < s.Len) {
+        if (s[i] == c) return i;
+        i++;
+    }
+    return s.Len;
+}
+
+// A copy of s in new memory.
+str StrDup(str s) {
+    unsafe { return str_from(MemDup(s.Ptr, s.Len), s.Len); }
+}
+
+// FNV-1a, 64-bit.
+u64 StrHash(str s) {
+    u64 h = 14695981039346656037;
+    for (usize i = 0; i < s.Len; i++) {
+        h = (h ^ s[i] as u64) *% 1099511628211;
+    }
+    return h;
+}
+
+// Parses a decimal u64. Returns false on an empty string, a non-digit or overflow.
+bool StrToU64(str s, *u64 result) {
+    if (s.Len == 0) return false;
+    u64 v = 0;
+    for (usize i = 0; i < s.Len; i++) {
+        u8 c = s[i];
+        if (c < '0' || c > '9') return false;
+        u64 d = (c - '0') as u64;
+        if (v > (18446744073709551615 - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    unsafe { *result = v; }
+    return true;
+}

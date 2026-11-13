@@ -1,0 +1,818 @@
+; =============================================================================
+; platform/windows.eas - the Windows runtime block
+;
+; Position-independent code and data between rtw_begin and rtw_end: the process
+; entry, the eight shim routines (rtw_sys_open ... rtw_sys_args) over kernel32,
+; command-line splitting, the KERNEL32 import table, and the built-ins of
+; envo-core.md section 6. envoc0 runs this block itself on Windows, and
+; `envoc0 build --target x86_64-windows` copies its bytes into every program it
+; produces (src/writer.eas patches the import RVAs and the call to main).
+; Every reference inside the block is RIP-relative to the block, so it works at
+; any address. The block starts with a table of 5-byte jumps (see RT_ENTRY_*).
+;
+; Calling convention: shim routines use the System V register order and convert
+; to Win64 at each kernel32 call (realign the stack, 32 bytes of shadow space,
+; arguments in rcx, rdx, r8, r9, then the stack). Win64 callees preserve rbx,
+; rbp, rdi, rsi, r12-r15, a superset of what our convention requires.
+; =============================================================================
+
+STD_INPUT_HANDLE  equ -10
+STD_OUTPUT_HANDLE equ -11
+STD_ERROR_HANDLE  equ -12
+ERROR_BROKEN_PIPE equ 109
+CP_UTF8           equ 65001
+MB_ERR_INVALID_CHARS equ 8
+WPATH_CHARS       equ 32768             ; longest path, in UTF-16 units (the NTFS limit)
+
+rtw_begin:
+        jmp     near rtw_start          ; 0  RT_ENTRY_START (the process entry point)
+        jmp     near rtw_bi_print       ; 1  print
+        jmp     near rtw_bi_write       ; 2  write
+        jmp     near rtw_bi_read        ; 3  read
+        jmp     near rtw_bi_open        ; 4  open
+        jmp     near rtw_bi_close       ; 5  close
+        jmp     near rtw_bi_alloc       ; 6  alloc
+        jmp     near rtw_bi_exit        ; 7  exit
+        jmp     near rtw_bi_argc        ; 8  argc
+        jmp     near rtw_bi_arg         ; 9  arg
+        jmp     near rtw_bi_panic       ; 10 panic
+        jmp     near rtw_bi_str_from    ; 11 str_from
+        jmp     near rtw_trap           ; 12 RT_ENTRY_TRAP
+; ---------------------------------------------------------------- entry
+; Windows enters with rsp = 8 (mod 16), as if called. Reserve shadow space and
+; realign in one step; from here on rsp is aligned at every call.
+rtw_start:
+        sub     rsp, 40
+        mov     ecx, STD_INPUT_HANDLE
+        call    [__imp_GetStdHandle]
+        mov     [win_std], rax
+        mov     ecx, STD_OUTPUT_HANDLE
+        call    [__imp_GetStdHandle]
+        mov     [win_std + 8], rax
+        mov     ecx, STD_ERROR_HANDLE
+        call    [__imp_GetStdHandle]
+        mov     [win_std + 16], rax
+        ; Scratch buffer for UTF-16 paths in rtw_sys_open. Allocated once, so rtw_sys_open
+        ; needs no large stack frame (which would need stack probing on Windows).
+        mov     edi, WPATH_CHARS * 2
+        call    rtw_sys_alloc
+        test    rax, rax
+        jz      short .oom
+        mov     [win_wpath], rax
+        call    win_build_argv
+        call    main                    ; patched by src/writer.eas in output programs
+.after_main_call:                       ; src/writer.eas: the rel32 ends here
+        mov     edi, eax
+        call    rtw_sys_exit
+.oom:
+        mov     edi, 70
+        call    rtw_sys_exit
+
+; win_handle - map an fd to a HANDLE.
+;   in:  rdi = fd (0, 1, 2 = standard handles; anything else is a HANDLE value)
+;   out: rcx = HANDLE.  clobbers: rax
+win_handle:
+        mov     rcx, rdi
+        cmp     rdi, 3
+        jae     short .done
+        lea     rax, [win_std]
+        mov     rcx, [rax + rdi*8]
+.done:
+        ret
+
+; ---------------------------------------------------------------- shim
+; rtw_sys_open - open a file.
+;   in:  rdi = NUL-terminated UTF-8 path, rsi = mode
+;        (0 = read, 1 = write/create/truncate, 2 = same as 1 on Windows)
+;   out: rax = fd (a HANDLE), or -1 on failure (including a path that is not
+;        valid UTF-8 or is longer than WPATH_CHARS UTF-16 units)
+; Paths are UTF-8 on every OS; here they become UTF-16 for CreateFileW.
+rtw_sys_open:
+        push    rbp
+        mov     rbp, rsp
+        push    rbx
+        and     rsp, -16
+        sub     rsp, 64                 ; shadow space + stack arguments, aligned
+        mov     rbx, rsi                ; mode
+        mov     ecx, CP_UTF8            ; CodePage
+        mov     edx, MB_ERR_INVALID_CHARS ; dwFlags: reject invalid UTF-8
+        mov     r8, rdi                 ; lpMultiByteStr
+        mov     r9d, -1                 ; cbMultiByte: NUL-terminated
+        mov     rax, [win_wpath]
+        mov     [rsp + 32], rax         ; lpWideCharStr
+        mov     qword [rsp + 40], WPATH_CHARS ; cchWideChar
+        call    [__imp_MultiByteToWideChar]
+        test    eax, eax
+        jz      short .fail
+        mov     rcx, [win_wpath]        ; lpFileName
+        mov     edx, 0x80000000         ; dwDesiredAccess: GENERIC_READ
+        mov     r8d, 1                  ; dwShareMode: FILE_SHARE_READ
+        mov     eax, 3                  ; dwCreationDisposition: OPEN_EXISTING
+        test    rbx, rbx
+        jz      short .go
+        mov     edx, 0x40000000         ; GENERIC_WRITE
+        xor     r8d, r8d                ; no sharing while we write
+        mov     eax, 2                  ; CREATE_ALWAYS
+.go:
+        xor     r9d, r9d                ; lpSecurityAttributes = NULL
+        mov     [rsp + 32], rax         ; dwCreationDisposition
+        mov     qword [rsp + 40], 0x80  ; dwFlagsAndAttributes: FILE_ATTRIBUTE_NORMAL
+        mov     qword [rsp + 48], 0     ; hTemplateFile = NULL
+        call    [__imp_CreateFileW]
+        ; INVALID_HANDLE_VALUE is -1, which is already our error value.
+        jmp     short .out
+.fail:
+        mov     rax, -1
+.out:
+        lea     rsp, [rbp - 8]
+        pop     rbx
+        pop     rbp
+        ret
+
+; rtw_sys_read - read up to rdx bytes.
+;   in:  rdi = fd, rsi = buffer, rdx = length
+;   out: rax = bytes read (0 at end of file or broken pipe), or -1 on error
+rtw_sys_read:
+        push    rbp
+        mov     rbp, rsp
+        and     rsp, -16
+        sub     rsp, 64
+        call    win_handle              ; rcx = HANDLE
+        mov     r8, rdx                 ; nNumberOfBytesToRead (a DWORD)
+        mov     eax, 0x40000000
+        cmp     r8, rax
+        cmova   r8, rax                 ; at most 1 GiB per call; callers loop
+        mov     rdx, rsi                ; lpBuffer
+        lea     r9, [rsp + 48]          ; lpNumberOfBytesRead
+        mov     qword [r9], 0
+        mov     qword [rsp + 32], 0     ; lpOverlapped = NULL
+        call    [__imp_ReadFile]
+        test    eax, eax
+        jz      short .fail
+        mov     eax, [rsp + 48]         ; DWORD count, zero-extended
+        jmp     short .out
+.fail:
+        call    [__imp_GetLastError]
+        cmp     eax, ERROR_BROKEN_PIPE  ; writer closed the pipe: that is end of file
+        mov     eax, 0
+        je      short .out
+        mov     rax, -1
+.out:
+        mov     rsp, rbp
+        pop     rbp
+        ret
+
+; rtw_sys_write - write up to rdx bytes (may write fewer; callers loop).
+;   in:  rdi = fd, rsi = buffer, rdx = length
+;   out: rax = bytes written, or -1 on error
+rtw_sys_write:
+        push    rbp
+        mov     rbp, rsp
+        and     rsp, -16
+        sub     rsp, 64
+        call    win_handle
+        mov     r8, rdx                 ; nNumberOfBytesToWrite
+        mov     eax, 0x40000000
+        cmp     r8, rax
+        cmova   r8, rax
+        mov     rdx, rsi                ; lpBuffer
+        lea     r9, [rsp + 48]          ; lpNumberOfBytesWritten
+        mov     qword [r9], 0
+        mov     qword [rsp + 32], 0     ; lpOverlapped = NULL
+        call    [__imp_WriteFile]
+        test    eax, eax
+        jz      short .fail
+        mov     eax, [rsp + 48]
+        jmp     short .out
+.fail:
+        mov     rax, -1
+.out:
+        mov     rsp, rbp
+        pop     rbp
+        ret
+
+; rtw_sys_close - close a file. fds 0-2 (standard handles) are left open.
+;   in:  rdi = fd
+;   out: rax = 0, or -1 on failure
+rtw_sys_close:
+        xor     eax, eax
+        cmp     rdi, 3
+        jb      short .done
+        push    rbp
+        mov     rbp, rsp
+        and     rsp, -16
+        sub     rsp, 32
+        mov     rcx, rdi
+        call    [__imp_CloseHandle]
+        mov     rsp, rbp
+        pop     rbp
+        test    eax, eax                ; BOOL: nonzero on success
+        mov     eax, 0
+        jnz     short .done
+        mov     rax, -1
+.done:
+        ret
+
+; rtw_sys_alloc - get zeroed, page-aligned memory.
+;   in:  rdi = size in bytes
+;   out: rax = pointer, or 0 on failure
+rtw_sys_alloc:
+        push    rbp
+        mov     rbp, rsp
+        and     rsp, -16
+        sub     rsp, 32
+        xor     ecx, ecx                ; lpAddress = NULL
+        mov     rdx, rdi                ; dwSize
+        mov     r8d, 0x3000             ; MEM_COMMIT | MEM_RESERVE
+        mov     r9d, 4                  ; PAGE_READWRITE
+        call    [__imp_VirtualAlloc]
+        mov     rsp, rbp
+        pop     rbp
+        ret
+
+; rtw_sys_free - release memory from rtw_sys_alloc.
+;   in:  rdi = pointer, rsi = size (unused: MEM_RELEASE frees the whole block)
+rtw_sys_free:
+        push    rbp
+        mov     rbp, rsp
+        and     rsp, -16
+        sub     rsp, 32
+        mov     rcx, rdi                ; lpAddress
+        xor     edx, edx                ; dwSize = 0, required for MEM_RELEASE
+        mov     r8d, 0x8000             ; MEM_RELEASE
+        call    [__imp_VirtualFree]
+        mov     rsp, rbp
+        pop     rbp
+        ret
+
+; rtw_sys_exit - terminate the process. Does not return.
+;   in:  rdi = exit code
+rtw_sys_exit:
+        and     rsp, -16
+        sub     rsp, 32
+        mov     ecx, edi
+        call    [__imp_ExitProcess]
+        ud2
+
+; rtw_sys_args - command-line arguments.
+;   out: rax = argc, rdx = argv (array of NUL-terminated strings, NULL-terminated)
+rtw_sys_args:
+        mov     rax, [win_argc]
+        mov     rdx, [win_argv]
+        ret
+
+; ---------------------------------------------------------------- argv
+; win_build_argv - split the command line into win_argc / win_argv, as UTF-8.
+;
+; GetCommandLineW() is converted to UTF-8 first, so arguments (and the paths in
+; them) are UTF-8 on every OS. Splitting works on the UTF-8 bytes: every byte
+; the rules below look at (space, tab, quote, backslash) is ASCII, and those
+; bytes never occur inside a multi-byte UTF-8 sequence.
+;
+; Follows the Microsoft C runtime rules, so programs see the same arguments a
+; C program would:
+;   - argv[0] (the program): if it starts with a quote, everything up to the next
+;     quote; otherwise everything up to a space or tab. No escapes.
+;   - other arguments are separated by spaces/tabs outside quotes;
+;   - 2n backslashes then a quote: n backslashes, and the quote toggles quoting;
+;   - 2n+1 backslashes then a quote: n backslashes and a literal quote;
+;   - backslashes not followed by a quote are literal;
+;   - inside quotes, "" is a literal quote and quoting continues.
+;
+; Memory: an argument's text is never longer than the command line, and there are
+; at most len+1 arguments, so (len + 2) pointers plus 2*len + 2 bytes of text is
+; always enough. We allocate 10*len + 32 bytes once.
+;
+; Registers: rbx = command-line cursor, r12 = length, r13 = argv array,
+;            r14 = text output cursor, r15 = argc, r8d = in-quotes flag.
+win_build_argv:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 64                 ; entry rsp = 8 (mod 16); 5 pushes + 64 realigns
+        call    [__imp_GetCommandLineW]
+        mov     r12, rax                ; UTF-16 command line
+        ; bytes needed = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL)
+        mov     ecx, CP_UTF8
+        xor     edx, edx
+        mov     r8, r12
+        mov     r9d, -1
+        mov     qword [rsp + 32], 0
+        mov     qword [rsp + 40], 0
+        mov     qword [rsp + 48], 0
+        mov     qword [rsp + 56], 0
+        call    [__imp_WideCharToMultiByte]
+        test    eax, eax
+        jz      near .oom
+        mov     r13d, eax               ; size in bytes, including the NUL
+        mov     edi, eax
+        call    rtw_sys_alloc
+        test    rax, rax
+        jz      near .oom
+        mov     rbx, rax                ; UTF-8 command line
+        mov     ecx, CP_UTF8
+        xor     edx, edx
+        mov     r8, r12
+        mov     r9d, -1
+        mov     [rsp + 32], rbx         ; lpMultiByteStr
+        mov     [rsp + 40], r13         ; cbMultiByte
+        mov     qword [rsp + 48], 0
+        mov     qword [rsp + 56], 0
+        call    [__imp_WideCharToMultiByte]
+        test    eax, eax
+        jz      near .oom
+        xor     ecx, ecx
+.len:
+        cmp     byte [rbx + rcx], 0
+        je      short .len_done
+        inc     rcx
+        jmp     short .len
+.len_done:
+        mov     r12, rcx
+        imul    rdi, r12, 10
+        add     rdi, 32
+        call    rtw_sys_alloc
+        test    rax, rax
+        jz      near .oom
+        mov     r13, rax
+        lea     r14, [r12 + 2]
+        lea     r14, [rax + r14*8]      ; text area follows the pointer array
+        xor     r15d, r15d
+
+        ; --- argv[0]
+        mov     [r13], r14
+        inc     r15
+        cmp     byte [rbx], '"'
+        jne     short .a0_plain
+        inc     rbx
+.a0_quoted:
+        movzx   eax, byte [rbx]
+        test    al, al
+        jz      short .a0_end
+        inc     rbx
+        cmp     al, '"'
+        je      short .a0_end
+        mov     [r14], al
+        inc     r14
+        jmp     short .a0_quoted
+.a0_plain:
+        movzx   eax, byte [rbx]
+        test    al, al
+        jz      short .a0_end
+        cmp     al, ' '
+        je      short .a0_end
+        cmp     al, 9
+        je      short .a0_end
+        mov     [r14], al
+        inc     r14
+        inc     rbx
+        jmp     short .a0_plain
+.a0_end:
+        mov     byte [r14], 0
+        inc     r14
+
+        ; --- remaining arguments
+.skip_ws:
+        movzx   eax, byte [rbx]
+        cmp     al, ' '
+        je      short .ws
+        cmp     al, 9
+        je      short .ws
+        test    al, al
+        jz      near .done
+        jmp     short .arg_start
+.ws:
+        inc     rbx
+        jmp     short .skip_ws
+
+.arg_start:
+        mov     [r13 + r15*8], r14
+        inc     r15
+        xor     r8d, r8d                ; not inside quotes
+.arg_loop:
+        movzx   eax, byte [rbx]
+        test    al, al
+        jz      near .arg_end
+        cmp     al, 0x5C                ; backslash
+        je      short .backslashes
+        cmp     al, '"'
+        je      short .quote
+        test    r8d, r8d
+        jnz     short .literal                ; inside quotes, whitespace is literal
+        cmp     al, ' '
+        je      near .arg_end
+        cmp     al, 9
+        je      near .arg_end
+.literal:
+        mov     [r14], al
+        inc     r14
+        inc     rbx
+        jmp     short .arg_loop
+
+.backslashes:
+        xor     ecx, ecx                ; count the run of backslashes
+.bs_count:
+        cmp     byte [rbx + rcx], 0x5C
+        jne     short .bs_counted
+        inc     rcx
+        jmp     short .bs_count
+.bs_counted:
+        cmp     byte [rbx + rcx], '"'
+        je      short .bs_quote
+        add     rbx, rcx                ; not before a quote: all literal
+.bs_literal:
+        mov     byte [r14], 0x5C
+        inc     r14
+        dec     rcx
+        jnz     short .bs_literal
+        jmp     short .arg_loop
+.bs_quote:
+        add     rbx, rcx                ; rbx now points at the quote
+        mov     rdx, rcx
+        shr     rdx, 1                  ; emit n = count / 2 backslashes
+        jz      short .bs_half_done
+.bs_half:
+        mov     byte [r14], 0x5C
+        inc     r14
+        dec     rdx
+        jnz     short .bs_half
+.bs_half_done:
+        test    ecx, 1
+        jz      short .quote                  ; even count: the quote is a delimiter
+        mov     byte [r14], '"'         ; odd count: the quote is literal
+        inc     r14
+        inc     rbx
+        jmp     near .arg_loop
+
+.quote:
+        inc     rbx
+        test    r8d, r8d
+        jz      short .open_quote
+        cmp     byte [rbx], '"'         ; "" inside quotes: literal quote
+        jne     short .close_quote
+        mov     byte [r14], '"'
+        inc     r14
+        inc     rbx
+        jmp     near .arg_loop
+.close_quote:
+        xor     r8d, r8d
+        jmp     near .arg_loop
+.open_quote:
+        mov     r8d, 1
+        jmp     near .arg_loop
+
+.arg_end:
+        mov     byte [r14], 0
+        inc     r14
+        jmp     near .skip_ws                ; sees the NUL and finishes if the line ended
+
+.done:
+        mov     qword [r13 + r15*8], 0
+        mov     [win_argc], r15
+        mov     [win_argv], r13
+        add     rsp, 64
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.oom:
+        mov     edi, 70
+        call    rtw_sys_exit
+
+        align   8, db 0
+; Mutable state of the block, kept together so src/writer.eas can zero it when
+; it copies the block into an output program (the copy must start fresh).
+rtw_data_begin:
+win_std:        dq 0, 0, 0              ; stdin, stdout, stderr handles
+win_argc:       dq 0
+win_argv:       dq 0
+win_wpath:      dq 0                    ; WPATH_CHARS UTF-16 units of scratch for rtw_sys_open
+rtw_heap_cur:       dq 0                ; built-in heap (alloc, open)
+rtw_heap_end:       dq 0
+rtw_data_end:
+
+; ---------------------------------------------------------------- built-ins
+; The built-ins of envo-core.md section 6, in the stack ABI described in
+; platform/runtime-abi.eas. Generated from one template for both runtime blocks;
+; keep platform/windows.eas and platform/linux.eas in step.
+
+; print(str s): write s and a newline to stdout.
+rtw_bi_print:
+        mov     rsi, [rsp + 8]
+        mov     rdx, [rsp + 16]
+        mov     edi, 1
+        call    rtw_write_all
+        mov     edi, 1
+        lea     rsi, [rtw_newline]
+        mov     edx, 1
+        jmp     near rtw_write_all
+
+; write(i32 fd, str s)
+rtw_bi_write:
+        mov     rsi, [rsp + 8]
+        mov     rdx, [rsp + 16]
+        movsxd  rdi, dword [rsp + 24]
+        jmp     near rtw_write_all
+
+; read(i32 fd, *u8 buf, usize n) -> isize
+rtw_bi_read:
+        mov     rdx, [rsp + 8]
+        mov     rsi, [rsp + 16]
+        movsxd  rdi, dword [rsp + 24]
+        jmp     near rtw_sys_read
+
+; open(str path, i32 mode) -> i32: the path is copied so it can be NUL-terminated. A path
+; with a NUL byte fails (-1): the system would read only the part before it.
+rtw_bi_open:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, [rsp + 40]                 ; path pointer
+        mov     r13, [rsp + 48]                 ; path length
+        xor     ecx, ecx
+.scan:
+        cmp     rcx, r13
+        jae     short .clean
+        cmp     byte [r12 + rcx], 0
+        je      short .refuse
+        inc     rcx
+        jmp     short .scan
+.refuse:
+        mov     rax, -1
+        jmp     short .done
+.clean:
+        lea     rdi, [r13 + 1]
+        call    rtw_heap_alloc                  ; zeroed, so the copy ends in NUL
+        mov     rbx, rax
+        mov     rdi, rax
+        mov     rsi, r12
+        mov     rcx, r13
+        rep movsb
+        mov     rdi, rbx
+        movsxd  rsi, dword [rsp + 32]           ; mode
+        call    rtw_sys_open
+        cdqe                                    ; an i32 result, normalized
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; close(i32 fd)
+rtw_bi_close:
+        movsxd  rdi, dword [rsp + 8]
+        jmp     near rtw_sys_close
+
+; alloc(usize n) -> *u8
+rtw_bi_alloc:
+        mov     rdi, [rsp + 8]
+        jmp     near rtw_heap_alloc
+
+; exit(i32 code)
+rtw_bi_exit:
+        movsxd  rdi, dword [rsp + 8]
+        jmp     near rtw_sys_exit
+
+; argc() -> usize
+rtw_bi_argc:
+        mov     rax, [win_argc]
+        ret
+
+; arg(usize i) -> str: argument i, or an index-out-of-bounds panic.
+rtw_bi_arg:
+        mov     rcx, [rsp + 8]
+        cmp     rcx, [win_argc]
+        jae     short .out_of_bounds
+        mov     rax, [win_argv]
+        mov     rax, [rax + rcx*8]
+        xor     edx, edx
+.length:
+        cmp     byte [rax + rdx], 0
+        je      short .done
+        inc     rdx
+        jmp     short .length
+.done:
+        ret
+.out_of_bounds:
+        mov     edi, TRAP_BOUNDS
+        jmp     near rtw_trap
+
+; panic(str msg): "panic: <msg>" on stderr, exit code 101.
+rtw_bi_panic:
+        mov     edi, 2
+        lea     rsi, [rtw_panic_prefix]
+        mov     edx, 7
+        call    rtw_write_all
+        mov     rsi, [rsp + 8]
+        mov     rdx, [rsp + 16]
+        jmp     short rtw_panic_finish
+
+; str_from(*u8 ptr, usize len) -> str: the caller (in `unsafe`) vouches for the bytes.
+rtw_bi_str_from:
+        mov     rdx, [rsp + 8]
+        mov     rax, [rsp + 16]
+        ret
+
+; rtw_trap - a run-time check failed ([type.int.1], [type.array.1]).
+;   in: edi = TRAP_* reason. Prints "panic: <reason>", exits with code 101.
+rtw_trap:
+        mov     ebx, edi
+        mov     edi, 2
+        lea     rsi, [rtw_panic_prefix]
+        mov     edx, 7
+        call    rtw_write_all
+        lea     rsi, [rtw_trap_messages]        ; skip to message number ebx
+.skip:
+        dec     ebx
+        jz      short .found
+.skip_byte:
+        lodsb
+        test    al, al
+        jnz     short .skip_byte
+        jmp     short .skip
+.found:
+        xor     edx, edx                        ; length of the NUL-terminated message
+.measure:
+        cmp     byte [rsi + rdx], 0
+        je      short rtw_panic_finish
+        inc     rdx
+        jmp     short .measure
+
+; rtw_panic_finish - write rsi/rdx and a newline to stderr, exit with code 101.
+rtw_panic_finish:
+        mov     edi, 2
+        call    rtw_write_all
+        mov     edi, 2
+        lea     rsi, [rtw_newline]
+        mov     edx, 1
+        call    rtw_write_all
+        mov     edi, PANIC_EXIT_CODE
+        jmp     near rtw_sys_exit
+
+; rtw_write_all - write all of a buffer, retrying partial writes.
+;   in: rdi = fd, rsi = buffer, rdx = length. Errors end the write silently.
+rtw_write_all:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi
+        mov     r12, rsi
+        mov     r13, rdx
+.loop:
+        test    r13, r13
+        jz      short .done
+        mov     rdi, rbx
+        mov     rsi, r12
+        mov     rdx, r13
+        call    rtw_sys_write
+        test    rax, rax
+        jle     short .done
+        add     r12, rax
+        sub     r13, rax
+        jmp     short .loop
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; rtw_heap_alloc - zeroed, 16-byte-aligned memory for compiled programs. A bump
+; pointer over RT_HEAP_CHUNK mappings; never freed (envo-core.md section 6).
+;   in: rdi = size.  out: rax.  Out of memory is a TRAP_MEMORY panic.
+rtw_heap_alloc:
+        add     rdi, 15
+        and     rdi, -16
+        mov     rax, [rtw_heap_cur]
+        mov     rdx, [rtw_heap_end]
+        sub     rdx, rax
+        cmp     rdi, rdx
+        ja      short .grow
+        add     rdi, rax
+        mov     [rtw_heap_cur], rdi
+        ret
+.grow:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     rbx, rdi
+        mov     r12, RT_HEAP_CHUNK
+        cmp     rbx, r12
+        jbe     short .map
+        lea     r12, [rbx + 0xFFF]
+        and     r12, -0x1000
+.map:
+        mov     rdi, r12
+        call    rtw_sys_alloc
+        test    rax, rax
+        jz      short .out_of_memory
+        lea     rdx, [rax + rbx]
+        mov     [rtw_heap_cur], rdx
+        lea     rdx, [rax + r12]
+        mov     [rtw_heap_end], rdx
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+.out_of_memory:
+        mov     edi, TRAP_MEMORY
+        jmp     near rtw_trap
+
+rtw_newline:        db 10
+rtw_panic_prefix:   db 'panic: '
+rtw_trap_messages:
+        db      'integer overflow', 0
+        db      'index out of bounds', 0
+        db      'division by zero', 0
+        db      'out of memory', 0
+        db      'shift amount out of range', 0
+        db      'unreachable code reached', 0
+
+; ---------------------------------------------------------------- imports
+; One IMAGE_IMPORT_DESCRIPTOR for KERNEL32.dll, then a null descriptor. The
+; import lookup table (ILT) and the import address table (IAT) both list the
+; hint/name entries; the loader overwrites the IAT with function addresses.
+        align   8, db 0
+win_import_dir:
+        dd      win_ilt - $$            ; OriginalFirstThunk
+        dd      0                       ; TimeDateStamp
+        dd      0                       ; ForwarderChain
+        dd      win_dll_name - $$       ; Name
+        dd      win_iat - $$            ; FirstThunk
+        times 5 dd 0                    ; terminating null descriptor
+win_import_dir_end:
+
+win_ilt:
+        dq      win_hn_GetStdHandle - $$
+        dq      win_hn_GetCommandLineW - $$
+        dq      win_hn_CreateFileW - $$
+        dq      win_hn_ReadFile - $$
+        dq      win_hn_WriteFile - $$
+        dq      win_hn_CloseHandle - $$
+        dq      win_hn_VirtualAlloc - $$
+        dq      win_hn_VirtualFree - $$
+        dq      win_hn_GetLastError - $$
+        dq      win_hn_ExitProcess - $$
+        dq      win_hn_MultiByteToWideChar - $$
+        dq      win_hn_WideCharToMultiByte - $$
+        dq      0
+
+win_iat:
+__imp_GetStdHandle:     dq win_hn_GetStdHandle - $$
+__imp_GetCommandLineW:  dq win_hn_GetCommandLineW - $$
+__imp_CreateFileW:      dq win_hn_CreateFileW - $$
+__imp_ReadFile:         dq win_hn_ReadFile - $$
+__imp_WriteFile:        dq win_hn_WriteFile - $$
+__imp_CloseHandle:      dq win_hn_CloseHandle - $$
+__imp_VirtualAlloc:     dq win_hn_VirtualAlloc - $$
+__imp_VirtualFree:      dq win_hn_VirtualFree - $$
+__imp_GetLastError:     dq win_hn_GetLastError - $$
+__imp_ExitProcess:      dq win_hn_ExitProcess - $$
+__imp_MultiByteToWideChar: dq win_hn_MultiByteToWideChar - $$
+__imp_WideCharToMultiByte: dq win_hn_WideCharToMultiByte - $$
+        dq      0
+
+; Hint/name entries: a 2-byte hint (0: let the loader search) and the name.
+; Each entry must start on an even address.
+win_hn_GetStdHandle:    dw 0
+        db      'GetStdHandle', 0
+        align   2, db 0
+win_hn_GetCommandLineW: dw 0
+        db      'GetCommandLineW', 0
+        align   2, db 0
+win_hn_CreateFileW:     dw 0
+        db      'CreateFileW', 0
+        align   2, db 0
+win_hn_ReadFile:        dw 0
+        db      'ReadFile', 0
+        align   2, db 0
+win_hn_WriteFile:       dw 0
+        db      'WriteFile', 0
+        align   2, db 0
+win_hn_CloseHandle:     dw 0
+        db      'CloseHandle', 0
+        align   2, db 0
+win_hn_VirtualAlloc:    dw 0
+        db      'VirtualAlloc', 0
+        align   2, db 0
+win_hn_VirtualFree:     dw 0
+        db      'VirtualFree', 0
+        align   2, db 0
+win_hn_GetLastError:    dw 0
+        db      'GetLastError', 0
+        align   2, db 0
+win_hn_ExitProcess:     dw 0
+        db      'ExitProcess', 0
+        align   2, db 0
+win_hn_MultiByteToWideChar: dw 0
+        db      'MultiByteToWideChar', 0
+        align   2, db 0
+win_hn_WideCharToMultiByte: dw 0
+        db      'WideCharToMultiByte', 0
+        align   2, db 0
+win_dll_name:
+        db      'KERNEL32.dll', 0
+rtw_end:

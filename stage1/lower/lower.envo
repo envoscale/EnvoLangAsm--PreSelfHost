@@ -1,0 +1,765 @@
+// Lowering: the checked Envo-Core tree to EIR (docs/architecture/stage1.md). Every local
+// lives in a slot; scalar expressions become values; aggregates (str, slices, arrays,
+// structs) are handled by address. Checks are EIR's checked instructions, so programs
+// panic where Stage 0's do, with the same reasons.
+
+struct Lower {
+    *Checker C;
+    *Module M;
+    u32 Func;           // EIR function being built
+    u32 Block;          // current block, 0 after a terminator
+    u32 Entry;          // the function's entry block (filled in last)
+    u32 Body;           // the first body block
+    Vec PendingSlots;   // u32 pairs (value, type) for the entry block
+    Vec SymSlots;       // u32 per checker symbol: the slot value of a local
+    Vec NodeLocals;     // u32 per node: the local symbol declared by a var or parameter node
+    Vec FuncIds;        // u32 per checker symbol: the EIR function of a fn or built-in
+    Vec GlobalIds;      // u32 per checker symbol: the EIR global of a static
+    Vec TypeIds;        // u32 per checker type: the EIR type (0 = not yet)
+    Map Strings;        // string literal bytes -> EIR global
+    Vec Loops;          // u32 pairs (continue block, break block)
+    u32 StrType;        // $str = { ptr, u64 }, also every slice
+    u32 RetSlot;        // the hidden result pointer of a function returning an aggregate
+    u32 RetType;        // the checker type the function returns
+    bool Top;           // lowering __main
+    u32 Target;
+    u32 Env;            // the generic environment of the function being lowered
+    u32 NEnv;
+    // function values (lower/closure.envo)
+    u32 FnvType;        // $fnv = { ptr, ptr }
+    u32 LamCount;
+    Vec PendingLams;    // u32 quintuples: lambda node, EIR function, env struct, Env, NEnv
+    Vec PendingThunks;  // u32 pairs: function symbol, thunk
+    Map Thunks;         // function symbol -> thunk
+    // drops (lower/drop.envo)
+    Vec DropFlags;      // u32 per checker symbol: a local's drop flag slot
+    Vec Drops;          // u32: the locals with a drop flag, in scope order
+    Vec Temps;          // u32 pairs (type, address): the statement's temporaries to drop
+    Vec KeptTemps;      // u32 pairs (type, address): temporaries a view local borrows, dropped with its block
+    Vec FlagSyms;       // u32: the locals given a drop flag in the current function
+}
+
+// The type of checked node n in the function being lowered (its type arguments
+// substituted).
+u32 LNType(*Lower l, u32 n) {
+    return LSubst(l, NType(LC(l), n));
+}
+
+u32 LSubst(*Lower l, u32 t) {
+    unsafe {
+        if (l.NEnv == 0) return t;
+        return Subst(l.C, t, l.Env, l.NEnv);
+    }
+}
+
+// ------------------------------------------------------------------ builder
+
+*Module LM(*Lower l) {
+    unsafe { return l.M; }
+}
+
+*Checker LC(*Lower l) {
+    unsafe { return l.C; }
+}
+
+u32 LNewBlock(*Lower l) {
+    *Module m = LM(l);
+    unsafe {
+        u32 b = ECount(&m.Blocks);
+        *EBlock blk = VecPush(&m.Blocks) as *EBlock;
+        blk.Func = l.Func;
+        blk.FirstParam = ECount(&m.Vals);
+        return b;
+    }
+}
+
+// Starts writing block b (blocks are written one at a time, so their instructions are
+// contiguous).
+void LStart(*Lower l, u32 b) {
+    *Module m = LM(l);
+    unsafe {
+        *EBlock blk = EBlockPtr(m, b);
+        blk.FirstInst = ECount(&m.Insts);
+        blk.FirstParam = ECount(&m.Vals);
+        l.Block = b;
+    }
+}
+
+u32 LValue(*Lower l, u32 t) {
+    unsafe { return NewValue(l.M, t, l.Block, 0); }
+}
+
+EOp OpV(u32 v) {
+    EOp o;
+    o.Kind = OK_VALUE;
+    o.Ref = v;
+    return o;
+}
+
+EOp OpTargetOf(u32 b) {
+    EOp o;
+    o.Kind = OK_TARGET;
+    o.Ref = b;
+    return o;
+}
+
+// Appends an instruction with up to three operands; returns its result (0 if resultType
+// is 0 or void).
+u32 LEmit(*Lower l, u16 op, u32 ty, u32 ty2, u64 imm, u32 resultType, u32 nops, EOp a, EOp b, EOp c) {
+    *Module m = LM(l);
+    unsafe {
+        if (l.Block == 0) {
+            // unreachable code after a terminator: give it a block of its own
+            LStart(l, LNewBlock(l));
+        }
+        EInst inst;
+        inst.Op = op;
+        inst.Ty = ty;
+        inst.Ty2 = ty2;
+        inst.Imm = imm;
+        inst.Block = l.Block;
+        inst.FirstOp = ECount(&m.Ops);
+        inst.NOps = nops;
+        if (nops > 0) *(VecPush(&m.Ops) as *EOp) = a;
+        if (nops > 1) *(VecPush(&m.Ops) as *EOp) = b;
+        if (nops > 2) *(VecPush(&m.Ops) as *EOp) = c;
+        u32 id = ECount(&m.Insts);
+        if (resultType != 0 && resultType != ET_VOID) {
+            inst.Result = NewValue(m, resultType, l.Block, id);
+        }
+        *(VecPush(&m.Insts) as *EInst) = inst;
+        if (OpTable(op).Term) {
+            *EBlock blk = EBlockPtr(m, l.Block);
+            blk.NInsts = ECount(&m.Insts) - blk.FirstInst;
+            l.Block = 0;
+        }
+        return inst.Result;
+    }
+}
+
+EOp NoOp() {
+    EOp o;
+    return o;
+}
+
+u32 LConst(*Lower l, u32 t, u64 v) {
+    return LEmit(l, OP_CONST, t, 0, v, t, 0, NoOp(), NoOp(), NoOp());
+}
+
+u32 LBin(*Lower l, u16 op, u32 t, u32 a, u32 b) {
+    u32 rt = t;
+    if (op >= 20 && op <= 25) rt = ET_BOOL;
+    return LEmit(l, op, t, 0, 0, rt, 2, OpV(a), OpV(b), NoOp());
+}
+
+u32 LConv(*Lower l, u16 op, u32 from, u32 to, u32 v) {
+    return LEmit(l, op, from, to, 0, to, 1, OpV(v), NoOp(), NoOp());
+}
+
+u32 LLoad(*Lower l, u32 t, u32 p) {
+    return LEmit(l, 42, t, 0, 0, t, 1, OpV(p), NoOp(), NoOp());
+}
+
+void LStore(*Lower l, u32 t, u32 v, u32 p) {
+    LEmit(l, 43, t, 0, 0, 0, 2, OpV(v), OpV(p), NoOp());
+}
+
+u32 LField(*Lower l, u32 st, u32 p, u32 k) {
+    return LEmit(l, 44, st, 0, k as u64, ET_PTR, 1, OpV(p), NoOp(), NoOp());
+}
+
+u32 LElem(*Lower l, u32 et, u32 p, u32 i) {
+    return LEmit(l, 45, et, 0, 0, ET_PTR, 2, OpV(p), OpV(i), NoOp());
+}
+
+void LCopy(*Lower l, u32 dst, u32 src, u64 n) {
+    EOp size;
+    size.Kind = OK_INT;
+    size.Int = n;
+    LEmit(l, 47, 0, 0, 0, 0, 3, OpV(dst), OpV(src), size);
+}
+
+void LZero(*Lower l, u32 p, u64 n) {
+    EOp size;
+    size.Kind = OK_INT;
+    size.Int = n;
+    LEmit(l, 48, 0, 0, 0, 0, 2, OpV(p), size, NoOp());
+}
+
+void LBr(*Lower l, u32 b) {
+    LEmit(l, 55, 0, 0, 0, 0, 1, OpTargetOf(b), NoOp(), NoOp());
+}
+
+void LCondBr(*Lower l, u32 c, u32 t, u32 f) {
+    LEmit(l, 56, 0, 0, 0, 0, 3, OpV(c), OpTargetOf(t), OpTargetOf(f));
+}
+
+void LPanic(*Lower l, u64 reason) {
+    LEmit(l, 59, 0, 0, reason, 0, 0, NoOp(), NoOp(), NoOp());
+}
+
+// A slot of EIR type t, created in the entry block when the function is finished.
+u32 LSlot(*Lower l, u32 t) {
+    *Module m = LM(l);
+    unsafe {
+        u32 v = NewValue(m, ET_PTR, l.Entry, 0);
+        MemStoreU32(VecPush(&l.PendingSlots), v);
+        MemStoreU32(VecPush(&l.PendingSlots), t);
+        return v;
+    }
+}
+
+// ------------------------------------------------------------------ types
+
+u32 ESizeOf(*Lower l, u32 t) {
+    *Module m = LM(l);
+    ELayout(m, t);
+    return ETyGet(m, t).Size;
+}
+
+// The EIR type of checker type t.
+u32 LType(*Lower l, u32 t) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    u32 known;
+    unsafe {
+        // substitution makes types after the table was sized
+        while (VecLen(&l.TypeIds) <= t as usize) MemStoreU32(VecPush(&l.TypeIds), 0);
+        known = MemLoadU32(VecAt(&l.TypeIds, t as usize));
+    }
+    if (known != 0) return known;
+    Type ty = TypeGet(c, t);
+    u32 r = 0;
+    if (ty.Kind == TYK_VOID) r = ET_VOID;
+    else if (ty.Kind == TYK_BOOL) r = ET_BOOL;
+    else if (ty.Kind == TYK_PTR) r = ET_PTR;
+    else if (ty.Kind == TYK_FN) {
+        unsafe { r = l.FnvType; }
+    }
+    else if (ty.Kind == TYK_UNION) r = TaggedEType(l, t);
+    else if (ty.Kind == TYK_STR || ty.Kind == TYK_SLICE) {
+        unsafe { r = l.StrType; }
+    } else if (ty.Kind == TYK_INT) {
+        r = EIntType(ty.Size, ty.Signed);
+    } else if (ty.Kind == TYK_ENUM) {
+        EnumDeclare(c, ty.Sym);
+        r = LType(l, SymGet(c, ty.Sym).Aux);
+    } else if (ty.Kind == TYK_ARRAY) {
+        r = EArrayType(m, LType(l, ty.Elem), ty.Count);
+    } else {
+        // a struct: its fields in order, with C layout like Stage 0; named with its
+        // namespace, and a generic instance after its arguments
+        str name = "";
+        Buf b = BufNew(32);
+        unsafe {
+            BufMangle(&b, c, t);
+            name = BufCopy(&b);
+        }
+        r = EStructType(m, name);
+        unsafe { MemStoreU32(VecAt(&l.TypeIds, t as usize), r); }
+        u32 f = CNode(c, SymGet(c, ty.Sym).Node).A;
+        Vec fields = VecNew(4, 8);
+        while (f != 0) {
+            unsafe { MemStoreU32(VecPush(&fields), LType(l, FieldType(c, t, f))); }
+            f = CNode(c, f).Next;
+        }
+        unsafe {
+            u32 first = ECount(&m.Fields);
+            for (usize i = 0; i < VecLen(&fields); i++) MemStoreU32(VecPush(&m.Fields), MemLoadU32(VecAt(&fields, i)));
+            *ETy et = ETyPtr(m, r);
+            et.Fields = first;
+            et.NFields = VecLen(&fields) as u32;
+            et.Defined = true;
+        }
+    }
+    unsafe { MemStoreU32(VecAt(&l.TypeIds, t as usize), r); }
+    return r;
+}
+
+u32 EIntType(u32 size, bool signed) {
+    if (signed) {
+        if (size == 1) return 3;
+        if (size == 2) return 4;
+        if (size == 4) return 5;
+        return 6;
+    }
+    if (size == 1) return 7;
+    if (size == 2) return 8;
+    if (size == 4) return 9;
+    return 10;
+}
+
+// Is checker type t passed and stored by address (str, slice, array, struct)?
+bool IsAggregate(*Lower l, u32 t) {
+    u8 k = TyKind(LC(l), t);
+    return k == TYK_STR || k == TYK_SLICE || k == TYK_ARRAY || k == TYK_STRUCT || k == TYK_FN || k == TYK_UNION;
+}
+
+// ------------------------------------------------------------------ module
+
+void LowerProgram(*Lower l, u32 program) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    unsafe {
+        l.SymSlots = SideTable(4, VecLen(&c.Syms));
+        l.NodeLocals = SideTable(4, VecLen(c.Nodes));
+        for (u32 s = 1; s < VecLen(&c.Syms) as u32; s++) {
+            Sym sym = SymGet(c, s);
+            if (sym.Kind == SK_LOCAL && sym.Node != 0) MemStoreU32(VecAt(&l.NodeLocals, sym.Node as usize), s);
+        }
+        l.FuncIds = SideTable(4, VecLen(&c.Syms));
+        l.GlobalIds = SideTable(4, VecLen(&c.Syms));
+        l.TypeIds = SideTable(4, VecLen(&c.Types) + 64);
+        l.Strings = MapNew(256);
+        l.Loops = VecNew(4, 32);
+        l.PendingSlots = VecNew(4, 64);
+        m.Target = "x86_64-linux";
+        if (l.Target == TARGET_WINDOWS) m.Target = "x86_64-windows";
+        // $str = { ptr, u64 }
+        l.StrType = EStructType(m, "str");
+        u32 first = ECount(&m.Fields);
+        MemStoreU32(VecPush(&m.Fields), ET_PTR);
+        MemStoreU32(VecPush(&m.Fields), ET_U64);
+        *ETy st = ETyPtr(m, l.StrType);
+        st.Fields = first;
+        st.NFields = 2;
+        st.Defined = true;
+        // $fnv = { ptr, ptr }
+        Vec fv = VecNew(4, 2);
+        MemStoreU32(VecPush(&fv), ET_PTR);
+        MemStoreU32(VecPush(&fv), ET_PTR);
+        l.FnvType = EStructOf(l, "fnv", &fv);
+        l.PendingLams = VecNew(4, 20);
+        l.PendingThunks = VecNew(4, 8);
+        l.Thunks = MapNew(16);
+        l.DropFlags = VecNew(4, 64);
+        l.Drops = VecNew(4, 16);
+        l.Temps = VecNew(4, 8);
+        l.KeptTemps = VecNew(4, 8);
+        l.FlagSyms = VecNew(4, 16);
+    }
+    // declare every function and static first, so calls can refer forward; generic
+    // functions and methods are declared once per instance
+    u32 n = CNode(c, program).A;
+    while (n != 0) {
+        u16 k = NKind(c, n);
+        if (k == NK_FN && !NeedsInst(c, NSym(c, n))) DeclareFunc(l, NSym(c, n), QualifiedName(c, NSym(c, n), TokText(c, NTok(c, n))));
+        if (k == NK_STATIC) DeclareStatic(l, NSym(c, n));
+        n = CNode(c, n).Next;
+    }
+    u32 ninst;
+    unsafe { ninst = VecLen(&c.Insts) as u32; }
+    for (u32 i = 0; i < ninst; i++) DeclareInst(l, i);
+    // __main: the top-level statements
+    u32 mainFn = AddFunc(l, "__main", 0, ET_I32);
+    n = CNode(c, program).A;
+    while (n != 0) {
+        if (NKind(c, n) == NK_FN && !NeedsInst(c, NSym(c, n))) LowerFunc(l, NSym(c, n));
+        n = CNode(c, n).Next;
+    }
+    LowerMain(l, mainFn, CNode(c, program).A);
+    // instances, including those lowering itself needed (drops)
+    u32 i = 0;
+    while (true) {
+        unsafe {
+            if (i >= VecLen(&c.Insts) as u32) break;
+        }
+        u32 f = InstFunc(l, i);
+        Inst inst = InstAt(c, i);
+        LowerFuncEnv(l, inst.Sym, f, inst.Env, inst.NEnv);
+        i++;
+    }
+    DrainThunks(l);
+}
+
+// The EIR function of instance i, named after its type arguments.
+void DeclareInst(*Lower l, u32 i) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    Inst inst = InstAt(c, i);
+    str name = InstName(c, i);
+    u64 taken;
+    unsafe {
+        if (MapGet(&m.Names, name, &taken)) {
+            // mangled names are unique by construction; this keeps them so regardless
+            Buf b = BufNew(32);
+            BufStr(&b, name);
+            BufStr(&b, ".i");
+            BufU64(&b, i as u64);
+            name = BufCopy(&b);
+        }
+    }
+    Sym sym = SymGet(c, inst.Sym);
+    u32 count = sym.Aux;
+    if (sym.Flags & SF_METHOD != 0 && sym.Flags & SF_STATIC == 0) count++;
+    u32 rt = Subst(c, sym.Type, inst.Env, inst.NEnv);
+    u32 ret = LType(l, rt);
+    if (IsAggregate(l, rt)) {
+        count++;
+        ret = ET_VOID;
+    }
+    u32 f = AddFunc(l, name, count, ret);
+    unsafe {
+        *Inst ip = VecAt(&c.Insts, i as usize) as *Inst;
+        ip.Func = f;
+        ip.Declared = true;
+    }
+}
+
+// A new EIR function with nparams parameters (their values are added by the caller).
+u32 AddFunc(*Lower l, str name, u32 nparams, u32 ret) {
+    *Module m = LM(l);
+    unsafe {
+        u32 f = ECount(&m.Funcs);
+        *EFunc fn = VecPush(&m.Funcs) as *EFunc;
+        fn.Name = name;
+        fn.Ret = ret;
+        fn.NParams = nparams;
+        MapPut(&m.Names, name, (NAME_FUNC << 32) | f as u64);
+        return f;
+    }
+}
+
+// The EIR signature of function symbol s: scalars by value, aggregates by pointer, and
+// an aggregate result through a hidden first pointer parameter.
+// The EIR name of item s, written name: prefixed with its namespace, so items of the same
+// name in different namespaces stay apart (found in the M3 sweep).
+str QualifiedName(*Checker c, u32 s, str name) {
+    Sym sym = SymGet(c, s);
+    if (sym.Ns.Len == 0) return name;
+    Buf b = BufNew(sym.Ns.Len + name.Len + 1);
+    unsafe {
+        BufStr(&b, sym.Ns);
+        BufStr(&b, ".");
+        BufStr(&b, name);
+        return BufCopy(&b);
+    }
+}
+
+void DeclareFunc(*Lower l, u32 s, str name) {
+    *Checker c = LC(l);
+    Sym sym = SymGet(c, s);
+    u32 n = sym.Aux;
+    u32 ret = LType(l, sym.Type);
+    if (IsAggregate(l, sym.Type)) {
+        n++;
+        ret = ET_VOID;
+    }
+    u32 f = AddFunc(l, name, n, ret);
+    unsafe { MemStoreU32(VecAt(&l.FuncIds, s as usize), f); }
+}
+
+void DeclareStatic(*Lower l, u32 s) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    Sym sym = SymGet(c, s);
+    u32 t = LType(l, sym.Type);
+    EInit init;
+    init.Kind = EI_ZERO;
+    u32 valueNode = CNode(c, sym.Node).B;
+    if (valueNode != 0) {
+        if (TyKind(c, sym.Type) == TYK_STR) {
+            // a string constant: { address of its bytes, length }
+            str bytes = StringValue(l, valueNode);
+            u32 g = StringGlobal(l, bytes);
+            unsafe {
+                EInit addr;
+                addr.Kind = EI_ADDR;
+                addr.Bytes = EGlobalGet(m, g).Name;
+                EInit len;
+                len.Kind = EI_INT;
+                len.Int = bytes.Len as u64;
+                u32 a = ECount(&m.Inits);
+                *(VecPush(&m.Inits) as *EInit) = addr;
+                u32 b = ECount(&m.Inits);
+                *(VecPush(&m.Inits) as *EInit) = len;
+                *EInit ai = VecAt(&m.Inits, a as usize) as *EInit;
+                ai.Next = b;
+                init.Kind = EI_LIST;
+                init.First = a;
+            }
+        } else if (IsScalarValue(c, sym.Type)) {
+            init.Kind = EI_INT;
+            init.Int = WrapValue(c, sym.Value, sym.Type);
+            if (TyKind(c, sym.Type) == TYK_ENUM) init.Int = sym.Value;
+        }
+    }
+    unsafe {
+        u32 g = ECount(&m.Globals);
+        *EGlobal gl = VecPush(&m.Globals) as *EGlobal;
+        Buf name = BufNew(16);
+        BufStr(&name, "static.");
+        BufStr(&name, QualifiedName(c, s, sym.Name));
+        gl.Name = BufCopy(&name);
+        gl.Type = t;
+        u32 ii = ECount(&m.Inits);
+        *(VecPush(&m.Inits) as *EInit) = init;
+        gl.Init = ii;
+        MapPut(&m.Names, gl.Name, (NAME_GLOBAL << 32) | g as u64);
+        MemStoreU32(VecAt(&l.GlobalIds, s as usize), g);
+    }
+}
+
+// The bytes of a string literal token (escapes decoded).
+str StringValue(*Lower l, u32 n) {
+    str text = TokText(LC(l), NTok(LC(l), n));
+    Buf b = BufNew(text.Len);
+    usize i = 1;
+    unsafe {
+        while (i + 1 < text.Len) {
+            u8 ch = text[i];
+            if (ch != 0x5C) {
+                BufByte(&b, ch);
+                i++;
+                continue;
+            }
+            u8 e = text[i + 1];
+            i += 2;
+            if (e == 'n') BufByte(&b, 10);
+            else if (e == 'r') BufByte(&b, 13);
+            else if (e == 't') BufByte(&b, 9);
+            else if (e == '0') BufByte(&b, 0);
+            else if (e == 'x') {
+                BufByte(&b, (DigitValue(text[i]) * 16 + DigitValue(text[i + 1])) as u8);
+                i += 2;
+            } else if (e == 'u') {
+                // \u{H…}: UTF-8 encode the scalar value
+                u32 v = 0;
+                i++;
+                while (text[i] != '}') {
+                    v = v * 16 + DigitValue(text[i]);
+                    i++;
+                }
+                i++;
+                if (v < 0x80) BufByte(&b, v as u8);
+                else if (v < 0x800) {
+                    BufByte(&b, (0xC0 | v >> 6) as u8);
+                    BufByte(&b, (0x80 | v & 0x3F) as u8);
+                } else if (v < 0x10000) {
+                    BufByte(&b, (0xE0 | v >> 12) as u8);
+                    BufByte(&b, (0x80 | v >> 6 & 0x3F) as u8);
+                    BufByte(&b, (0x80 | v & 0x3F) as u8);
+                } else {
+                    BufByte(&b, (0xF0 | v >> 18) as u8);
+                    BufByte(&b, (0x80 | v >> 12 & 0x3F) as u8);
+                    BufByte(&b, (0x80 | v >> 6 & 0x3F) as u8);
+                    BufByte(&b, (0x80 | v & 0x3F) as u8);
+                }
+            } else BufByte(&b, e);
+        }
+        return BufCopy(&b);
+    }
+}
+
+// A read-only global holding bytes (shared between equal literals).
+u32 StringGlobal(*Lower l, str bytes) {
+    *Module m = LM(l);
+    u64 found;
+    unsafe {
+        if (MapGet(&l.Strings, bytes, &found)) return found as u32;
+        u32 g = ECount(&m.Globals);
+        Buf name = BufNew(16);
+        BufStr(&name, "str.");
+        BufU64(&name, g as u64);
+        *EGlobal gl = VecPush(&m.Globals) as *EGlobal;
+        gl.Name = BufCopy(&name);
+        u32 n = bytes.Len as u32;
+        if (n == 0) n = 1;      // a zero-length array still needs an address
+        gl.Type = EArrayType(m, ET_U8, n);
+        gl.ReadOnly = true;
+        EInit init;
+        init.Kind = EI_BYTES;
+        init.Bytes = bytes;
+        if (bytes.Len == 0) init.Bytes = "\0";
+        u32 ii = ECount(&m.Inits);
+        *(VecPush(&m.Inits) as *EInit) = init;
+        gl.Init = ii;
+        MapPut(&m.Names, gl.Name, (NAME_GLOBAL << 32) | g as u64);
+        MapPut(&l.Strings, bytes, g as u64);
+        return g;
+    }
+}
+
+// ------------------------------------------------------------------ functions
+
+// Begins EIR function f: parameter values, the (empty) entry block and the first body
+// block.
+void BeginFunc(*Lower l, u32 f, u32 nparams) {
+    *Module m = LM(l);
+    unsafe {
+        l.Func = f;
+        VecClear(&l.PendingSlots);
+        *EFunc fn = EFuncPtr(m, f);
+        fn.FirstBlock = ECount(&m.Blocks);
+        fn.FirstValue = ECount(&m.Vals);
+        l.Entry = LNewBlock(l);
+        for (u32 i = 0; i < nparams; i++) NewValue(m, 0, l.Entry, 0);
+        l.Body = LNewBlock(l);
+        LStart(l, l.Body);
+    }
+}
+
+// Finishes the function: the entry block gets the slots, the parameter stores, and a
+// branch to the body.
+void EndFunc(*Lower l, Vec stores) {
+    *Module m = LM(l);
+    unsafe {
+        if (l.Block != 0) {
+            // falling off the end: void functions return; __main returns 0
+            if (l.Top) LEmit(l, 58, 0, 0, 0, 0, 1, OpV(LConst(l, ET_I32, 0)), NoOp(), NoOp());
+            else if (EFuncGet(m, l.Func).Ret == ET_VOID) LEmit(l, 58, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+            else LEmit(l, 60, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+        }
+        LStart(l, l.Entry);
+        for (usize i = 0; i < VecLen(&l.PendingSlots); i += 2) {
+            u32 v = MemLoadU32(VecAt(&l.PendingSlots, i));
+            u32 t = MemLoadU32(VecAt(&l.PendingSlots, i + 1));
+            EInst inst;
+            inst.Op = OP_SLOT;
+            inst.Ty = t;
+            inst.Block = l.Entry;
+            inst.Result = v;
+            inst.FirstOp = ECount(&m.Ops);
+            u32 id = ECount(&m.Insts);
+            *(VecPush(&m.Insts) as *EInst) = inst;
+            *EVal val = VecAt(&m.Vals, v as usize) as *EVal;
+            val.Inst = id;
+            val.Block = l.Entry;
+        }
+        // parameter stores: (value, slot, type) triples
+        for (usize i = 0; i < VecLen(&stores); i += 3) {
+            u32 v = MemLoadU32(VecAt(&stores, i));
+            u32 p = MemLoadU32(VecAt(&stores, i + 1));
+            u32 t = MemLoadU32(VecAt(&stores, i + 2));
+            LStore(l, t, v, p);
+        }
+        LBr(l, l.Body);
+        *EFunc fn = EFuncPtr(m, l.Func);
+        fn.NBlocks = ECount(&m.Blocks) - fn.FirstBlock;
+        fn.NValues = ECount(&m.Vals) - fn.FirstValue;
+    }
+}
+
+void SetSymSlot(*Lower l, u32 s, u32 v) {
+    unsafe { MemStoreU32(VecAt(&l.SymSlots, s as usize), v); }
+}
+
+u32 SymSlot(*Lower l, u32 s) {
+    unsafe { return MemLoadU32(VecAt(&l.SymSlots, s as usize)); }
+}
+
+void LowerFunc(*Lower l, u32 s) {
+    u32 f;
+    unsafe { f = MemLoadU32(VecAt(&l.FuncIds, s as usize)); }
+    LowerFuncEnv(l, s, f, 0, 0);
+}
+
+// Lowers function symbol s into EIR function f, with type arguments (env, n).
+void LowerFuncEnv(*Lower l, u32 s, u32 f, u32 env, u32 n) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    Sym sym = SymGet(c, s);
+    Node fn = CNode(c, sym.Node);
+    EFunc ef = EFuncGet(m, f);
+    unsafe {
+        l.Env = env;
+        l.NEnv = n;
+    }
+    BeginFunc(l, f, ef.NParams);
+    Vec stores = VecNew(4, 16);
+    u32 first = EFuncGet(m, f).FirstValue;
+    u32 k = 0;
+    u32 ret = LSubst(l, sym.Type);
+    ResetDropFlags(l);
+    unsafe {
+        l.Top = false;
+        l.RetType = ret;
+        l.RetSlot = 0;
+        if (IsAggregate(l, ret)) {
+            *EVal rv = VecAt(&m.Vals, first as usize) as *EVal;
+            rv.Type = ET_PTR;
+            l.RetSlot = first;
+            k = 1;
+        }
+    }
+    // the receiver: a pointer for `in this` and `ref this`, else a value like a parameter
+    u32 p = fn.B;
+    if (sym.Flags & SF_METHOD != 0 && sym.Flags & SF_STATIC == 0) {
+        bool byref = sym.Flags & (SF_RECV_IN | SF_RECV_REF) != 0;
+        unsafe { LowerParam(l, sym.Recv, LSubst(l, sym.OwnerType), byref, first + k, &stores); }
+        if (!byref) TrackDrop(l, sym.Recv, LSubst(l, sym.OwnerType), true, fn.Tok);
+        k++;
+        if (p != 0 && IsReceiver(c, p)) p = CNode(c, p).Next;
+    }
+    // each parameter gets a slot (Core parameters are mutable locals)
+    while (p != 0) {
+        bool byref = CNode(c, p).Flags & (NF_IN | NF_REF) != 0;
+        unsafe { LowerParam(l, ParamSym(l, p), LNType(l, p), byref, first + k, &stores); }
+        // a parameter taken by value is the callee's to drop
+        if (!byref) TrackDrop(l, ParamSym(l, p), LNType(l, p), true, NTok(c, p));
+        k++;
+        p = CNode(c, p).Next;
+    }
+    if (NKind(c, fn.C) == NK_BLOCK) {
+        LowerStmt(l, fn.C);
+    } else if (ret == T_VOID) {
+        LowerExpr(l, fn.C);
+        DropTemps(l);
+    } else {
+        LowerReturnValue(l, fn.C);
+    }
+    DropDownTo(l, 0, false);
+    EndFunc(l, stores);
+    unsafe {
+        l.Env = 0;
+        l.NEnv = 0;
+    }
+    DrainLambdas(l);
+}
+
+// Parameter value v for local s of type pt: an aggregate or a borrowed (`in`, `ref`)
+// parameter arrives as a pointer, which is the local's address; a scalar is stored in a
+// slot of its own.
+void LowerParam(*Lower l, u32 s, u32 pt, bool byref, u32 v, *Vec stores) {
+    *Module m = LM(l);
+    u32 et = LType(l, pt);
+    unsafe {
+        *EVal pv = VecAt(&m.Vals, v as usize) as *EVal;
+        if (byref || IsAggregate(l, pt)) {
+            // the caller passes a pointer to a copy this function owns, or to the borrowed place
+            pv.Type = ET_PTR;
+            SetSymSlot(l, s, v);
+        } else {
+            pv.Type = et;
+            u32 slot = LSlot(l, et);
+            MemStoreU32(VecPush(stores), v);
+            MemStoreU32(VecPush(stores), slot);
+            MemStoreU32(VecPush(stores), et);
+            SetSymSlot(l, s, slot);
+        }
+    }
+}
+
+// The local symbol the checker made for parameter node p.
+u32 ParamSym(*Lower l, u32 p) {
+    unsafe { return MemLoadU32(VecAt(&l.NodeLocals, p as usize)); }
+}
+
+void LowerMain(*Lower l, u32 f, u32 items) {
+    *Checker c = LC(l);
+    BeginFunc(l, f, 0);
+    unsafe {
+        l.Top = true;
+        l.RetType = T_I32;
+        l.RetSlot = 0;
+    }
+    ResetDropFlags(l);
+    u32 n = items;
+    while (n != 0) {
+        if (!NodeIsItem(NKind(c, n))) LowerStmt(l, n);
+        n = CNode(c, n).Next;
+    }
+    DropDownTo(l, 0, false);
+    EndFunc(l, VecNew(4, 1));
+    DrainLambdas(l);
+}

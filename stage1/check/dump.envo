@@ -1,0 +1,110 @@
+// `check`: the syntax tree with what the checker worked out (tests/golden/README.md):
+// struct " size S align A", field " offset O", variant / const / static " = value", and
+// " : type" for expressions, locals, parameters and fields. Follows Stage 0's
+// c_dump_extra and w_out_value.
+
+void BufValue(*Buf b, *Checker c, u32 t, u64 v) {
+    BufStr(b, " = ");
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_ENUM) ty = TypeGet(c, SymGet(c, ty.Sym).Aux);
+    if (ty.Signed && (v as i64) < 0) {
+        BufByte(b, '-');
+        v = 0 -% v;
+    }
+    BufU64(b, v);
+}
+
+void CheckDumpExtra(*Buf b, *Checker c, u32 n, Node node) {
+    u16 k = node.Kind;
+    if (k == NK_STRUCT) {
+        u32 s = NSym(c, n);
+        if (s == 0) return;
+        Sym sym = SymGet(c, s);
+        if (sym.LState != 2 || sym.NEnv > 0) return;     // a generic struct has no one size
+        BufStr(b, " size ");
+        BufU64(b, sym.Aux as u64);
+        BufStr(b, " align ");
+        BufU64(b, sym.Aux2 as u64);
+        return;
+    }
+    if (k == NK_VARIANT) {
+        u32 t = NType(c, n);
+        if (t == 0) return;
+        BufValue(b, c, t, NValue(c, n));
+        return;
+    }
+    if (k == NK_CONST || k == NK_STATIC) {
+        u32 s = NSym(c, n);
+        if (s == 0) return;
+        Sym sym = SymGet(c, s);
+        if (sym.State != 2 || !IsScalarValue(c, sym.Type)) return;
+        BufValue(b, c, sym.Type, sym.Value);
+        return;
+    }
+    if (k == NK_FIELD) {
+        if (NType(c, n) == 0) return;
+        BufStr(b, " offset ");
+        BufU64(b, NValue(c, n));
+    }
+    // expressions, locals, parameters and fields print their type
+    bool expression = k >= NK_INT && k <= NK_NEW;
+    if (!expression && k != NK_VAR && k != NK_PARAM && k != NK_FIELD) return;
+    u32 t = NType(c, n);
+    if (t == 0) return;
+    BufStr(b, " : ");
+    BufType(b, c, t);
+}
+
+void CheckDump(*Checker c, u32 first, usize depth) {
+    *Buf o = Out();
+    u32 n = first;
+    while (n != 0) {
+        Node node = CNode(c, n);
+        if (IsPreludeNode(c, n)) {
+            n = node.Next;      // the prelude is not part of the program's tree
+            continue;
+        }
+        Token t = CTok(c, node.Tok);
+        str text = SrcGet(t.File).Text;
+        BufRepeat(o, ' ', depth * 2);
+        BufStr(o, NodeName(node.Kind));
+        if (NodeHasText(node.Kind)) {
+            BufByte(o, ' ');
+            BufStr(o, StrSub(text, t.Start as usize, (t.Start + t.Len) as usize));
+        }
+        BufNodeFlags(o, node.Flags);
+        BufStr(o, " @");
+        BufU64(o, t.Line as u64);
+        BufByte(o, ':');
+        BufU64(o, SrcCol(text, t.Start as usize) as u64);
+        CheckDumpExtra(o, c, n, node);
+        BufByte(o, 10);
+        if (BufLen(o) >= 1 << 16) Flush();
+        u32 slots = NodeSlots(node.Kind);
+        for (u32 s = 0; s < slots; s++) {
+            u32 child = node.A;
+            if (s == 1) child = node.B;
+            if (s == 2) child = node.C;
+            if (s == 3) child = node.D;
+            if (child == 0) {
+                BufRepeat(o, ' ', (depth + 1) * 2);
+                BufStr(o, "-\n");
+            } else {
+                CheckDump(c, child, depth + 1);
+            }
+        }
+        if (node.E != 0) CheckDump(c, node.E, depth + 1);
+        if (node.F != 0) CheckDump(c, node.F, depth + 1);
+        if (node.G != 0) CheckDump(c, node.G, depth + 1);
+        n = node.Next;
+    }
+}
+
+// A zeroed side table of n elements of size elem.
+Vec SideTable(usize elem, usize n) {
+    Vec v = VecNew(elem, n + 1);
+    unsafe {
+        for (usize i = 0; i < n; i++) VecPush(&v);
+    }
+    return v;
+}

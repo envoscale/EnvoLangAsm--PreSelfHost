@@ -1,0 +1,94 @@
+// envoc1: the Stage 1 compiler (bootstrap/stage1/README.md). This is the entry file:
+// its top-level statements are the program's main. The other files are listed, in
+// order, in files.txt.
+
+const str VERSION = "envoc1 0.1.0-dev (EnvoScale stage 1, Envo-S1; ";
+
+void Usage(i32 fd) {
+    write(fd, "usage: envoc1 [--core] <command> [arguments]\n");
+    write(fd, "\n");
+    write(fd, "commands:\n");
+    write(fd, "  lex <file.envo>     print the token stream of a source file\n");
+    write(fd, "  parse <file.envo>   print the syntax tree of a source file\n");
+    write(fd, "  check <file.envo>...\n");
+    write(fd, "                      check names and types; print the typed syntax tree\n");
+    write(fd, "  build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]\n");
+    write(fd, "                      compile to an executable (default: this OS)\n");
+    write(fd, "                      (several files are one program; the first is the entry file)\n");
+    write(fd, "  eir <file.envo>...  print the program's EIR\n");
+    write(fd, "  eir-check <file.eir>\n");
+    write(fd, "                      parse and verify an EIR text file, and print it back\n");
+    write(fd, "  version             print the version\n");
+    write(fd, "  help                print this message\n");
+    write(fd, "\n");
+    write(fd, "options:\n");
+    write(fd, "  --core              accept only Envo-Core, exactly as envoc0 does\n");
+}
+
+usize argi = 1;
+bool coreOnly = false;
+if (argi < argc() && StrEq(arg(argi), "--core")) {
+    coreOnly = true;
+    argi++;
+}
+if (argi >= argc()) {
+    Usage(2);
+    Exit(EXIT_USAGE);
+}
+str command = arg(argi);
+argi++;
+
+if (StrEq(command, "version") || StrEq(command, "--version")) {
+    OutStr(VERSION);
+    OutStr(HostTarget());
+    OutLine(")");
+    Exit(EXIT_OK);
+}
+if (StrEq(command, "help") || StrEq(command, "--help")) {
+    Usage(1);
+    Exit(EXIT_OK);
+}
+if (StrEq(command, "selftest-image") && argc() == argi + 2) {
+    SelfTestImage(arg(argi), arg(argi + 1));
+    Exit(EXIT_OK);
+}
+if (StrEq(command, "selftest")) {
+    SelfTest();
+    Exit(EXIT_OK);
+}
+if (StrEq(command, "lex")) {
+    CmdLex(argi, coreOnly);
+}
+if (StrEq(command, "parse")) {
+    CmdParse(argi, coreOnly);
+}
+if (StrEq(command, "check")) {
+    CmdCheck(argi, coreOnly);
+}
+if (StrEq(command, "embed")) {
+    CmdEmbed(argi);
+}
+if (StrEq(command, "eir-check")) {
+    CmdEirCheck(argi);
+}
+if (StrEq(command, "build")) {
+    CmdBuild(argi, coreOnly);
+}
+if (StrEq(command, "eir")) {
+    CmdEir(argi, coreOnly);
+}
+if (StrEq(command, "never")) {
+    *Buf e = Err();
+    BufStr(e, "envoc1: error: '");
+    BufStr(e, command);
+    BufStr(e, "' is not implemented yet\n");
+    Exit(EXIT_USAGE);
+}
+
+*Buf e = Err();
+BufStr(e, "envoc1: error: unknown command '");
+BufStr(e, command);
+BufStr(e, "'\n");
+Flush();
+Usage(2);
+Exit(EXIT_USAGE);

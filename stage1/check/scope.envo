@@ -1,0 +1,563 @@
+// Checker state, symbols, scopes, types and diagnostics. Follows Stage 0's check.eas;
+// see check/decl.envo, check/stmt.envo and check/expr.envo for the passes.
+
+struct Checker {
+    *Vec Toks;
+    *Vec Nodes;
+    Vec NType;          // u32 per node: type of an expression, local, parameter or field
+    Vec NValue;         // u64 per node: constant value (expressions, enum variants), field offset
+    Vec NSym;           // u32 per node: the symbol a name resolved to; an item's symbol
+    Vec NMatched;       // u8 per node: a match pattern whose value was recorded
+    Vec NMove;          // u8 per node: 1 where a use moves a whole local (check/move.envo)
+    Vec NConv;          // u8 per node: 1 where a `string` is used as a `str`
+    Vec Types;          // Type
+    Vec Syms;           // Sym
+    Map Global;         // program scope: name -> symbol
+    Map Derived;        // interned pointer, slice and array types
+    Vec Locals;         // u32 symbols; a stack scanned from the top
+    usize LSP;          // local stack top
+    usize LBase;        // first local of the current function
+    usize Unsafe;       // unsafe block depth
+    usize Loops;        // loop depth
+    u32 Ret;            // current function's return type
+    bool Top;           // checking top-level statements
+    bool Brk;           // a break left the innermost loop
+    Vec ParamTypes;     // u32: parameter types of functions and built-ins
+    bool Core;          // --core
+    bool Runtime;       // compiling with the runtime: the target built-ins exist
+    // Envo-S1 generics, methods and interfaces (check/generic.envo)
+    Vec TypeArgs;       // u32: type arguments of instances and of call environments
+    Map Instances;      // interned generic instance types
+    Map Methods;        // "<owner key>.<name>" -> method symbol | (impl index + 1) << 32
+    Vec Impls;          // ImplRec
+    Vec Bounds;         // u32 pairs: (parameter type, interface type)
+    Vec Calls;          // u32: generic and method call nodes, grouped by function body
+    Vec MainCalls;      // the same for the top-level statements
+    Vec Insts;          // Inst: the functions to compile, one per generic environment
+    Map InstMap;        // "<symbol>:<types>" -> Inst index
+    u32 Scope1;         // type parameter lists visible by name: the owner's,
+    u32 Scope2;         // and the function's own
+    u32 CurFn;          // the function whose body is being checked (0: top level)
+    u32 CurBounds;      // its bounds
+    u32 NCurBounds;
+    // lambdas (check/closure.envo)
+    Vec LamStack;       // u32 triples for the lambdas being checked: node, locals start, first change
+    Vec CapTmp;         // u32 pairs (lambda, local) found so far
+    Vec Captures;       // u32 locals, each lambda's contiguous (its NValue: first | count << 32)
+    // ownership (check/own.envo)
+    u32 PreludeFile;    // the source file of the S1 prelude (0xFFFFFFFF: none)
+    u32 CopySym;        // the built-in auto-interface `Copy`
+    u32 DropSym;        // the prelude's `IDrop`
+    u32 OptionSym;      // the prelude's `Option` (`T?`)
+    u32 ResultSym;      // the prelude's `Result`
+    u32 StringSym;      // the prelude's `string`
+    Map PreludeScope;   // the prelude's items by name, hidden or not
+    // namespaces (check/names.envo)
+    Vec FileNs;         // str per source file: its namespace
+    Map NsSet;          // every namespace and namespace prefix
+    Vec Uses;           // u32: the `use` items
+    Map TokSym;         // token index -> the item a qualified name resolved to
+    Map Summaries;      // function symbol -> its storage summary (check/views.envo)
+}
+
+// ------------------------------------------------------------------ side tables
+
+u32 NType(*Checker c, u32 n) {
+    unsafe { return MemLoadU32(VecAt(&c.NType, n as usize)); }
+}
+
+void SetNType(*Checker c, u32 n, u32 t) {
+    unsafe { MemStoreU32(VecAt(&c.NType, n as usize), t); }
+}
+
+u64 NValue(*Checker c, u32 n) {
+    unsafe { return VecGetU64(&c.NValue, n as usize); }
+}
+
+void SetNValue(*Checker c, u32 n, u64 v) {
+    unsafe { VecSetU64(&c.NValue, n as usize, v); }
+}
+
+u32 NSym(*Checker c, u32 n) {
+    unsafe { return MemLoadU32(VecAt(&c.NSym, n as usize)); }
+}
+
+void SetNSym(*Checker c, u32 n, u32 s) {
+    unsafe { MemStoreU32(VecAt(&c.NSym, n as usize), s); }
+}
+
+bool NMatched(*Checker c, u32 n) {
+    unsafe { return *VecAt(&c.NMatched, n as usize) != 0; }
+}
+
+void SetNMatched(*Checker c, u32 n) {
+    unsafe { *VecAt(&c.NMatched, n as usize) = 1; }
+}
+
+// ------------------------------------------------------------------ nodes and tokens
+
+Node CNode(*Checker c, u32 n) {
+    unsafe { return *NodeAt(c.Nodes, n); }
+}
+
+u16 NKind(*Checker c, u32 n) {
+    return CNode(c, n).Kind;
+}
+
+u32 NTok(*Checker c, u32 n) {
+    return CNode(c, n).Tok;
+}
+
+Token CTok(*Checker c, u32 tok) {
+    unsafe { return *(VecAt(c.Toks, tok as usize) as *Token); }
+}
+
+str TokText(*Checker c, u32 tok) {
+    Token t = CTok(c, tok);
+    return StrSub(SrcGet(t.File).Text, t.Start as usize, (t.Start + t.Len) as usize);
+}
+
+bool SameName(*Checker c, u32 a, u32 b) {
+    return StrEq(TokText(c, a), TokText(c, b));
+}
+
+bool CCore(*Checker c) {
+    unsafe { return c.Core; }
+}
+
+// ------------------------------------------------------------------ types
+
+Type TypeGet(*Checker c, u32 t) {
+    unsafe { return *(VecAt(&c.Types, t as usize) as *Type); }
+}
+
+*Type TypePtr(*Checker c, u32 t) {
+    unsafe { return VecAt(&c.Types, t as usize) as *Type; }
+}
+
+u8 TyKind(*Checker c, u32 t) {
+    return TypeGet(c, t).Kind;
+}
+
+bool IsIntType(*Checker c, u32 t) {
+    return TyKind(c, t) == TYK_INT;
+}
+
+u32 TypeNew(*Checker c, u8 kind) {
+    unsafe {
+        u32 t = VecLen(&c.Types) as u32;
+        *Type ty = VecPush(&c.Types) as *Type;
+        ty.Kind = kind;
+        return t;
+    }
+}
+
+void PrimType(*Checker c, u8 kind, bool signed, u32 size, u32 align, str name) {
+    u32 t = TypeNew(c, kind);
+    unsafe {
+        *Type ty = TypePtr(c, t);
+        ty.Signed = signed;
+        ty.Size = size;
+        ty.Align = align;
+        ty.Name = name;
+    }
+}
+
+// The interned pointer, slice or array type of elem (count for arrays).
+u32 TypeDerived(*Checker c, u8 kind, u32 elem, u32 count) {
+    Buf key = BufNew(24);
+    unsafe {
+        BufU64(&key, kind as u64);
+        BufByte(&key, ':');
+        BufU64(&key, elem as u64);
+        BufByte(&key, ':');
+        BufU64(&key, count as u64);
+        u64 found;
+        if (MapGet(&c.Derived, BufView(&key), &found)) return found as u32;
+        u32 t = TypeNew(c, kind);
+        *Type ty = TypePtr(c, t);
+        ty.Elem = elem;
+        ty.Count = count;
+        if (kind == TYK_PTR) {
+            ty.Size = 8;
+            ty.Align = 8;
+        } else if (kind == TYK_SLICE) {
+            ty.Size = 16;
+            ty.Align = 8;
+        }
+        MapPut(&c.Derived, BufCopy(&key), t as u64);
+        return t;
+    }
+}
+
+u32 TypePtrTo(*Checker c, u32 elem) {
+    return TypeDerived(c, TYK_PTR, elem, 0);
+}
+
+// A new struct or enum type for symbol s.
+u32 TypeNamed(*Checker c, u8 kind, u32 s) {
+    u32 t = TypeNew(c, kind);
+    unsafe {
+        *Type ty = TypePtr(c, t);
+        ty.Sym = s;
+        ty.Name = SymGet(c, s).Name;
+    }
+    return t;
+}
+
+// *T, T[], T[N], or the type's own name; ? for "no type".
+void BufType(*Buf b, *Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_PTR) {
+        BufByte(b, '*');
+        BufType(b, c, ty.Elem);
+    } else if (ty.Kind == TYK_SLICE) {
+        if (ty.Count == 1) BufStr(b, "mut ");
+        BufType(b, c, ty.Elem);
+        BufStr(b, "[]");
+    } else if (ty.Kind == TYK_ARRAY) {
+        BufType(b, c, ty.Elem);
+        BufByte(b, '[');
+        BufU64(b, ty.Count as u64);
+        BufByte(b, ']');
+    } else if (t == 0) {
+        BufByte(b, '?');
+    } else if (ty.Kind == TYK_FN) {
+        BufFnType(b, c, ty);
+    } else {
+        BufStr(b, ty.Name);
+        if (ty.NArgs > 0) {
+            BufByte(b, '<');
+            for (u32 i = 0; i < ty.NArgs; i++) {
+                if (i > 0) BufStr(b, ", ");
+                BufType(b, c, EnvGet(c, ty.Args, i));
+            }
+            BufByte(b, '>');
+        }
+    }
+}
+
+// ------------------------------------------------------------------ symbols
+
+Sym SymGet(*Checker c, u32 s) {
+    unsafe { return *(VecAt(&c.Syms, s as usize) as *Sym); }
+}
+
+*Sym SymPtr(*Checker c, u32 s) {
+    unsafe { return VecAt(&c.Syms, s as usize) as *Sym; }
+}
+
+// A new zeroed symbol; its name is the token text of node n (if any).
+u32 SymNew(*Checker c, u8 kind, u32 n) {
+    unsafe {
+        u32 s = VecLen(&c.Syms) as u32;
+        *Sym sym = VecPush(&c.Syms) as *Sym;
+        sym.Kind = kind;
+        sym.Node = n;
+        if (n != 0) sym.Name = TokText(c, NTok(c, n));
+        return s;
+    }
+}
+
+// Program scope.
+u32 GFind(*Checker c, str name) {
+    u64 s;
+    unsafe {
+        if (MapGet(&c.Global, name, &s)) return s as u32;
+    }
+    return 0;
+}
+
+void GAdd(*Checker c, u32 s) {
+    unsafe { MapPut(&c.Global, SymGet(c, s).Name, s as u64); }
+}
+
+// Locals: the visible local with token tok's name, or 0.
+u32 LocalFind(*Checker c, u32 tok) {
+    str name = TokText(c, tok);
+    unsafe {
+        usize i = c.LSP;
+        while (i > c.LBase) {
+            i--;
+            u32 s = MemLoadU32(VecAt(&c.Locals, i));
+            if (StrEq(SymGet(c, s).Name, name)) return s;
+        }
+    }
+    return 0;
+}
+
+// Adds a local symbol for node n with type t.
+u32 LocalPush(*Checker c, u32 n, u32 t) {
+    u32 s = SymNew(c, SK_LOCAL, n);
+    LocalPushSym(c, s, t);
+    return s;
+}
+
+// Adds a local without a declaring node (a method's implicit `this`).
+u32 LocalPushNamed(*Checker c, str name, u32 t) {
+    u32 s = SymNew(c, SK_LOCAL, 0);
+    unsafe { SymPtr(c, s).Name = name; }
+    LocalPushSym(c, s, t);
+    return s;
+}
+
+void LocalPushSym(*Checker c, u32 s, u32 t) {
+    unsafe {
+        SymPtr(c, s).Type = t;
+        SymPtr(c, s).Value = c.LSP as u64;     // its stack index, for lambda captures
+        if (c.LSP == VecLen(&c.Locals)) VecPush(&c.Locals);
+        MemStoreU32(VecAt(&c.Locals, c.LSP), s);
+        c.LSP++;
+    }
+}
+
+// Locals first, then program scope.
+u32 Lookup(*Checker c, u32 tok) {
+    u32 fixed = FixedSym(c, tok);
+    if (fixed != 0) return fixed;
+    u32 s = LocalFind(c, tok);
+    if (s != 0) return s;
+    return GFindAt(c, tok);
+}
+
+// The program-scope symbol token tok names. Inside the prelude, the prelude's own items
+// come first, so a program's items of the same names cannot change what it means.
+u32 GFindAt(*Checker c, u32 tok) {
+    u32 fixed = FixedSym(c, tok);
+    if (fixed != 0) return fixed;
+    unsafe {
+        if (c.PreludeFile != 0xFFFFFFFF && CTok(c, tok).File == c.PreludeFile) {
+            u64 s;
+            if (MapGet(&c.PreludeScope, TokText(c, tok), &s)) return s as u32;
+        }
+        if (MapLen(&c.NsSet) == 0) return GFind(c, TokText(c, tok));
+    }
+    return FindInScope(c, TokText(c, tok), CTok(c, tok).File, tok);
+}
+
+// [core.name.2]: adds a local; E0204 if a visible local already has the name.
+void DeclareLocal(*Checker c, u32 n, u32 t) {
+    u32 tok = NTok(c, n);
+    if (LocalFind(c, tok) != 0) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufByte(&b, '`');
+            BufStr(&b, TokText(c, tok));
+            BufStr(&b, "` is already declared in this function");
+            CFail(c, tok, E_REDECLARED, BufView(&b));
+        }
+    }
+    SetNSym(c, n, LocalPush(c, n, t));
+}
+
+// ------------------------------------------------------------------ diagnostics
+
+void CFail(*Checker c, u32 tok, u32 code, str msg) {
+    Token t = CTok(c, tok);
+    Fail(t.File, t.Start as usize, code, msg);
+}
+
+void CError(*Checker c, u32 code, u32 tok) {
+    CFail(c, tok, code, CheckMessage(code));
+}
+
+// A message with `name` (the text of token nameTok) between prefix and suffix.
+void CFailName(*Checker c, u32 tok, u32 code, str prefix, u32 nameTok, str suffix) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, prefix);
+        BufStr(&b, TokText(c, nameTok));
+        BufStr(&b, suffix);
+        CFail(c, tok, code, BufView(&b));
+    }
+}
+
+// E0301 "mismatched types: expected `T`, found `U`" at tok.
+void Mismatch(*Checker c, u32 expected, u32 tok, u32 found) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "mismatched types: expected `");
+        BufType(&b, c, expected);
+        BufStr(&b, "`, found `");
+        BufType(&b, c, found);
+        BufByte(&b, '`');
+        CFail(c, tok, E_MISMATCH, BufView(&b));
+    }
+}
+
+// E0302 "operator `op` cannot be applied to `T`" at the operator token.
+void BadOperand(*Checker c, u32 t, u32 opTok) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "operator `");
+        BufStr(&b, TokText(c, opTok));
+        BufStr(&b, "` cannot be applied to `");
+        BufType(&b, c, t);
+        BufByte(&b, '`');
+        CFail(c, opTok, E_BAD_OPERAND, BufView(&b));
+    }
+}
+
+// E0304 "value does not fit in `T`".
+void DoesNotFit(*Checker c, u32 tok, u32 t) {
+    Buf b = BufNew(48);
+    unsafe {
+        BufStr(&b, "value does not fit in `");
+        BufType(&b, c, t);
+        BufByte(&b, '`');
+        CFail(c, tok, E_DOES_NOT_FIT, BufView(&b));
+    }
+}
+
+// E0206 "`T` has no member `x`".
+void NoMember(*Checker c, u32 tok, u32 t) {
+    Buf b = BufNew(48);
+    unsafe {
+        BufByte(&b, '`');
+        BufType(&b, c, t);
+        BufStr(&b, "` has no member `");
+        BufStr(&b, TokText(c, tok));
+        BufByte(&b, '`');
+        CFail(c, tok, E_NO_MEMBER, BufView(&b));
+    }
+}
+
+// E0905 in Core (E0950 in Envo-S1) for a construct the checker recognises.
+void CNotCore(*Checker c, str what, u32 tok) {
+    Buf b = BufNew(64);
+    u32 code = E_CORE_CONSTRUCT;
+    unsafe {
+        if (c.Core) {
+            BufStr(&b, "not part of Envo-Core: ");
+        } else {
+            BufStr(&b, "not part of Envo-S1: ");
+            code = E_NOT_S1;
+        }
+        BufStr(&b, what);
+        CFail(c, tok, code, BufView(&b));
+    }
+}
+
+// ------------------------------------------------------------------ program scope
+
+void AddPrimSym(*Checker c, str name, u32 t) {
+    u32 s = SymNew(c, SK_TYPE, 0);
+    unsafe {
+        *Sym sym = SymPtr(c, s);
+        sym.Name = name;
+        sym.Type = t;
+    }
+    GAdd(c, s);
+}
+
+void AddBuiltin(*Checker c, str name, u32 id, u32 ret, u32 n, u32 p1, u32 p2, u32 p3) {
+    u32 s = SymNew(c, SK_BUILTIN, 0);
+    unsafe {
+        u32 first = VecLen(&c.ParamTypes) as u32;
+        MemStoreU32(VecPush(&c.ParamTypes), p1);
+        MemStoreU32(VecPush(&c.ParamTypes), p2);
+        MemStoreU32(VecPush(&c.ParamTypes), p3);
+        *Sym sym = SymPtr(c, s);
+        sym.Name = name;
+        sym.Type = ret;
+        sym.Aux = n;
+        sym.Aux2 = id;
+        sym.Params = first;
+    }
+    GAdd(c, s);
+}
+
+// Primitive types, aliases and built-ins ([core.name.1]).
+void InitScope(*Checker c) {
+    TypeNew(c, 0);      // type 0: none
+    PrimType(c, TYK_VOID, false, 0, 1, "void");
+    PrimType(c, TYK_BOOL, false, 1, 1, "bool");
+    PrimType(c, TYK_STR, false, 16, 8, "str");
+    PrimType(c, TYK_INT, true, 1, 1, "i8");
+    PrimType(c, TYK_INT, true, 2, 2, "i16");
+    PrimType(c, TYK_INT, true, 4, 4, "i32");
+    PrimType(c, TYK_INT, true, 8, 8, "i64");
+    PrimType(c, TYK_INT, true, 8, 8, "isize");
+    PrimType(c, TYK_INT, false, 1, 1, "u8");
+    PrimType(c, TYK_INT, false, 2, 2, "u16");
+    PrimType(c, TYK_INT, false, 4, 4, "u32");
+    PrimType(c, TYK_INT, false, 8, 8, "u64");
+    PrimType(c, TYK_INT, false, 8, 8, "usize");
+    u32 ptrU8 = TypePtrTo(c, T_U8);
+    if (ptrU8 != T_PTR_U8) Bug("checker: *u8 is not type 14");
+    SymNew(c, 0, 0);    // symbol 0: none
+    for (u32 t = T_VOID; t <= T_USIZE; t++) AddPrimSym(c, TypeGet(c, t).Name, t);
+    AddPrimSym(c, "byte", T_U8);
+    AddPrimSym(c, "int", T_I32);
+    AddPrimSym(c, "uint", T_U32);
+    AddPrimSym(c, "long", T_I64);
+    AddPrimSym(c, "ulong", T_U64);
+    AddBuiltin(c, "print", 1, T_VOID, 1, T_STR, 0, 0);
+    AddBuiltin(c, "write", 2, T_VOID, 2, T_I32, T_STR, 0);
+    AddBuiltin(c, "read", 3, T_ISIZE, 3, T_I32, T_PTR_U8, T_USIZE);
+    AddBuiltin(c, "open", 4, T_I32, 2, T_STR, T_I32, 0);
+    AddBuiltin(c, "close", 5, T_VOID, 1, T_I32, 0, 0);
+    AddBuiltin(c, "alloc", 6, T_PTR_U8, 1, T_USIZE, 0, 0);
+    AddBuiltin(c, "exit", B_EXIT, T_VOID, 1, T_I32, 0, 0);
+    AddBuiltin(c, "argc", 8, T_USIZE, 0, 0, 0, 0);
+    AddBuiltin(c, "arg", 9, T_STR, 1, T_USIZE, 0, 0);
+    AddBuiltin(c, "panic", B_PANIC, T_VOID, 1, T_STR, 0, 0);
+    AddBuiltin(c, "str_from", B_STR_FROM, T_STR, 2, T_PTR_U8, T_USIZE, 0);
+    if (!CCore(c)) {
+        // the Envo-S1 built-ins (envo-s1.md section 7); a program's own items hide them
+        AddBuiltin(c, "free", B_FREE, T_VOID, 1, T_PTR_U8, 0, 0);
+        MarkLastPrelude(c);
+        AddBuiltin(c, "slice_from", B_SLICE_FROM, 0, 2, T_PTR_U8, T_USIZE, 0);
+        MarkLastPrelude(c);
+        AddBuiltin(c, "slice_from_mut", B_SLICE_FROM_MUT, 0, 2, T_PTR_U8, T_USIZE, 0);
+        MarkLastPrelude(c);
+        // `Copy`, the automatic interface ([type.copy.1]); a program's own `Copy` hides it
+        u32 s = SymNew(c, SK_IFACE, 0);
+        unsafe {
+            *Sym sym = SymPtr(c, s);
+            sym.Name = "Copy";
+            sym.Flags = SF_PRELUDE;
+            sym.Type = TypeNamed(c, TYK_IFACE, s);
+            c.CopySym = s;
+        }
+        GAdd(c, s);
+    }
+    bool runtime;
+    unsafe { runtime = c.Runtime; }
+    if (runtime) {
+        // target intrinsics for the runtime's OS layer (docs/architecture/stage1.md)
+        AddBuiltinN(c, "__syscall", B_SYSCALL, T_I64, 7, T_I64);
+        AddBuiltinN(c, "__wincall", B_WINCALL, T_I64, 11, T_I64);     // import slot and up to 10 arguments
+        AddBuiltinN(c, "__wincall12", B_WINCALL, T_I64, 13, T_I64);   // import slot and 12 arguments
+        AddBuiltinN(c, "__wincallp", B_WINCALLP, T_I64, 13, T_I64);   // a function pointer and 12 arguments
+        AddBuiltinN(c, "__hostcall", B_HOSTCALL, T_I64, 5, T_I64);    // the WebAssembly host's function k and 4 arguments
+    }
+}
+
+// The symbol just added is a prelude item, hidden by a program's own item of its name.
+void MarkLastPrelude(*Checker c) {
+    unsafe {
+        u32 s = (VecLen(&c.Syms) - 1) as u32;
+        SymPtr(c, s).Flags = SymGet(c, s).Flags | SF_PRELUDE;
+    }
+}
+
+// A built-in with n parameters of one type.
+void AddBuiltinN(*Checker c, str name, u32 id, u32 ret, u32 n, u32 p) {
+    u32 s = SymNew(c, SK_BUILTIN, 0);
+    unsafe {
+        u32 first = VecLen(&c.ParamTypes) as u32;
+        for (u32 i = 0; i < n; i++) MemStoreU32(VecPush(&c.ParamTypes), p);
+        *Sym sym = SymPtr(c, s);
+        sym.Name = name;
+        sym.Type = ret;
+        sym.Aux = n;
+        sym.Aux2 = id;
+        sym.Params = first;
+    }
+    GAdd(c, s);
+}
+
+u32 ParamType(*Checker c, u32 s, u32 i) {
+    unsafe { return MemLoadU32(VecAt(&c.ParamTypes, (SymGet(c, s).Params + i) as usize)); }
+}

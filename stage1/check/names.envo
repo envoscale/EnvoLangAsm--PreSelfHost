@@ -1,0 +1,271 @@
+// Envo-S1 namespaces, `use` and visibility ([s1.item.1], [s1.item.2]; docs/architecture/
+// stage1.md, "Namespaces"). A file may start with `namespace a.b;`; its items are then
+// `a.b.X` in program scope. All files still form one program. An unqualified name is
+// looked up in the file's namespace and the namespaces around it, then in what the file
+// imports, then in the root namespace. A private item (the default) is visible only
+// inside its own namespace; `public` and `internal` ones everywhere.
+
+// The namespace of source file f ("" for the root).
+str FileNamespace(*Checker c, u32 f) {
+    unsafe {
+        if (f as usize >= VecLen(&c.FileNs)) return "";
+        return *(VecAt(&c.FileNs, f as usize) as *str);
+    }
+}
+
+// The dotted path a list of name nodes spells.
+str PathText(*Checker c, u32 first) {
+    Buf b = BufNew(32);
+    u32 p = first;
+    unsafe {
+        while (p != 0) {
+            if (p != first) BufByte(&b, '.');
+            BufStr(&b, TokText(c, NTok(c, p)));
+            p = CNode(c, p).Next;
+        }
+        return BufCopy(&b);
+    }
+}
+
+str JoinName(str ns, str name) {
+    if (ns.Len == 0) return name;
+    Buf b = BufNew(ns.Len + name.Len + 1);
+    unsafe {
+        BufStr(&b, ns);
+        BufByte(&b, '.');
+        BufStr(&b, name);
+        return BufCopy(&b);
+    }
+}
+
+bool IsNamespace(*Checker c, str path) {
+    unsafe { return MapHas(&c.NsSet, path); }
+}
+
+// Pass 0: each file's namespace (E0211 unless it comes first), the namespaces that exist
+// (with every prefix), and the files' `use` lines (E0213 for an unknown namespace).
+void CollectNamespaces(*Checker c, u32 first) {
+    unsafe {
+        usize files = VecLen(Files());
+        for (usize i = 0; i < files; i++) *(VecPush(&c.FileNs) as *str) = "";
+    }
+    Vec seen = VecNew(1, 8);        // u8 per file: an item came before
+    unsafe {
+        for (usize i = 0; i < VecLen(Files()); i++) *VecPush(&seen) = 0;
+    }
+    u32 n = first;
+    while (n != 0) {
+        u32 f = CTok(c, NTok(c, n)).File;
+        if (NKind(c, n) == NK_NAMESPACE) {
+            unsafe {
+                if (*VecAt(&seen, f as usize) != 0) CFail(c, NTok(c, n), E_NAMESPACE_FIRST, "`namespace` must come first in its file");
+            }
+            str path = PathText(c, CNode(c, n).A);
+            unsafe {
+                *(VecAt(&c.FileNs, f as usize) as *str) = path;
+                // the namespace and each prefix
+                for (usize i = 0; i <= path.Len; i++) {
+                    if (i == path.Len || path[i] == '.') MapPut(&c.NsSet, StrSub(path, 0, i), 1);
+                }
+            }
+        }
+        unsafe { *VecAt(&seen, f as usize) = 1; }
+        n = CNode(c, n).Next;
+    }
+    // `use` lines name namespaces that exist
+    n = first;
+    while (n != 0) {
+        if (NKind(c, n) == NK_USE) {
+            unsafe { MemStoreU32(VecPush(&c.Uses), n); }
+            str path = PathText(c, CNode(c, n).A);
+            if (!IsNamespace(c, path)) {
+                Buf b = BufNew(48);
+                unsafe {
+                    BufStr(&b, "unknown namespace `");
+                    BufStr(&b, path);
+                    BufByte(&b, '`');
+                    CFail(c, NTok(c, CNode(c, n).A), E_UNKNOWN_NAMESPACE, BufView(&b));
+                }
+            }
+        }
+        n = CNode(c, n).Next;
+    }
+}
+
+// May code in file f use item symbol s? ([s1.item.2])
+bool VisibleFrom(*Checker c, u32 s, u32 f) {
+    Sym sym = SymGet(c, s);
+    if (sym.Flags & (SF_PUBLIC | SF_PRELUDE) != 0) return true;
+    if (sym.Kind == SK_TYPE || sym.Kind == SK_BUILTIN) return true;
+    return StrEq(sym.Ns, FileNamespace(c, f));
+}
+
+// The item key path.name names, if code in file f may use it: 0 if there is none,
+// E0212 if it is private to another namespace.
+u32 FindVisible(*Checker c, str key, u32 f, u32 tok) {
+    u32 s = GFind(c, key);
+    if (s == 0) return 0;
+    if (!VisibleFrom(c, s, f)) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufByte(&b, '`');
+            BufStr(&b, key);
+            BufStr(&b, "` is private to namespace `");
+            BufStr(&b, SymGet(c, s).Ns);
+            BufStr(&b, "`; mark it `public` or `internal` to use it here");
+            CFail(c, tok, E_PRIVATE, BufView(&b));
+        }
+    }
+    return s;
+}
+
+// An unqualified name in file f: its namespace and those around it, its imports, the root.
+u32 FindInScope(*Checker c, str name, u32 f, u32 tok) {
+    str ns = FileNamespace(c, f);
+    while (ns.Len > 0) {
+        u32 s = GFind(c, JoinName(ns, name));
+        if (s != 0) return s;
+        usize cut = ns.Len;
+        while (cut > 0 && ns[cut - 1] != '.') cut--;
+        if (cut == 0) ns = "";
+        else ns = StrSub(ns, 0, cut - 1);
+    }
+    // `use a.b;` imports every name of a.b; `use a.b.{X, Y};` imports X and Y
+    usize uses;
+    unsafe { uses = VecLen(&c.Uses); }
+    for (usize i = 0; i < uses; i++) {
+        u32 u;
+        unsafe { u = MemLoadU32(VecAt(&c.Uses, i)); }
+        Node un = CNode(c, u);
+        if (un.C == 0 && CTok(c, un.Tok).File == f) {
+            str path = PathText(c, un.A);
+            if (un.B == 0) {
+                u32 s = FindVisible(c, JoinName(path, name), f, tok);
+                if (s != 0) return s;
+            } else {
+                u32 m = un.B;
+                while (m != 0) {
+                    if (StrEq(TokText(c, NTok(c, m)), name)) {
+                        u32 s = FindVisible(c, JoinName(path, name), f, NTok(c, m));
+                        if (s == 0) CFailName(c, NTok(c, m), E_UNKNOWN_NAME, "unknown name `", NTok(c, m), "`");
+                        return s;
+                    }
+                    m = CNode(c, m).Next;
+                }
+            }
+        }
+    }
+    u32 s = GFind(c, name);
+    if (s != 0 && !VisibleFrom(c, s, f)) return 0;
+    return s;
+}
+
+// The namespace a name chain spells in file f (an alias from `use a.b as c`, a namespace,
+// or a namespace inside one), or "".
+str NsPathOf(*Checker c, u32 n, u32 f) {
+    Node node = CNode(c, n);
+    if (node.Kind == NK_NAME) {
+        str t = TokText(c, node.Tok);
+        str alias = AliasPath(c, t, f);
+        if (alias.Len > 0) return alias;
+        if (IsNamespace(c, t)) return t;
+        return "";
+    }
+    if (node.Kind != NK_MEMBER) return "";
+    str inner = NsPathOf(c, node.A, f);
+    if (inner.Len == 0) return "";
+    str whole = JoinName(inner, TokText(c, node.Tok));
+    if (IsNamespace(c, whole)) return whole;
+    return "";
+}
+
+// `ns.X` in an expression, met while checking: when the chain does not start with a
+// local, member node n becomes the name X with its item fixed (Checker.TokSym), so the
+// rest of the checker and lowering see a plain name.
+void TryQualified(*Checker c, u32 n) {
+    unsafe {
+        if (MapLen(&c.NsSet) == 0) return;
+    }
+    if (NKind(c, n) != NK_MEMBER) return;
+    Node node = CNode(c, n);
+    u32 root = node.A;
+    while (NKind(c, root) == NK_MEMBER) root = CNode(c, root).A;
+    if (NKind(c, root) != NK_NAME || LocalFind(c, NTok(c, root)) != 0) return;
+    u32 f = CTok(c, node.Tok).File;
+    str ns = NsPathOf(c, node.A, f);
+    if (ns.Len == 0) return;
+    str key = JoinName(ns, TokText(c, node.Tok));
+    if (IsNamespace(c, key)) return;        // a namespace inside one: the outer member goes on
+    u32 s = FindVisible(c, key, f, node.Tok);
+    if (s == 0) CFailName(c, node.Tok, E_UNKNOWN_NAME, "unknown name `", node.Tok, "`");
+    unsafe {
+        *Node p = NodeAt(c.Nodes, n);
+        p.Kind = NK_NAME;
+        p.A = 0;
+        MapPut(&c.TokSym, TokKey(node.Tok), s as u64);
+    }
+}
+
+// The key of token tok in Checker.TokSym.
+str TokKey(u32 n) {
+    Buf b = BufNew(12);
+    unsafe {
+        BufU64(&b, n as u64);
+        return BufCopy(&b);
+    }
+}
+
+// The item the name at token tok stands for after ResolveQualified, or 0.
+u32 FixedSym(*Checker c, u32 tok) {
+    u64 s;
+    unsafe {
+        if (MapLen(&c.TokSym) == 0) return 0;
+        if (MapGet(&c.TokSym, TokKey(tok), &s)) return s as u32;
+    }
+    return 0;
+}
+
+// `a.b.T` in a type: the qualifiers (an alias first, if any) and the name.
+u32 QualifiedType(*Checker c, u32 quals, u32 tok) {
+    u32 f = CTok(c, tok).File;
+    Buf b = BufNew(32);
+    u32 q = quals;
+    unsafe {
+        while (q != 0) {
+            str t = TokText(c, NTok(c, q));
+            if (q == quals) {
+                str alias = AliasPath(c, t, f);
+                if (alias.Len > 0) t = alias;
+            }
+            if (q != quals) BufByte(&b, '.');
+            BufStr(&b, t);
+            q = CNode(c, q).Next;
+        }
+    }
+    str ns;
+    unsafe { ns = BufCopy(&b); }
+    if (!IsNamespace(c, ns)) {
+        Buf m = BufNew(48);
+        unsafe {
+            BufStr(&m, "unknown namespace `");
+            BufStr(&m, ns);
+            BufByte(&m, '`');
+            CFail(c, NTok(c, quals), E_UNKNOWN_NAMESPACE, BufView(&m));
+        }
+    }
+    u32 s = FindVisible(c, JoinName(ns, TokText(c, tok)), f, tok);
+    if (s == 0) CFailName(c, tok, E_UNKNOWN_TYPE, "unknown type `", tok, "`");
+    return s;
+}
+
+// The namespace `use … as name` in file f names, or "".
+str AliasPath(*Checker c, str name, u32 f) {
+    unsafe {
+        for (usize i = 0; i < VecLen(&c.Uses); i++) {
+            u32 u = MemLoadU32(VecAt(&c.Uses, i));
+            Node un = CNode(c, u);
+            if (un.C != 0 && CTok(c, un.Tok).File == f && StrEq(TokText(c, NTok(c, un.C)), name)) return PathText(c, un.A);
+        }
+    }
+    return "";
+}

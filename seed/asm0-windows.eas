@@ -1,0 +1,36 @@
+; =============================================================================
+; asm0-windows.eas - top-level build unit: asm0, the seed assembler, for x86-64
+; Windows (PLAN D67). The same layout as Stage 0's envoc0-windows.eas: its header,
+; runtime block and support routines, then the assembler (src/).
+;
+; Built by NASM (`nasm -f bin -I bootstrap/seed/`), by asm0 itself, or from
+; seed-windows.hex with hex2bin; all three give the same bytes.
+; =============================================================================
+        bits    64
+        default rel
+
+%include "../stage0/platform/pe.eas"
+%include "../stage0/platform/runtime-abi.eas"
+%include "../stage0/platform/windows.eas"
+
+sys_open       equ rtw_sys_open
+sys_read       equ rtw_sys_read
+sys_write      equ rtw_sys_write
+sys_close      equ rtw_sys_close
+sys_alloc      equ rtw_sys_alloc
+sys_free       equ rtw_sys_free
+sys_exit       equ rtw_sys_exit
+sys_args       equ rtw_sys_args
+
+%include "../stage0/src/mem.eas"
+%include "../stage0/src/io.eas"
+%include "src/asm.eas"
+%include "src/lines.eas"
+%include "src/encode.eas"
+%include "src/insn.eas"
+%include "src/data.eas"
+
+image_end:
+        ; Pad the file to the PE file alignment; SizeOfRawData is a multiple of it.
+        times (PE_ALIGN - (($ - $$) % PE_ALIGN)) % PE_ALIGN db 0
+pe_file_end:

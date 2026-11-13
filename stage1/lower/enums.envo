@@ -1,0 +1,332 @@
+// Lowering tagged enums and Envo-S1 `match` (docs/architecture/stage1.md, "Enums"). A tagged
+// enum is the EIR struct { u32 tag, [K x word] } (word: the largest payload alignment);
+// variant V's payload is the struct of its fields, laid over the words.
+
+u32 WordType(u32 size) {
+    if (size == 8) return ET_U64;
+    if (size == 4) return ET_U32;
+    if (size == 2) return ET_U16;
+    return ET_U8;
+}
+
+// The EIR type of concrete tagged enum type t.
+u32 TaggedEType(*Lower l, u32 t) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    u64 align;
+    unsafe { SizeOf(c, t, 0, &align); }
+    Type ty = TypeGet(c, t);
+    Buf name = BufNew(32);
+    Vec fields = VecNew(4, 2);
+    unsafe {
+        BufMangle(&name, c, t);
+        MemStoreU32(VecPush(&fields), ET_U32);
+        MemStoreU32(VecPush(&fields), EArrayType(m, WordType(ty.Count), ty.Elem));
+        return EStructOf(l, BufCopy(&name), &fields);
+    }
+}
+
+// The EIR struct of variant v's payload in concrete tagged enum type t.
+u32 PayloadEType(*Lower l, u32 t, u32 v) {
+    *Checker c = LC(l);
+    Buf name = BufNew(32);
+    Vec fields = VecNew(4, 4);
+    unsafe {
+        BufMangle(&name, c, t);
+        BufStr(&name, ".");
+        BufStr(&name, TokText(c, NTok(c, v)));
+        u32 f = CNode(c, v).E;
+        while (f != 0) {
+            MemStoreU32(VecPush(&fields), LType(l, PayloadType(c, t, f)));
+            f = CNode(c, f).Next;
+        }
+        return EStructOf(l, BufCopy(&name), &fields);
+    }
+}
+
+// The address of variant v's payload in the tagged value at p.
+u32 PayloadAddr(*Lower l, u32 t, u32 p) {
+    return LField(l, LType(l, t), p, 1);
+}
+
+// Variant v of concrete type t, built from the payload arguments args (a node list).
+u32 LowerVariantValue(*Lower l, u32 t, u32 v, u32 args) {
+    *Checker c = LC(l);
+    u32 et = LType(l, t);
+    if (!IsTagged(c, t)) return LConst(l, et, NValue(c, v));       // a fieldless enum
+    u32 tmp = LSlot(l, et);
+    LZero(l, tmp, ESizeOf(l, et) as u64);
+    LStore(l, ET_U32, LConst(l, ET_U32, NValue(c, v)), LField(l, et, tmp, 0));
+    u32 pt = PayloadEType(l, t, v);
+    u32 pay = PayloadAddr(l, t, tmp);
+    u32 a = args;
+    u32 f = CNode(c, v).E;
+    u32 i = 0;
+    while (a != 0) {
+        u32 ft = PayloadType(c, t, f);
+        StoreTo(l, ft, LowerExpr(l, a), LField(l, pt, pay, i));
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+        i++;
+    }
+    return tmp;
+}
+
+// The address of field 0 of variant v's payload in the tagged value at p, of type t.
+u32 PayloadField0(*Lower l, u32 t, u32 v, u32 p) {
+    return LField(l, PayloadEType(l, t, v), PayloadAddr(l, t, p), 0);
+}
+
+// `a ?? b`: a's `Some` value, or b.
+u32 LowerCoalesce(*Lower l, u32 n, u32 t) {
+    *Checker c = LC(l);
+    Node node = CNode(c, n);
+    u32 ot = LNType(l, node.A);
+    u32 some;
+    unsafe { some = VariantByName(c, c.OptionSym, "Some"); }
+    u32 v = LowerExpr(l, node.A);
+    u32 tag = LLoad(l, ET_U32, LField(l, LType(l, ot), v, 0));
+    u32 slot = LSlot(l, LType(l, t));
+    u32 yes = LNewBlock(l);
+    u32 no = LNewBlock(l);
+    u32 join = LNewBlock(l);
+    LCondBr(l, LBin(l, 20, ET_U32, tag, LConst(l, ET_U32, NValue(c, some))), yes, no);
+    LStart(l, yes);
+    StoreTo(l, t, LoadPlace(l, t, PayloadField0(l, ot, some, v)), slot);
+    LBr(l, join);
+    LStart(l, no);
+    StoreTo(l, t, LowerExpr(l, node.B), slot);
+    LBr(l, join);
+    LStart(l, join);
+    return LoadPlace(l, t, slot);
+}
+
+// `e?`: e's value, or return `None` (or e's error) from the function, with the drops of
+// a `return`.
+u32 LowerTry(*Lower l, u32 n, u32 t) {
+    *Checker c = LC(l);
+    Node node = CNode(c, n);
+    u32 ot = LNType(l, node.A);
+    bool option = IsOptionType(c, ot);
+    u32 s;
+    unsafe {
+        s = c.ResultSym;
+        if (option) s = c.OptionSym;
+    }
+    u32 good = VariantByName(c, s, "Ok");
+    u32 bad = VariantByName(c, s, "Err");
+    if (option) {
+        good = VariantByName(c, s, "Some");
+        bad = VariantByName(c, s, "None");
+    }
+    u32 v = LowerExpr(l, node.A);
+    u32 tag = LLoad(l, ET_U32, LField(l, LType(l, ot), v, 0));
+    u32 ok = LNewBlock(l);
+    u32 fail = LNewBlock(l);
+    LCondBr(l, LBin(l, 20, ET_U32, tag, LConst(l, ET_U32, NValue(c, good))), ok, fail);
+    LStart(l, fail);
+    u32 rt;
+    u32 rs;
+    unsafe {
+        rt = l.RetType;
+        rs = l.RetSlot;
+    }
+    u32 et = LType(l, rt);
+    u32 rv = LSlot(l, et);
+    LZero(l, rv, ESizeOf(l, et) as u64);
+    LStore(l, ET_U32, LConst(l, ET_U32, NValue(c, bad)), LField(l, et, rv, 0));
+    if (!option) {
+        // the error moves into the result
+        u32 errType = TypeArg(c, ot, 1);
+        StoreTo(l, errType, LoadPlace(l, errType, PayloadField0(l, ot, bad, v)), PayloadField0(l, rt, bad, rv));
+    }
+    LCopy(l, rs, rv, ESizeOf(l, et) as u64);
+    DropTempsOnPath(l);
+    DropDownTo(l, 0, true);
+    LEmit(l, 58, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+    LStart(l, ok);
+    return LoadPlace(l, t, PayloadField0(l, ot, good, v));
+}
+
+// Drops the payload of the variant tagged value p holds (each field that needs it).
+void DropPayload(*Lower l, u32 t, u32 p) {
+    *Checker c = LC(l);
+    u32 tag = LLoad(l, ET_U32, LField(l, LType(l, t), p, 0));
+    u32 v = CNode(c, SymGet(c, TypeGet(c, t).Sym).Node).B;
+    while (v != 0) {
+        bool needs = false;
+        u32 f = CNode(c, v).E;
+        while (f != 0) {
+            if (NeedsDrop(c, PayloadType(c, t, f))) needs = true;
+            f = CNode(c, f).Next;
+        }
+        if (needs) {
+            u32 yes = LNewBlock(l);
+            u32 next = LNewBlock(l);
+            LCondBr(l, LBin(l, 20, ET_U32, tag, LConst(l, ET_U32, NValue(c, v))), yes, next);
+            LStart(l, yes);
+            u32 pt = PayloadEType(l, t, v);
+            u32 pay = PayloadAddr(l, t, p);
+            f = CNode(c, v).E;
+            u32 i = 0;
+            while (f != 0) {
+                u32 ft = PayloadType(c, t, f);
+                if (NeedsDrop(c, ft)) DropValue(l, ft, LField(l, pt, pay, i));
+                f = CNode(c, f).Next;
+                i++;
+            }
+            LBr(l, next);
+            LStart(l, next);
+        }
+        v = CNode(c, v).Next;
+    }
+}
+
+// An Envo-S1 match ([s1.expr.1]): each arm tests its patterns in order, binds, checks its
+// guard, and runs; a failed guard goes on to the next arm. isExpr: returns the value.
+u32 LowerMatchS1(*Lower l, u32 n, bool isExpr) {
+    *Checker c = LC(l);
+    Node m = CNode(c, n);
+    u32 st = LNType(l, m.A);
+    bool tagged = IsTagged(c, st);
+    u32 kind = NValue(c, n) as u32;
+    usize mark = DropMark(l);
+    u32 v = LowerExpr(l, m.A);
+    DropTemps(l);
+    if (tagged && kind == MS_TEMP) {
+        // the temporary is held like a local: dropped at the end unless an arm takes it
+        u32 hold = NSym(c, n);
+        SetSymSlot(l, hold, v);
+        TrackDrop(l, hold, st, true, m.Tok);
+    }
+    u32 tag = v;
+    u32 tt = LType(l, st);
+    if (tagged) {
+        tag = LLoad(l, ET_U32, LField(l, tt, v, 0));
+        tt = ET_U32;
+    }
+    u32 rt = 0;
+    u32 slot = 0;
+    if (isExpr) {
+        rt = LNType(l, n);
+        slot = LSlot(l, LType(l, rt));
+    }
+    u32 join = LNewBlock(l);
+    u32 arm = m.B;
+    while (arm != 0) {
+        Node a = CNode(c, arm);
+        u32 next = LNewBlock(l);
+        u32 bind = LNewBlock(l);
+        u32 pat = a.A;
+        while (pat != 0) {
+            if (NKind(c, pat) == NK_WILD) {
+                LBr(l, bind);
+            } else {
+                u32 other = LNewBlock(l);
+                u64 key = NValue(c, pat);
+                if (!tagged) key = WrapValue(c, key, IntReprType(c, st));
+                LCondBr(l, LBin(l, 20, tt, tag, LConst(l, tt, key)), bind, other);
+                LStart(l, other);
+            }
+            pat = CNode(c, pat).Next;
+        }
+        LJumpIfOpen(l, next);
+        LStart(l, bind);
+        usize armMark = DropMark(l);
+        if (tagged) LowerBindings(l, a.A, st, v);
+        if (a.E != 0) {
+            u32 body = LNewBlock(l);
+            u32 g = LowerExpr(l, a.E);
+            DropTemps(l);
+            LCondBr(l, g, body, next);
+            LStart(l, body);
+        }
+        // the arm takes the payload: the scrutinee is moved, the bindings own it
+        if (tagged && NValue(c, arm) == 1) {
+            if (kind == MS_OWNED_LOCAL) SetDropFlag(l, NSym(c, m.A), false);
+            if (kind == MS_TEMP) SetDropFlag(l, NSym(c, n), false);
+            TrackBindings(l, a.A, st);
+            DropSkipped(l, a.A, st, v);
+        }
+        if (isExpr && NKind(c, a.B) != NK_BLOCK) {
+            StoreTo(l, rt, LowerExpr(l, a.B), slot);
+            DropTemps(l);
+        } else {
+            LowerStmt(l, a.B);
+        }
+        DropDownTo(l, armMark, false);
+        LJumpIfOpen(l, join);
+        LStart(l, next);
+        arm = a.Next;
+    }
+    // no arm matched: the checker proved this cannot happen
+    LEmit(l, 60, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+    LStart(l, join);
+    DropDownTo(l, mark, false);
+    if (isExpr) return LoadPlace(l, rt, slot);
+    return 0;
+}
+
+// The bindings of a tagged pattern: a borrowed one is the payload field's address; any
+// other gets a copy of the field.
+void LowerBindings(*Lower l, u32 pat, u32 t, u32 v) {
+    *Checker c = LC(l);
+    if (NKind(c, pat) != NK_CALL) return;
+    u32 variant = NSym(c, pat);
+    u32 pt = PayloadEType(l, t, variant);
+    u32 pay = PayloadAddr(l, t, v);
+    u32 a = CNode(c, pat).B;
+    u32 f = CNode(c, variant).E;
+    u32 i = 0;
+    while (a != 0) {
+        if (NKind(c, a) == NK_NAME) {
+            u32 s = NSym(c, a);
+            u32 ft = PayloadType(c, t, f);
+            u32 addr = LField(l, pt, pay, i);
+            if (SymGet(c, s).Flags & SF_BYREF != 0) {
+                SetSymSlot(l, s, addr);
+            } else {
+                u32 slot = LSlot(l, LType(l, ft));
+                StoreTo(l, ft, LoadPlace(l, ft, addr), slot);
+                SetSymSlot(l, s, slot);
+            }
+        }
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+        i++;
+    }
+}
+
+// An arm that takes the payload drops the fields its pattern skips (`_`) at once.
+void DropSkipped(*Lower l, u32 pat, u32 t, u32 v) {
+    *Checker c = LC(l);
+    if (NKind(c, pat) != NK_CALL) return;
+    u32 variant = NSym(c, pat);
+    u32 pt = PayloadEType(l, t, variant);
+    u32 pay = PayloadAddr(l, t, v);
+    u32 a = CNode(c, pat).B;
+    u32 f = CNode(c, variant).E;
+    u32 i = 0;
+    while (a != 0) {
+        u32 ft = PayloadType(c, t, f);
+        if (NKind(c, a) == NK_WILD && NeedsDrop(c, ft)) DropValue(l, ft, LField(l, pt, pay, i));
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+        i++;
+    }
+}
+
+// The bindings that own their value start their drop flags.
+void TrackBindings(*Lower l, u32 pat, u32 t) {
+    *Checker c = LC(l);
+    if (NKind(c, pat) != NK_CALL) return;
+    u32 a = CNode(c, pat).B;
+    u32 f = CNode(c, NSym(c, pat)).E;
+    while (a != 0) {
+        if (NKind(c, a) == NK_NAME && SymGet(c, NSym(c, a)).Flags & SF_BYREF == 0) {
+            TrackDrop(l, NSym(c, a), PayloadType(c, t, f), true, NTok(c, a));
+        }
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+    }
+}

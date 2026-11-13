@@ -1,0 +1,33 @@
+; =============================================================================
+; platform/runtime-abi.eas - the interface between compiled Envo-Core code and
+; the runtime blocks (platform/windows.eas, platform/linux.eas)
+;
+; Each block starts with a table of 5-byte `jmp near` instructions, so entry k
+; is at block start + 5 * k on every OS. Entries 1-11 are the built-ins of
+; envo-core.md section 6, in the order of src/check.eas's builtin_table (so a
+; built-in's id is its entry number).
+;
+; Stack ABI (docs/architecture/bootstrap.md, "Code generation"): arguments are
+; pushed left to right, 8 bytes per scalar; a str is pushed length first, then
+; pointer, so it sits in memory as (ptr, len). At entry [rsp + 8] holds the
+; last argument. The caller removes the arguments. Results come back in rax,
+; plus rdx for a str. Built-ins preserve rbp and rsp only.
+;
+; RT_ENTRY_TRAP takes its reason in edi instead (TRAP_*), prints
+; "panic: <reason>" and exits with code 101.
+; =============================================================================
+
+RT_ENTRY_SIZE   equ 5
+RT_ENTRY_START  equ 0
+RT_ENTRY_TRAP   equ 12
+RT_ENTRY_COUNT  equ 13
+
+TRAP_OVERFLOW   equ 1
+TRAP_BOUNDS     equ 2
+TRAP_DIVIDE     equ 3
+TRAP_MEMORY     equ 4
+TRAP_SHIFT      equ 5
+TRAP_UNREACHABLE equ 6
+
+PANIC_EXIT_CODE equ 101
+RT_HEAP_CHUNK   equ 0x4000000               ; 64 MiB per heap chunk

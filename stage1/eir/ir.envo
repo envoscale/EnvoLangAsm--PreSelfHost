@@ -1,0 +1,556 @@
+// EIR v1 in memory (docs/spec/eir.md). A module is a set of flat vectors addressed by
+// index, so the lowering (M2.7) can build one directly and the text reader fills the
+// same structures. Index 0 of every vector is unused, so 0 means "none".
+
+// ------------------------------------------------------------------ types
+
+const u8 EK_VOID = 1;
+const u8 EK_BOOL = 2;
+const u8 EK_I8 = 3;
+const u8 EK_I16 = 4;
+const u8 EK_I32 = 5;
+const u8 EK_I64 = 6;
+const u8 EK_U8 = 7;
+const u8 EK_U16 = 8;
+const u8 EK_U32 = 9;
+const u8 EK_U64 = 10;
+const u8 EK_F32 = 11;
+const u8 EK_F64 = 12;
+const u8 EK_PTR = 13;
+const u8 EK_STRUCT = 14;
+const u8 EK_ARRAY = 15;
+
+// Fixed type ids: the primitives have the id of their kind.
+const u32 ET_VOID = 1;
+const u32 ET_BOOL = 2;
+const u32 ET_I32 = 5;
+const u32 ET_I64 = 6;
+const u32 ET_U8 = 7;
+const u32 ET_U16 = 8;
+const u32 ET_U32 = 9;
+const u32 ET_U64 = 10;
+const u32 ET_PTR = 13;
+
+struct ETy {
+    u8 Kind;
+    bool Packed;
+    bool Defined;   // a struct whose fields are known
+    u8 LState;      // layout: 0 not done, 1 in progress, 2 done
+    u32 Size;
+    u32 Align;
+    u32 Elem;       // array element
+    u32 Count;      // array length
+    u32 Fields;     // struct: first field type in Module.Fields
+    u32 NFields;
+    str Name;       // primitive spelling, or the struct's name without `$`
+}
+
+// ------------------------------------------------------------------ module
+
+struct EGlobal {
+    str Name;       // without `@`
+    u32 Type;
+    bool ReadOnly;
+    u32 Init;       // EInit
+    u32 Pos;        // source offset in EIR text (0 if built in memory)
+}
+
+// Global initializers: zero | bytes "…" | { init, … } | integer | @global
+const u8 EI_ZERO = 1;
+const u8 EI_BYTES = 2;
+const u8 EI_LIST = 3;
+const u8 EI_INT = 4;
+const u8 EI_ADDR = 5;
+
+struct EInit {
+    u8 Kind;
+    u64 Int;
+    str Bytes;      // EI_BYTES: the decoded bytes; EI_ADDR: the global or function name
+    u32 First;      // EI_LIST: first element
+    u32 Next;       // next element of a list
+}
+
+struct EFunc {
+    str Name;       // without `@`
+    bool Extern;
+    str Abi;        // "" for the Envo convention
+    u32 Ret;
+    u32 NParams;
+    u32 FirstBlock;
+    u32 NBlocks;
+    u32 FirstValue;     // its parameters are its first values
+    u32 NValues;
+    u32 Pos;
+}
+
+struct EBlock {
+    u32 Func;
+    u32 FirstParam;     // value id of its first parameter
+    u32 NParams;
+    u32 FirstInst;
+    u32 NInsts;
+    u32 Pos;
+}
+
+// A value: a function parameter, a block parameter or an instruction result.
+struct EVal {
+    u32 Type;
+    u32 Block;      // the block that defines it (entry block for function parameters)
+    u32 Inst;       // the defining instruction, 0 for a parameter
+    u32 Pos;        // where it first appears in EIR text
+}
+
+struct EInst {
+    u16 Op;         // OP_*
+    u32 Ty;         // the type operand (T, I, $S), or the source type of a conversion
+    u32 Ty2;        // the target type of a conversion
+    u32 Result;     // value id, 0 if none
+    u32 FirstOp;    // operands in Module.Ops
+    u32 NOps;
+    u32 Block;
+    u64 Imm;        // const value, field index, panic reason
+    str Str;        // intrinsic name, callee name, abi of call.ind
+    u32 Pos;
+}
+
+// Operands
+const u8 OK_VALUE = 1;     // Ref = value id
+const u8 OK_INT = 2;       // Int
+const u8 OK_GLOBAL = 3;    // Str = global or function name (resolved by the verifier)
+const u8 OK_TARGET = 4;    // Ref = block; Args, NArgs = argument value ids in Module.Args
+const u8 OK_CASE = 5;      // switch key Int, then the OK_TARGET that follows
+
+struct EOp {
+    u8 Kind;
+    u32 Ref;
+    u64 Int;
+    str Str;
+    u32 Args;
+    u32 NArgs;
+    u32 Pos;
+}
+
+struct Module {
+    u32 Version;
+    str Target;
+    Vec Types;      // ETy
+    Map TypeNames;  // struct name -> type id
+    Map Arrays;     // "elem:count" -> type id
+    Vec Fields;     // u32 field type ids
+    Vec Globals;    // EGlobal
+    Vec Inits;      // EInit
+    Vec Funcs;      // EFunc
+    Map Names;      // global or function name -> (kind << 32) | index
+    Vec Blocks;     // EBlock
+    Vec Vals;       // EVal
+    Vec Insts;      // EInst
+    Vec Ops;        // EOp
+    Vec Args;       // u32 value ids (branch arguments)
+    u32 Text;       // source file of the EIR text (for diagnostics), if any
+    bool FromText;
+}
+
+const u64 NAME_GLOBAL = 1;
+const u64 NAME_FUNC = 2;
+
+void ModuleInit(*Module m) {
+    unsafe {
+        m.Version = 1;
+        m.Types = VecNew(sizeof(ETy), 64);
+        m.TypeNames = MapNew(64);
+        m.Arrays = MapNew(32);
+        m.Fields = VecNew(4, 64);
+        m.Globals = VecNew(sizeof(EGlobal), 64);
+        m.Inits = VecNew(sizeof(EInit), 64);
+        m.Funcs = VecNew(sizeof(EFunc), 64);
+        m.Names = MapNew(128);
+        m.Blocks = VecNew(sizeof(EBlock), 256);
+        m.Vals = VecNew(sizeof(EVal), 1024);
+        m.Insts = VecNew(sizeof(EInst), 1024);
+        m.Ops = VecNew(sizeof(EOp), 2048);
+        m.Args = VecNew(4, 256);
+        VecPush(&m.Types);
+        VecPush(&m.Fields);
+        VecPush(&m.Globals);
+        VecPush(&m.Inits);
+        VecPush(&m.Funcs);
+        VecPush(&m.Blocks);
+        VecPush(&m.Vals);
+        VecPush(&m.Insts);
+        VecPush(&m.Ops);
+        VecPush(&m.Args);
+        EPrim(m, EK_VOID, 0, 1, "void");
+        EPrim(m, EK_BOOL, 1, 1, "bool");
+        EPrim(m, EK_I8, 1, 1, "i8");
+        EPrim(m, EK_I16, 2, 2, "i16");
+        EPrim(m, EK_I32, 4, 4, "i32");
+        EPrim(m, EK_I64, 8, 8, "i64");
+        EPrim(m, EK_U8, 1, 1, "u8");
+        EPrim(m, EK_U16, 2, 2, "u16");
+        EPrim(m, EK_U32, 4, 4, "u32");
+        EPrim(m, EK_U64, 8, 8, "u64");
+        EPrim(m, EK_F32, 4, 4, "f32");
+        EPrim(m, EK_F64, 8, 8, "f64");
+        EPrim(m, EK_PTR, 8, 8, "ptr");
+    }
+}
+
+void EPrim(*Module m, u8 kind, u32 size, u32 align, str name) {
+    unsafe {
+        *ETy t = VecPush(&m.Types) as *ETy;
+        t.Kind = kind;
+        t.Size = size;
+        t.Align = align;
+        t.Name = name;
+        t.LState = 2;
+        t.Defined = true;
+    }
+}
+
+// ------------------------------------------------------------------ accessors
+
+ETy ETyGet(*Module m, u32 t) {
+    unsafe { return *(VecAt(&m.Types, t as usize) as *ETy); }
+}
+
+*ETy ETyPtr(*Module m, u32 t) {
+    unsafe { return VecAt(&m.Types, t as usize) as *ETy; }
+}
+
+EFunc EFuncGet(*Module m, u32 f) {
+    unsafe { return *(VecAt(&m.Funcs, f as usize) as *EFunc); }
+}
+
+*EFunc EFuncPtr(*Module m, u32 f) {
+    unsafe { return VecAt(&m.Funcs, f as usize) as *EFunc; }
+}
+
+EBlock EBlockGet(*Module m, u32 b) {
+    unsafe { return *(VecAt(&m.Blocks, b as usize) as *EBlock); }
+}
+
+*EBlock EBlockPtr(*Module m, u32 b) {
+    unsafe { return VecAt(&m.Blocks, b as usize) as *EBlock; }
+}
+
+EVal EValGet(*Module m, u32 v) {
+    unsafe { return *(VecAt(&m.Vals, v as usize) as *EVal); }
+}
+
+EInst EInstGet(*Module m, u32 i) {
+    unsafe { return *(VecAt(&m.Insts, i as usize) as *EInst); }
+}
+
+*EInst EInstPtr(*Module m, u32 i) {
+    unsafe { return VecAt(&m.Insts, i as usize) as *EInst; }
+}
+
+EOp EOpGet(*Module m, u32 o) {
+    unsafe { return *(VecAt(&m.Ops, o as usize) as *EOp); }
+}
+
+EGlobal EGlobalGet(*Module m, u32 g) {
+    unsafe { return *(VecAt(&m.Globals, g as usize) as *EGlobal); }
+}
+
+EInit EInitGet(*Module m, u32 i) {
+    unsafe { return *(VecAt(&m.Inits, i as usize) as *EInit); }
+}
+
+u32 EArg(*Module m, u32 i) {
+    unsafe { return MemLoadU32(VecAt(&m.Args, i as usize)); }
+}
+
+u32 EField(*Module m, u32 i) {
+    unsafe { return MemLoadU32(VecAt(&m.Fields, i as usize)); }
+}
+
+u32 ECount(*Vec v) {
+    return VecLen(v) as u32;
+}
+
+// ------------------------------------------------------------------ type helpers
+
+bool EIsInt(*Module m, u32 t) {
+    u8 k = ETyGet(m, t).Kind;
+    return k >= EK_I8 && k <= EK_U64;
+}
+
+bool EIsSigned(*Module m, u32 t) {
+    u8 k = ETyGet(m, t).Kind;
+    return k >= EK_I8 && k <= EK_I64;
+}
+
+bool EIsFloat(*Module m, u32 t) {
+    u8 k = ETyGet(m, t).Kind;
+    return k == EK_F32 || k == EK_F64;
+}
+
+// Scalar types are the only ones SSA values, parameters and results may have.
+bool EIsScalar(*Module m, u32 t) {
+    u8 k = ETyGet(m, t).Kind;
+    return k >= EK_BOOL && k <= EK_PTR;
+}
+
+u32 EBits(*Module m, u32 t) {
+    return ETyGet(m, t).Size * 8;
+}
+
+// The interned array type [count x elem].
+u32 EArrayType(*Module m, u32 elem, u32 count) {
+    Buf key = BufNew(24);
+    unsafe {
+        BufU64(&key, elem as u64);
+        BufByte(&key, ':');
+        BufU64(&key, count as u64);
+        u64 found;
+        if (MapGet(&m.Arrays, BufView(&key), &found)) return found as u32;
+        u32 t = ECount(&m.Types);
+        *ETy ty = VecPush(&m.Types) as *ETy;
+        ty.Kind = EK_ARRAY;
+        ty.Elem = elem;
+        ty.Count = count;
+        ty.Defined = true;
+        MapPut(&m.Arrays, BufCopy(&key), t as u64);
+        return t;
+    }
+}
+
+// The struct type named name, created (undefined) if new.
+u32 EStructType(*Module m, str name) {
+    u64 found;
+    unsafe {
+        if (MapGet(&m.TypeNames, name, &found)) return found as u32;
+        u32 t = ECount(&m.Types);
+        *ETy ty = VecPush(&m.Types) as *ETy;
+        ty.Kind = EK_STRUCT;
+        ty.Name = name;
+        MapPut(&m.TypeNames, name, t as u64);
+        return t;
+    }
+}
+
+// Lays out type t ([eir.type.3]): fields in order at natural alignment, padded to the
+// struct's alignment; `packed` removes padding. Returns false for a struct that contains
+// itself (E0612).
+bool ELayout(*Module m, u32 t) {
+    ETy ty = ETyGet(m, t);
+    if (ty.LState == 2) return true;
+    if (ty.LState == 1) return false;
+    unsafe { ETyPtr(m, t).LState = 1; }
+    u64 size = 0;
+    u64 align = 1;
+    if (ty.Kind == EK_ARRAY) {
+        if (!ELayout(m, ty.Elem)) return false;
+        ETy e = ETyGet(m, ty.Elem);
+        size = e.Size as u64 * ty.Count as u64;
+        align = e.Align as u64;
+    } else {
+        for (u32 i = 0; i < ty.NFields; i++) {
+            u32 ft = EField(m, ty.Fields + i);
+            if (!ELayout(m, ft)) return false;
+            ETy f = ETyGet(m, ft);
+            u64 fa = f.Align as u64;
+            if (ty.Packed) fa = 1;
+            size = (size + fa - 1) & ~(fa - 1);
+            if (align < fa) align = fa;
+            size += f.Size as u64;
+        }
+        size = (size + align - 1) & ~(align - 1);
+    }
+    unsafe {
+        *ETy p = ETyPtr(m, t);
+        p.Size = size as u32;
+        p.Align = align as u32;
+        p.LState = 2;
+    }
+    return true;
+}
+
+// The byte offset of field k of struct type t (laid out).
+u64 EFieldOffset(*Module m, u32 t, u32 k) {
+    ETy ty = ETyGet(m, t);
+    u64 off = 0;
+    for (u32 i = 0; i <= k; i++) {
+        ETy f = ETyGet(m, EField(m, ty.Fields + i));
+        u64 fa = f.Align as u64;
+        if (ty.Packed) fa = 1;
+        off = (off + fa - 1) & ~(fa - 1);
+        if (i < k) off += f.Size as u64;
+    }
+    return off;
+}
+
+// ------------------------------------------------------------------ opcodes
+
+// Operand shapes: how an instruction is written, read and checked (eir.md section 5).
+const u8 SH_CONST = 1;      // const T k
+const u8 SH_ADDR = 2;       // addr @g
+const u8 SH_SLOT = 3;       // slot T
+const u8 SH_UNARY_V = 4;    // op %p            (slot.end)
+const u8 SH_BIN = 5;        // op T a, b        -> T
+const u8 SH_UN = 6;         // op T a           -> T
+const u8 SH_CMP = 7;        // cmp.x T a, b     -> bool
+const u8 SH_SELECT = 8;     // select T c, a, b -> T
+const u8 SH_CONV = 9;       // op T1 -> T2 a    -> T2
+const u8 SH_LOAD = 10;      // load T %p        -> T
+const u8 SH_STORE = 11;     // store T v, %p
+const u8 SH_FIELD = 12;     // fieldaddr $S %p, k -> ptr
+const u8 SH_ELEM = 13;      // elemaddr T %p, i  -> ptr
+const u8 SH_PTRADD = 14;    // ptradd %p, n      -> ptr
+const u8 SH_VALUES = 15;    // op a, b[, c]      (copy, zero, bounds.range, bounds.utf8)
+const u8 SH_BOUNDS = 16;    // bounds I i, len
+const u8 SH_CALL = 17;      // call @f(args)
+const u8 SH_CALLIND = 18;   // call.ind T (args) %fp
+const u8 SH_INTRINSIC = 19; // intrinsic name(args)
+const u8 SH_BR = 20;        // br ^b(args)
+const u8 SH_CONDBR = 21;    // condbr c, ^t(args), ^f(args)
+const u8 SH_SWITCH = 22;    // switch I v, [k: ^b(args), …], ^d(args)
+const u8 SH_RET = 23;       // ret | ret v
+const u8 SH_PANIC = 24;     // panic "reason"
+const u8 SH_NONE = 25;      // unreachable
+
+struct OpInfo {
+    u16 Op;
+    str Name;
+    u8 Shape;
+    u8 Operands;    // value operands for SH_VALUES
+    bool Term;      // terminator
+    bool IntOnly;   // integer operands only (else also floats where it applies)
+    bool FloatOnly;
+}
+
+// The opcode table, in a fixed order: its index is the opcode number of the binary form
+// ([eir.bin.2]), so new opcodes go at the end.
+OpInfo OpTable(u16 op) {
+    OpInfo o;
+    o.Op = op;
+    o.IntOnly = true;
+    match op {
+        1 => { o.Name = "const"; o.Shape = SH_CONST; o.IntOnly = false; }
+        2 => { o.Name = "addr"; o.Shape = SH_ADDR; }
+        3 => { o.Name = "slot"; o.Shape = SH_SLOT; }
+        4 => { o.Name = "slot.end"; o.Shape = SH_UNARY_V; }
+        5 => { o.Name = "add.wrap"; o.Shape = SH_BIN; }
+        6 => { o.Name = "sub.wrap"; o.Shape = SH_BIN; }
+        7 => { o.Name = "mul.wrap"; o.Shape = SH_BIN; }
+        8 => { o.Name = "add.chk"; o.Shape = SH_BIN; }
+        9 => { o.Name = "sub.chk"; o.Shape = SH_BIN; }
+        10 => { o.Name = "mul.chk"; o.Shape = SH_BIN; }
+        11 => { o.Name = "neg.chk"; o.Shape = SH_UN; }
+        12 => { o.Name = "div"; o.Shape = SH_BIN; }
+        13 => { o.Name = "rem"; o.Shape = SH_BIN; }
+        14 => { o.Name = "and"; o.Shape = SH_BIN; }
+        15 => { o.Name = "or"; o.Shape = SH_BIN; }
+        16 => { o.Name = "xor"; o.Shape = SH_BIN; }
+        17 => { o.Name = "not"; o.Shape = SH_UN; }
+        18 => { o.Name = "shl"; o.Shape = SH_BIN; }
+        19 => { o.Name = "shr"; o.Shape = SH_BIN; }
+        20 => { o.Name = "cmp.eq"; o.Shape = SH_CMP; o.IntOnly = false; }
+        21 => { o.Name = "cmp.ne"; o.Shape = SH_CMP; o.IntOnly = false; }
+        22 => { o.Name = "cmp.lt"; o.Shape = SH_CMP; o.IntOnly = false; }
+        23 => { o.Name = "cmp.le"; o.Shape = SH_CMP; o.IntOnly = false; }
+        24 => { o.Name = "cmp.gt"; o.Shape = SH_CMP; o.IntOnly = false; }
+        25 => { o.Name = "cmp.ge"; o.Shape = SH_CMP; o.IntOnly = false; }
+        26 => { o.Name = "select"; o.Shape = SH_SELECT; o.IntOnly = false; }
+        27 => { o.Name = "fadd"; o.Shape = SH_BIN; o.IntOnly = false; o.FloatOnly = true; }
+        28 => { o.Name = "fsub"; o.Shape = SH_BIN; o.IntOnly = false; o.FloatOnly = true; }
+        29 => { o.Name = "fmul"; o.Shape = SH_BIN; o.IntOnly = false; o.FloatOnly = true; }
+        30 => { o.Name = "fdiv"; o.Shape = SH_BIN; o.IntOnly = false; o.FloatOnly = true; }
+        31 => { o.Name = "fneg"; o.Shape = SH_UN; o.IntOnly = false; o.FloatOnly = true; }
+        32 => { o.Name = "trunc"; o.Shape = SH_CONV; }
+        33 => { o.Name = "zext"; o.Shape = SH_CONV; }
+        34 => { o.Name = "sext"; o.Shape = SH_CONV; }
+        35 => { o.Name = "itof"; o.Shape = SH_CONV; }
+        36 => { o.Name = "ftoi"; o.Shape = SH_CONV; }
+        37 => { o.Name = "fext"; o.Shape = SH_CONV; }
+        38 => { o.Name = "ftrunc"; o.Shape = SH_CONV; }
+        39 => { o.Name = "ptoi"; o.Shape = SH_CONV; }
+        40 => { o.Name = "itop"; o.Shape = SH_CONV; }
+        41 => { o.Name = "bitcast"; o.Shape = SH_CONV; }
+        42 => { o.Name = "load"; o.Shape = SH_LOAD; o.IntOnly = false; }
+        43 => { o.Name = "store"; o.Shape = SH_STORE; o.IntOnly = false; }
+        44 => { o.Name = "fieldaddr"; o.Shape = SH_FIELD; }
+        45 => { o.Name = "elemaddr"; o.Shape = SH_ELEM; o.IntOnly = false; }
+        46 => { o.Name = "ptradd"; o.Shape = SH_PTRADD; }
+        47 => { o.Name = "copy"; o.Shape = SH_VALUES; o.Operands = 3; }
+        48 => { o.Name = "zero"; o.Shape = SH_VALUES; o.Operands = 2; }
+        49 => { o.Name = "bounds"; o.Shape = SH_BOUNDS; }
+        50 => { o.Name = "bounds.range"; o.Shape = SH_VALUES; o.Operands = 3; }
+        51 => { o.Name = "bounds.utf8"; o.Shape = SH_VALUES; o.Operands = 3; }
+        52 => { o.Name = "call"; o.Shape = SH_CALL; o.IntOnly = false; }
+        53 => { o.Name = "call.ind"; o.Shape = SH_CALLIND; o.IntOnly = false; }
+        54 => { o.Name = "intrinsic"; o.Shape = SH_INTRINSIC; o.IntOnly = false; }
+        55 => { o.Name = "br"; o.Shape = SH_BR; o.Term = true; }
+        56 => { o.Name = "condbr"; o.Shape = SH_CONDBR; o.Term = true; }
+        57 => { o.Name = "switch"; o.Shape = SH_SWITCH; o.Term = true; }
+        58 => { o.Name = "ret"; o.Shape = SH_RET; o.Term = true; o.IntOnly = false; }
+        59 => { o.Name = "panic"; o.Shape = SH_PANIC; o.Term = true; }
+        60 => { o.Name = "unreachable"; o.Shape = SH_NONE; o.Term = true; }
+        _ => { o.Name = ""; }
+    }
+    return o;
+}
+
+const u16 OP_CONST = 1;
+const u16 OP_SLOT = 3;
+const u16 OP_SHL = 18;
+const u16 OP_SHR = 19;
+const u16 OP_CALL = 52;
+const u16 OP_LAST = 60;
+
+// The opcode spelled name, or 0.
+u16 OpByName(str name) {
+    for (u16 op = 1; op <= OP_LAST; op++) {
+        if (StrEq(OpTable(op).Name, name)) return op;
+    }
+    return 0;
+}
+
+// Panic reasons ([eir.panic.1]), numbered for the binary form.
+str PanicReason(u64 i) {
+    match i {
+        0 => { return "integer overflow"; }
+        1 => { return "index out of bounds"; }
+        2 => { return "division by zero"; }
+        3 => { return "out of memory"; }
+        4 => { return "shift amount out of range"; }
+        5 => { return "unreachable code reached"; }
+        6 => { return "str slice is not on a character boundary"; }
+        _ => { return ""; }
+    }
+}
+
+const u64 PANIC_COUNT = 7;
+
+// Intrinsics ([eir.panic.1] section 5.6): name, parameter types, result type.
+struct Intrinsic {
+    str Name;
+    u32 N;
+    u32 P0;
+    u32 P1;
+    u32 P2;
+    u32 Ret;
+    bool AllI64;    // every argument is an i64 (the target intrinsics)
+}
+
+Intrinsic IntrinsicNamed(str name) {
+    Intrinsic x;
+    x.Name = name;
+    x.Ret = ET_VOID;
+    if (StrEq(name, "write")) { x.N = 3; x.P0 = ET_I32; x.P1 = ET_PTR; x.P2 = ET_U64; }
+    else if (StrEq(name, "read")) { x.N = 3; x.P0 = ET_I32; x.P1 = ET_PTR; x.P2 = ET_U64; x.Ret = ET_I64; }
+    else if (StrEq(name, "open")) { x.N = 3; x.P0 = ET_PTR; x.P1 = ET_U64; x.P2 = ET_I32; x.Ret = ET_I32; }
+    else if (StrEq(name, "close")) { x.N = 1; x.P0 = ET_I32; }
+    else if (StrEq(name, "alloc")) { x.N = 1; x.P0 = ET_U64; x.Ret = ET_PTR; }
+    else if (StrEq(name, "exit")) { x.N = 1; x.P0 = ET_I32; }
+    else if (StrEq(name, "argc")) { x.N = 0; x.Ret = ET_U64; }
+    else if (StrEq(name, "arg")) { x.N = 2; x.P0 = ET_U64; x.P1 = ET_PTR; }
+    else if (StrEq(name, "panic.msg")) { x.N = 2; x.P0 = ET_PTR; x.P1 = ET_U64; }
+    else if (StrEq(name, "syscall")) { x.N = 7; x.AllI64 = true; x.Ret = ET_I64; }
+    else if (StrEq(name, "wincall")) { x.N = 11; x.AllI64 = true; x.Ret = ET_I64; }
+    else if (StrEq(name, "wincallp")) { x.N = 13; x.AllI64 = true; x.Ret = ET_I64; }
+    else if (StrEq(name, "hostcall")) { x.N = 5; x.AllI64 = true; x.Ret = ET_I64; }
+    else x.Name = "";
+    return x;
+}

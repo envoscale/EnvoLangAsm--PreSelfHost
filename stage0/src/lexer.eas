@@ -1,0 +1,951 @@
+; =============================================================================
+; src/lexer.eas - the Envo-Core lexer (docs/spec/01-lexical.md)
+;
+; Implements the full Envo lexical grammar where that is cheap (every keyword is
+; reserved and every operator is lexed), and rejects the few constructs Envo-Core
+; leaves out with E09xx errors. Literal values are validated but not computed:
+; the parser converts the literals it needs.
+;
+; Preconditions: the input is valid UTF-8 (utf8_validate ran) and any BOM has
+; been removed, so offsets count from the first character after it.
+;
+; Register use inside lex (all callee-saved, so helpers can be called freely):
+;   rbx = source base        r12 = current offset     r13 = source length
+;   r14 = next token record  r15 = current line       ebp = flags for next token
+;   r8  = start offset of the token being lexed
+; Helpers called from lex leave r8, r9 and r10 alone; r9/r10 hold number state.
+; Stack frame: [rsp] = token array base, [rsp + 8] = scratch.
+; =============================================================================
+
+; lex - tokenize a source buffer.
+;   in:  rdi = source, rsi = length (< 4 GiB; Stage 0 limits files to 16 MiB)
+;   out: rax = token array, rdx = token count (the last token is TK_EOF)
+;   Stops at the first error and reports it with diag_error.
+lex:
+        push    rbx
+        push    rbp
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 24                 ; locals; also realigns rsp to 16
+        mov     rbx, rdi
+        mov     r13, rsi
+        lea     rdi, [rsi + 1]          ; every token uses >= 1 byte, plus EOF
+        shl     rdi, 4                  ; * TOK_SIZE
+        call    arena_alloc
+        mov     [rsp], rax
+        mov     r14, rax
+        xor     r12d, r12d
+        mov     r15d, 1
+        mov     ebp, TF_SPACE_BEFORE | TF_NEWLINE_BEFORE   ; [lex.flags.1], [lex.flags.2]
+
+        ; [lex.shebang.1] "#!" at the very start: skip to the end of the line.
+        cmp     r13, 2
+        jb      short .trivia
+        cmp     word [rbx], 0x2123      ; '#', '!'
+        jne     short .trivia
+.shebang:
+        cmp     r12, r13
+        jae     short .trivia
+        cmp     byte [rbx + r12], 10
+        je      short .trivia
+        inc     r12
+        jmp     short .shebang
+
+; ---------------------------------------------------------------- trivia
+; Skip whitespace and comments, recording them in the next token's flags.
+.trivia:
+        cmp     r12, r13
+        jae     near .eof
+        movzx   eax, byte [rbx + r12]
+        cmp     al, ' '
+        je      short .space
+        cmp     al, 9
+        je      short .space
+        cmp     al, 13                  ; CR is plain whitespace ([lex.src.4])
+        je      short .space
+        cmp     al, 10
+        je      short .newline
+        cmp     al, '/'
+        jne     near .token
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     near .token
+        movzx   edx, byte [rbx + r12 + 1]
+        cmp     dl, '/'
+        je      short .line_comment
+        cmp     dl, '*'
+        je      short .block_comment
+        jmp     near .token                  ; eax still holds '/'
+.space:
+        or      ebp, TF_SPACE_BEFORE
+        inc     r12
+        jmp     short .trivia
+.newline:
+        or      ebp, TF_SPACE_BEFORE | TF_NEWLINE_BEFORE
+        inc     r15
+        inc     r12
+        jmp     short .trivia
+
+.line_comment:                          ; [lex.comment.1] runs to the LF (not included)
+        or      ebp, TF_SPACE_BEFORE
+.lc_loop:
+        cmp     r12, r13
+        jae     short .trivia
+        cmp     byte [rbx + r12], 10
+        je      short .trivia
+        inc     r12
+        jmp     short .lc_loop
+
+.block_comment:                         ; [lex.comment.2] nests
+        or      ebp, TF_SPACE_BEFORE
+        mov     r8, r12                 ; for the error position
+        add     r12, 2
+        mov     ecx, 1                  ; nesting depth
+.bc_loop:
+        cmp     r12, r13
+        jae     short .bc_unterminated
+        movzx   eax, byte [rbx + r12]
+        cmp     al, 10
+        jne     short .bc_not_newline
+        inc     r15
+        or      ebp, TF_NEWLINE_BEFORE
+        inc     r12
+        jmp     short .bc_loop
+.bc_not_newline:
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     short .bc_next
+        movzx   edx, byte [rbx + r12 + 1]
+        cmp     al, '*'
+        jne     short .bc_not_close
+        cmp     dl, '/'
+        jne     short .bc_next
+        add     r12, 2
+        dec     ecx
+        jnz     short .bc_loop
+        jmp     near .trivia
+.bc_not_close:
+        cmp     al, '/'
+        jne     short .bc_next
+        cmp     dl, '*'
+        jne     short .bc_next
+        add     r12, 2
+        inc     ecx
+        jmp     short .bc_loop
+.bc_next:
+        inc     r12
+        jmp     short .bc_loop
+.bc_unterminated:
+        mov     edi, E_UNTERMINATED_COMMENT
+        mov     rsi, r8
+        call    diag_error
+
+; ---------------------------------------------------------------- dispatch
+; eax = first byte of the token, r12 = its offset.
+.token:
+        mov     r8, r12
+        cmp     al, 0x80
+        jae     near .non_ascii
+        mov     ecx, eax
+        or      ecx, 0x20               ; fold A-Z onto a-z
+        sub     ecx, 'a'
+        cmp     ecx, 26
+        jb      short .ident
+        cmp     al, '_'
+        je      short .ident
+        mov     ecx, eax
+        sub     ecx, '0'
+        cmp     ecx, 10
+        jb      near .number
+        cmp     al, '"'
+        je      near .string
+        cmp     al, 0x27                ; single quote
+        je      near .char
+        cmp     al, '@'
+        je      short .raw_ident
+        cmp     al, '$'
+        je      near .dollar
+        cmp     al, '#'
+        je      near .hash
+        jmp     near .punct
+
+; ---------------------------------------------------------------- identifiers
+.ident:                                 ; [lex.ident.1], ASCII only in Core
+        inc     r12
+.id_loop:
+        cmp     r12, r13
+        jae     short .id_end
+        movzx   eax, byte [rbx + r12]
+        call    is_ident_cont
+        test    eax, eax
+        jz      short .id_end
+        inc     r12
+        jmp     short .id_loop
+.id_end:
+        lea     rdi, [rbx + r8]
+        mov     rsi, r12
+        sub     rsi, r8
+        call    kw_lookup               ; [lex.ident.2] keyword or TK_IDENT
+        jmp     near .emit
+
+.raw_ident:                             ; [lex.ident.3] @name
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     near .unexpected
+        movzx   eax, byte [rbx + r12 + 1]
+        cmp     al, '_'
+        je      short .raw_start
+        mov     ecx, eax
+        or      ecx, 0x20
+        sub     ecx, 'a'
+        cmp     ecx, 26
+        jae     near .unexpected
+.raw_start:
+        add     r12, 2
+.raw_loop:
+        cmp     r12, r13
+        jae     short .raw_end
+        movzx   eax, byte [rbx + r12]
+        call    is_ident_cont
+        test    eax, eax
+        jz      short .raw_end
+        inc     r12
+        jmp     short .raw_loop
+.raw_end:
+        mov     rax, r12
+        sub     rax, r8
+        cmp     rax, 2                  ; "@_" is not an identifier
+        jne     short .raw_ok
+        cmp     byte [rbx + r8 + 1], '_'
+        je      near .unexpected
+.raw_ok:
+        mov     eax, TK_IDENT
+        jmp     near .emit
+
+; ---------------------------------------------------------------- numbers
+; r9d = 1 once the literal is known to be a float, r10d = base.
+.number:
+        xor     r9d, r9d
+        mov     r10d, 10
+        cmp     al, '0'
+        jne     short .decimal
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     short .decimal
+        movzx   edx, byte [rbx + r12 + 1]
+        cmp     dl, 'x'
+        je      short .hex
+        cmp     dl, 'b'
+        je      short .binary
+        cmp     dl, 'o'
+        je      short .octal
+        jmp     short .decimal
+.hex:
+        mov     r10d, 16
+        jmp     short .prefixed
+.binary:
+        mov     r10d, 2
+        jmp     short .prefixed
+.octal:
+        mov     r10d, 8
+.prefixed:                              ; [lex.int.1], [lex.int.2]
+        add     r12, 2
+        xor     r11d, r11d              ; digits seen
+.p_loop:
+        cmp     r12, r13
+        jae     short .p_end
+        movzx   eax, byte [rbx + r12]
+        cmp     al, '_'
+        je      short .p_next
+        call    digit_value
+        cmp     eax, r10d
+        jae     short .p_stop
+        inc     r11d
+.p_next:
+        inc     r12
+        jmp     short .p_loop
+.p_stop:
+        cmp     eax, 10                 ; a decimal digit too large for base 2 or 8
+        jb      near .bad_digit
+.p_end:
+        test    r11d, r11d
+        jz      near .bad_number             ; "0x" with no digits
+        jmp     near .suffix
+
+.decimal:
+.d_loop:
+        cmp     r12, r13
+        jae     short .d_end
+        movzx   eax, byte [rbx + r12]
+        cmp     al, '_'
+        je      short .d_next
+        sub     eax, '0'
+        cmp     eax, 10
+        jae     short .d_end
+.d_next:
+        inc     r12
+        jmp     short .d_loop
+.d_end:
+        ; [lex.float.2] a fraction needs a digit right after the '.', so 1..2
+        ; and 1.Max(2) stay an integer followed by punctuation
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     short .exponent
+        cmp     byte [rbx + r12], '.'
+        jne     short .exponent
+        movzx   eax, byte [rbx + r12 + 1]
+        sub     eax, '0'
+        cmp     eax, 10
+        jae     short .exponent
+        mov     r9d, 1
+        add     r12, 2
+.f_loop:
+        cmp     r12, r13
+        jae     short .exponent
+        movzx   eax, byte [rbx + r12]
+        cmp     al, '_'
+        je      short .f_next
+        sub     eax, '0'
+        cmp     eax, 10
+        jae     short .exponent
+.f_next:
+        inc     r12
+        jmp     short .f_loop
+.exponent:
+        cmp     r12, r13
+        jae     short .suffix
+        movzx   eax, byte [rbx + r12]
+        or      eax, 0x20
+        cmp     eax, 'e'
+        jne     short .suffix
+        mov     r9d, 1
+        inc     r12
+        cmp     r12, r13
+        jae     near .bad_number
+        movzx   eax, byte [rbx + r12]
+        cmp     al, '+'
+        je      short .e_sign
+        cmp     al, '-'
+        jne     short .e_digits
+.e_sign:
+        inc     r12
+.e_digits:
+        xor     r11d, r11d              ; [lex.float.3] the exponent needs a digit
+.e_loop:
+        cmp     r12, r13
+        jae     short .e_end
+        movzx   eax, byte [rbx + r12]
+        cmp     al, '_'
+        je      short .e_next
+        sub     eax, '0'
+        cmp     eax, 10
+        jae     short .e_end
+        inc     r11d
+.e_next:
+        inc     r12
+        jmp     short .e_loop
+.e_end:
+        test    r11d, r11d
+        jz      short .bad_number
+
+.suffix:                                ; [lex.int.3], [lex.float.3]
+        cmp     r12, r13
+        jae     short .num_done
+        movzx   eax, byte [rbx + r12]
+        call    is_ident_cont
+        test    eax, eax
+        jz      short .num_done
+        mov     [rsp + 8], r12          ; suffix start
+.s_loop:
+        inc     r12
+        cmp     r12, r13
+        jae     short .s_end
+        movzx   eax, byte [rbx + r12]
+        call    is_ident_cont
+        test    eax, eax
+        jnz     short .s_loop
+.s_end:
+        mov     rdx, [rsp + 8]
+        lea     rdi, [rbx + rdx]
+        mov     rsi, r12
+        sub     rsi, rdx
+        call    suffix_lookup
+        test    eax, eax
+        jz      short .bad_suffix
+        cmp     eax, 2
+        je      short .float_suffix
+        test    r9d, r9d                ; integer suffix on a float
+        jnz     short .bad_suffix
+        jmp     short .num_done
+.float_suffix:
+        cmp     r10d, 10                ; float suffix on 0x/0o/0b
+        jne     short .bad_suffix
+        mov     r9d, 1
+.num_done:
+        mov     eax, TK_INT
+        test    r9d, r9d
+        jz      near .emit
+        mov     eax, TK_FLOAT
+        jmp     near .emit
+
+.bad_number:
+        mov     edi, E_BAD_NUMBER
+        mov     rsi, r8
+        call    diag_error
+.bad_digit:
+        mov     edi, E_BAD_NUMBER
+        mov     rsi, r12
+        call    diag_error
+.bad_suffix:
+        mov     edi, E_BAD_SUFFIX
+        mov     rsi, [rsp + 8]
+        call    diag_error
+
+; ---------------------------------------------------------------- strings
+.string:
+        ; [lex.str.3] `"""` always starts a raw string, which Core does not have
+        lea     rdx, [r12 + 2]
+        cmp     rdx, r13
+        jae     short .str_open
+        cmp     word [rbx + r12 + 1], 0x2222
+        je      short .raw_string
+.str_open:
+        inc     r12
+.str_loop:
+        cmp     r12, r13
+        jae     short .str_unterminated
+        movzx   eax, byte [rbx + r12]
+        cmp     al, '"'
+        je      short .str_close
+        cmp     al, 0x5C                ; backslash
+        je      short .str_escape
+        cmp     al, 10                  ; [lex.str.1] no raw line breaks
+        je      short .str_unterminated
+        cmp     al, 13
+        je      short .str_unterminated
+        cmp     al, 9
+        je      short .str_next
+        cmp     al, 0x20                ; [lex.esc.3]
+        jb      short .control
+        cmp     al, 0x7F
+        je      short .control
+.str_next:
+        inc     r12
+        jmp     short .str_loop
+.str_escape:
+        call    lex_escape
+        jmp     short .str_loop
+.str_close:
+        inc     r12
+        mov     eax, TK_STRING
+        jmp     near .emit
+.str_unterminated:
+        mov     edi, E_UNTERMINATED_STRING
+        mov     rsi, r8
+        call    diag_error
+.raw_string:
+        mov     edi, E_CORE_RAW_STRING
+        mov     rsi, r8
+        call    diag_error
+.control:
+        mov     edi, E_CONTROL_CHAR
+        mov     rsi, r12
+        call    diag_error
+
+; ---------------------------------------------------------------- characters
+.char:                                  ; [lex.char.1]
+        inc     r12
+        cmp     r12, r13
+        jae     near .char_unterminated
+        movzx   eax, byte [rbx + r12]
+        cmp     al, 0x27
+        je      short .char_length            ; '' is empty
+        cmp     al, 10
+        je      short .char_unterminated
+        cmp     al, 13
+        je      short .char_unterminated
+        cmp     al, 0x5C
+        jne     short .char_plain
+        call    lex_escape
+        jmp     short .char_close
+.char_plain:
+        cmp     al, 9
+        je      short .char_one
+        cmp     al, 0x20
+        jb      short .control
+        cmp     al, 0x7F
+        je      short .control
+        ; One Unicode scalar; the input is valid UTF-8, so the lead byte gives
+        ; the length.
+        cmp     al, 0x80
+        jb      short .char_one
+        cmp     al, 0xE0
+        jb      short .char_two
+        cmp     al, 0xF0
+        jb      short .char_three
+        add     r12, 4
+        jmp     short .char_close
+.char_three:
+        add     r12, 3
+        jmp     short .char_close
+.char_two:
+        add     r12, 2
+        jmp     short .char_close
+.char_one:
+        inc     r12
+.char_close:
+        cmp     r12, r13
+        jae     short .char_unterminated
+        cmp     byte [rbx + r12], 0x27
+        jne     short .char_too_long
+        inc     r12
+        mov     eax, TK_CHAR
+        jmp     near .emit
+.char_too_long:
+        ; A closing quote later on this line means several characters (E0009);
+        ; otherwise the literal was never closed (E0005).
+        mov     rdx, r12
+.ctl_loop:
+        cmp     rdx, r13
+        jae     short .char_unterminated
+        movzx   eax, byte [rbx + rdx]
+        cmp     al, 10
+        je      short .char_unterminated
+        cmp     al, 0x27
+        je      short .char_length
+        inc     rdx
+        jmp     short .ctl_loop
+.char_length:
+        mov     edi, E_CHAR_LENGTH
+        mov     rsi, r8
+        call    diag_error
+.char_unterminated:
+        mov     edi, E_UNTERMINATED_CHAR
+        mov     rsi, r8
+        call    diag_error
+
+; ---------------------------------------------------------------- $ # and others
+.dollar:                                ; [lex.punct.4] only `$"` means anything
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     short .unexpected
+        cmp     byte [rbx + r12 + 1], '"'
+        jne     short .unexpected
+        mov     edi, E_CORE_INTERPOLATION
+        mov     rsi, r8
+        call    diag_error
+
+.hash:                                  ; [lex.dir.1] directives start a line
+        test    ebp, TF_NEWLINE_BEFORE
+        jz      short .unexpected
+        mov     edi, E_CORE_DIRECTIVE
+        mov     rsi, r8
+        call    diag_error
+
+.non_ascii:
+        mov     edi, E_CORE_NON_ASCII
+        mov     rsi, r8
+        call    diag_error
+
+.punct:                                 ; [lex.punct.1] maximal munch
+        lea     rdi, [rbx + r12]
+        mov     rsi, r13
+        sub     rsi, r12
+        call    punct_lookup            ; eax = kind (0 if none), edx = length
+        test    eax, eax
+        jz      short .unexpected
+        add     r12, rdx
+        jmp     short .emit
+
+.unexpected:
+        mov     edi, E_UNEXPECTED_CHAR
+        mov     rsi, r8
+        call    diag_error
+
+; ---------------------------------------------------------------- output
+; Store the token [r8, r12) of kind eax, then continue with the next one.
+.emit:
+        mov     [r14 + TOK_KIND], ax
+        mov     [r14 + TOK_FLAGS], bp
+        mov     [r14 + TOK_START], r8d
+        mov     ecx, r12d
+        sub     ecx, r8d
+        mov     [r14 + TOK_LEN], ecx
+        mov     [r14 + TOK_LINE], r15d
+        add     r14, TOK_SIZE
+        xor     ebp, ebp
+        jmp     near .trivia
+
+.eof:                                   ; [lex.eof.1]
+        mov     word [r14 + TOK_KIND], TK_EOF
+        mov     [r14 + TOK_FLAGS], bp
+        mov     [r14 + TOK_START], r12d
+        mov     dword [r14 + TOK_LEN], 0
+        mov     [r14 + TOK_LINE], r15d
+        add     r14, TOK_SIZE
+        mov     rax, [rsp]
+        mov     rdx, r14
+        sub     rdx, rax
+        shr     rdx, 4                  ; / TOK_SIZE
+        add     rsp, 24
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbp
+        pop     rbx
+        ret
+
+; =============================================================================
+; Helpers. Each one leaves r8, r9 and r10 unchanged.
+; =============================================================================
+
+; is_ident_cont - is this byte [A-Za-z0-9_]?
+;   in:  eax = byte
+;   out: eax = 1 or 0.  clobbers: ecx
+is_ident_cont:
+        cmp     al, '_'
+        je      short .yes
+        mov     ecx, eax
+        sub     ecx, '0'
+        cmp     ecx, 10
+        jb      short .yes
+        mov     ecx, eax
+        or      ecx, 0x20
+        sub     ecx, 'a'
+        cmp     ecx, 26
+        jb      short .yes
+        xor     eax, eax
+        ret
+.yes:
+        mov     eax, 1
+        ret
+
+; digit_value - value of a digit or letter, for bases up to 36.
+;   in:  eax = byte
+;   out: eax = 0-35, or 99 if the byte is not [0-9A-Za-z].  clobbers: ecx
+digit_value:
+        mov     ecx, eax
+        sub     ecx, '0'
+        cmp     ecx, 10
+        jb      short .digit
+        mov     ecx, eax
+        or      ecx, 0x20
+        sub     ecx, 'a'
+        cmp     ecx, 26
+        jb      short .letter
+        mov     eax, 99
+        ret
+.digit:
+        mov     eax, ecx
+        ret
+.letter:
+        lea     eax, [rcx + 10]
+        ret
+
+; kw_lookup - keyword kind for a word, if it is one.
+;   in:  rdi = pointer, rsi = length
+;   out: eax = TK_KW_* or TK_IDENT.  clobbers: rcx, rdx, r11
+kw_lookup:
+        cmp     rsi, 15
+        ja      short .ident
+        mov     ecx, TK_KW_FIRST
+.next:
+        cmp     ecx, TK_KW_LAST
+        ja      short .ident
+        mov     r11d, ecx
+        shl     r11d, 4
+        lea     rdx, [tok_table]
+        add     r11, rdx                ; r11 = table entry
+        movzx   edx, byte [r11]
+        cmp     rdx, rsi
+        jne     short .skip
+.cmp:                                   ; compare from the last byte down
+        test    rdx, rdx
+        jz      short .found
+        dec     rdx
+        movzx   eax, byte [rdi + rdx]
+        cmp     al, [r11 + rdx + 1]
+        je      short .cmp
+.skip:
+        inc     ecx
+        jmp     short .next
+.found:
+        mov     eax, ecx
+        ret
+.ident:
+        mov     eax, TK_IDENT
+        ret
+
+; punct_lookup - longest punctuation token at a position.
+;   in:  rdi = pointer, rsi = bytes left in the file
+;   out: eax = TK_* kind and edx = its length, or eax = 0 if nothing matches
+;   clobbers: rcx, r11
+punct_lookup:
+        mov     ecx, TK_PUNCT_FIRST
+.next:
+        cmp     ecx, TK_PUNCT_LAST
+        ja      short .none
+        mov     r11d, ecx
+        shl     r11d, 4
+        lea     rdx, [tok_table]
+        add     r11, rdx
+        movzx   edx, byte [r11]
+        cmp     rdx, rsi
+        ja      short .skip                   ; longer than the rest of the file
+.cmp:
+        test    rdx, rdx
+        jz      short .found
+        dec     rdx
+        movzx   eax, byte [rdi + rdx]
+        cmp     al, [r11 + rdx + 1]
+        je      short .cmp
+.skip:
+        inc     ecx
+        jmp     short .next
+.found:
+        mov     eax, ecx
+        movzx   edx, byte [r11]
+        ret
+.none:
+        xor     eax, eax
+        xor     edx, edx
+        ret
+
+; suffix_lookup - classify a numeric literal suffix.
+;   in:  rdi = pointer, rsi = length
+;   out: eax = 0 (not a suffix), 1 (integer suffix) or 2 (float suffix)
+;   clobbers: rcx, rdx, r11
+suffix_lookup:
+        xor     ecx, ecx
+.next:
+        cmp     ecx, SUFFIX_COUNT
+        jae     short .none
+        lea     r11, [suffix_table]
+        lea     r11, [r11 + rcx*8]
+        movzx   edx, byte [r11]
+        cmp     rdx, rsi
+        jne     short .skip
+.cmp:
+        test    rdx, rdx
+        jz      short .found
+        dec     rdx
+        movzx   eax, byte [rdi + rdx]
+        cmp     al, [r11 + rdx + 1]
+        je      short .cmp
+.skip:
+        inc     ecx
+        jmp     short .next
+.found:
+        mov     eax, 1
+        cmp     ecx, SUFFIX_FLOAT_FIRST
+        jb      short .done
+        mov     eax, 2
+.done:
+        ret
+.none:
+        xor     eax, eax
+        ret
+
+; lex_escape - validate one escape sequence ([lex.esc.1], [lex.esc.2]).
+; Shares lex's registers.
+;   in:  rbx = source, r12 = offset of the backslash, r13 = length
+;   out: r12 = offset just past the escape. A backslash at end of file only
+;        advances r12, so the caller reports the unterminated literal.
+;   clobbers: rax, rcx, rdx, r11. Reports E0006 / E0010 with diag_error.
+lex_escape:
+        lea     rdx, [r12 + 1]
+        cmp     rdx, r13
+        jae     short .at_eof
+        movzx   eax, byte [rbx + r12 + 1]
+        cmp     al, 'n'
+        je      short .simple
+        cmp     al, 'r'
+        je      short .simple
+        cmp     al, 't'
+        je      short .simple
+        cmp     al, '0'
+        je      short .simple
+        cmp     al, 0x5C
+        je      short .simple
+        cmp     al, 0x27
+        je      short .simple
+        cmp     al, '"'
+        je      short .simple
+        cmp     al, 'x'
+        je      short .hex
+        cmp     al, 'u'
+        je      short .unicode
+        jmp     near .bad
+.at_eof:
+        inc     r12
+        ret
+.simple:
+        add     r12, 2
+        ret
+
+.hex:                                   ; \xHH, at most 7F
+        lea     rdx, [r12 + 3]
+        cmp     rdx, r13
+        jae     near .bad
+        movzx   eax, byte [rbx + r12 + 2]
+        sub     eax, '0'
+        cmp     eax, 8
+        jae     near .bad
+        movzx   eax, byte [rbx + r12 + 3]
+        call    digit_value
+        cmp     eax, 16
+        jae     short .bad
+        add     r12, 4
+        ret
+
+.unicode:                               ; \u{1-6 hex digits}, a scalar value
+        lea     rdx, [r12 + 2]
+        cmp     rdx, r13
+        jae     short .bad_unicode
+        cmp     byte [rbx + r12 + 2], '{'
+        jne     short .bad_unicode
+        lea     r11, [r12 + 3]          ; r11 = cursor
+        xor     edx, edx                ; rdx = value
+.u_loop:
+        cmp     r11, r13
+        jae     short .bad_unicode
+        movzx   eax, byte [rbx + r11]
+        cmp     al, '}'
+        je      short .u_close
+        call    digit_value
+        cmp     eax, 16
+        jae     short .bad_unicode
+        shl     rdx, 4
+        or      rdx, rax
+        inc     r11
+        mov     rax, r11
+        sub     rax, r12
+        cmp     rax, 3 + 6              ; "\u{" plus more than six digits
+        ja      short .bad_unicode
+        jmp     short .u_loop
+.u_close:
+        mov     rax, r11
+        sub     rax, r12
+        cmp     rax, 3                  ; "\u{}" has no digits
+        je      short .bad_unicode
+        cmp     rdx, 0x10FFFF
+        ja      short .bad_unicode
+        mov     eax, edx
+        and     eax, 0xFFFFF800
+        cmp     eax, 0xD800             ; surrogates D800-DFFF are not scalar values
+        je      short .bad_unicode
+        lea     r12, [r11 + 1]
+        ret
+.bad:
+        mov     edi, E_BAD_ESCAPE
+        mov     rsi, r12
+        call    diag_error
+.bad_unicode:
+        mov     edi, E_BAD_UNICODE_ESCAPE
+        mov     rsi, r12
+        call    diag_error
+
+; =============================================================================
+; lex_dump - print tokens, one per line (docs/spec/01-lexical.md 1.11):
+;   <line>:<col> <n|s|j> <class> <text>
+; For keywords and punctuation the text comes from tok_table, not the source,
+; so a wrong spelling-to-kind mapping shows up in the golden tests.
+;   in:  rdi = token array, rsi = count. Uses diag_src for source text.
+; =============================================================================
+lex_dump:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi                ; current token
+        mov     r12, rsi                ; tokens left
+.loop:
+        test    r12, r12
+        jz      near .done
+        lea     rdi, [w_out]
+        mov     esi, [rbx + TOK_LINE]
+        call    w_u64
+        lea     rdi, [w_out]
+        mov     esi, ':'
+        call    w_byte
+        mov     edi, [rbx + TOK_START]
+        call    src_col
+        lea     rdi, [w_out]
+        mov     rsi, rax
+        call    w_u64
+        lea     rdi, [w_out]
+        mov     esi, ' '
+        call    w_byte
+        movzx   eax, word [rbx + TOK_FLAGS]
+        mov     esi, 'j'
+        test    eax, TF_SPACE_BEFORE
+        jz      short .flag
+        mov     esi, 's'
+        test    eax, TF_NEWLINE_BEFORE
+        jz      short .flag
+        mov     esi, 'n'
+.flag:
+        lea     rdi, [w_out]
+        call    w_byte
+        lea     rdi, [w_out]
+        mov     esi, ' '
+        call    w_byte
+        movzx   r13d, word [rbx + TOK_KIND]
+        cmp     r13d, TK_KW_FIRST
+        jb      short .literal
+        lea     rsi, [s_class_kw]
+        mov     edx, s_class_kw_len
+        cmp     r13d, TK_PUNCT_FIRST
+        jb      short .spelled
+        lea     rsi, [s_class_punct]
+        mov     edx, s_class_punct_len
+.spelled:
+        lea     rdi, [w_out]
+        call    w_bytes
+        mov     eax, r13d               ; canonical spelling from the table
+        shl     eax, 4
+        lea     rsi, [tok_table]
+        add     rsi, rax
+        movzx   edx, byte [rsi]
+        inc     rsi
+        lea     rdi, [w_out]
+        call    w_bytes
+        jmp     short .eol
+.literal:
+        mov     eax, r13d               ; class name from the table
+        shl     eax, 4
+        lea     rsi, [tok_table]
+        add     rsi, rax
+        movzx   edx, byte [rsi]
+        inc     rsi
+        lea     rdi, [w_out]
+        call    w_bytes
+        test    r13d, r13d              ; TK_EOF has no text
+        jz      short .eol
+        lea     rdi, [w_out]
+        mov     esi, ' '
+        call    w_byte
+        mov     esi, [rbx + TOK_START]
+        add     rsi, [diag_src]
+        mov     edx, [rbx + TOK_LEN]
+        lea     rdi, [w_out]
+        call    w_bytes
+.eol:
+        lea     rdi, [w_out]
+        mov     esi, 10
+        call    w_byte
+        add     rbx, TOK_SIZE
+        dec     r12
+        jmp     near .loop
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+s_class_kw:             db 'kw '
+s_class_kw_len          equ $ - s_class_kw
+s_class_punct:          db 'punct '
+s_class_punct_len       equ $ - s_class_punct

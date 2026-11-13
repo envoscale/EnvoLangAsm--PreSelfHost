@@ -1,0 +1,83 @@
+// Vec: a growable array of fixed-size elements. Envo-Core has no generics, so a Vec
+// knows its element size and hands out *u8 pointers to elements; callers cast them to
+// the element type (`VecAt(&v, i) as *Token`) inside unsafe.
+//
+// Pointers into a Vec stay valid until the next push that grows it.
+
+struct Vec {
+    *u8 Ptr;
+    usize Len;
+    usize Cap;
+    usize Elem;
+}
+
+Vec VecNew(usize elem, usize cap) {
+    if (cap < 4) cap = 4;
+    return new Vec { Ptr = alloc(elem * cap), Len = 0, Cap = cap, Elem = elem };
+}
+
+usize VecLen(*Vec v) {
+    unsafe { return v.Len; }
+}
+
+// The address of element i. Panics if i is out of bounds.
+*u8 VecAt(*Vec v, usize i) {
+    unsafe {
+        if (i >= v.Len) panic("VecAt: index out of bounds");
+        return &v.Ptr[i * v.Elem];
+    }
+}
+
+// Appends a zeroed element and returns its address.
+*u8 VecPush(*Vec v) {
+    unsafe {
+        if (v.Len == v.Cap) {
+            usize cap = v.Cap * 2;
+            *u8 p = alloc(cap * v.Elem);
+            MemCopy(p, v.Ptr, v.Len * v.Elem);
+            v.Ptr = p;
+            v.Cap = cap;
+        }
+        *u8 e = &v.Ptr[v.Len * v.Elem];
+        v.Len++;
+        return e;
+    }
+}
+
+// Removes the last element; its memory is zeroed so a later push starts clean.
+void VecPop(*Vec v) {
+    unsafe {
+        if (v.Len == 0) panic("VecPop: empty");
+        v.Len--;
+        MemZero(&v.Ptr[v.Len * v.Elem], v.Elem);
+    }
+}
+
+void VecClear(*Vec v) {
+    unsafe {
+        MemZero(v.Ptr, v.Len * v.Elem);
+        v.Len = 0;
+    }
+}
+
+// Convenience for vectors of u64 (and of indexes stored as u64).
+void VecPushU64(*Vec v, u64 x) {
+    MemStoreU64(VecPush(v), x);
+}
+
+u64 VecGetU64(*Vec v, usize i) {
+    return MemLoadU64(VecAt(v, i));
+}
+
+void VecSetU64(*Vec v, usize i, u64 x) {
+    MemStoreU64(VecAt(v, i), x);
+}
+
+// Shrinks v to len elements, zeroing the removed ones (used to backtrack).
+void VecTruncate(*Vec v, usize len) {
+    unsafe {
+        if (len > v.Len) panic("VecTruncate: longer than the vector");
+        MemZero(&v.Ptr[len * v.Elem], (v.Len - len) * v.Elem);
+        v.Len = len;
+    }
+}

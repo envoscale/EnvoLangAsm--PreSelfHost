@@ -1,0 +1,48 @@
+; =============================================================================
+; envoc0-linux.eas - top-level build unit: envoc0 for x86-64 Linux (ELF64)
+;
+; Assemble as one flat binary (Phase A: nasm -f bin -I bootstrap/stage0/).
+; The header file must come first. Then both runtime blocks (src/writer.eas copies
+; them into output programs), then the compiler itself.
+; =============================================================================
+        bits    64
+        default rel
+
+%include "platform/elf.eas"
+
+; Both runtime blocks are in every envoc0, so it can build programs for either
+; OS. The native block is the one envoc0 itself runs (the header's entry point).
+%include "platform/runtime-abi.eas"
+%include "platform/windows.eas"
+%include "platform/linux.eas"
+
+; envoc0's own OS interface is the native block's shim.
+sys_open       equ rtl_sys_open
+sys_read       equ rtl_sys_read
+sys_write      equ rtl_sys_write
+sys_close      equ rtl_sys_close
+sys_alloc      equ rtl_sys_alloc
+sys_free       equ rtl_sys_free
+sys_exit       equ rtl_sys_exit
+sys_args       equ rtl_sys_args
+
+NATIVE_TARGET   equ 1                   ; `envoc0 build` default (src/writer.eas)
+plat_name:      db 'x86_64-linux'
+plat_name_len   equ $ - plat_name
+
+; Shared sources, in dependency order: constants are defined before code that
+; uses them (docs/spec/eas.md section 4), and data tables come first.
+%include "src/tokens.eas"
+%include "src/nodes.eas"
+%include "src/diag.eas"
+%include "src/mem.eas"
+%include "src/io.eas"
+%include "src/utf8.eas"
+%include "src/lexer.eas"
+%include "src/parser.eas"
+%include "src/check.eas"
+%include "src/codegen.eas"
+%include "src/writer.eas"
+%include "src/main.eas"
+
+image_end:

@@ -1,0 +1,315 @@
+; =============================================================================
+; src/diag.eas - diagnostics
+;
+; Format (docs/spec/errors.md):
+;   <path>:<line>:<col>: error[E0004]: unterminated string literal
+; Lines and columns are 1-based; columns count Unicode scalar values, i.e. bytes
+; that are not UTF-8 continuation bytes (10xxxxxx). Stage 0 stops at the first
+; error, so diag_error never returns.
+;
+; diag_path / diag_src / diag_len describe the file being compiled and must be
+; set before any diagnostic is reported.
+; =============================================================================
+
+E_INVALID_UTF8          equ 1
+E_UNEXPECTED_CHAR       equ 2
+E_UNTERMINATED_COMMENT  equ 3
+E_UNTERMINATED_STRING   equ 4
+E_UNTERMINATED_CHAR     equ 5
+E_BAD_ESCAPE            equ 6
+E_BAD_NUMBER            equ 7
+E_BAD_SUFFIX            equ 8
+E_CHAR_LENGTH           equ 9
+E_BAD_UNICODE_ESCAPE    equ 10
+E_CONTROL_CHAR          equ 11
+E_EXPECTED              equ 101
+E_CHAINED_COMPARISON    equ 102
+E_BAD_ASSIGN_TARGET     equ 103
+E_TOO_DEEP              equ 104
+E_ENTRY_ONLY            equ 210
+E_CORE_INTERPOLATION    equ 901
+E_CORE_RAW_STRING       equ 902
+E_CORE_DIRECTIVE        equ 903
+E_CORE_NON_ASCII        equ 904
+E_CORE_CONSTRUCT        equ 905
+
+; src_line - 1-based line number of a byte offset.
+;   in:  rdi = offset
+;   out: rax = line.  clobbers: rcx, rdx
+src_line:
+        push    rdi
+        call    file_start              ; rcx = the file's first byte
+        pop     rdi
+        mov     rdx, [diag_src]
+        mov     eax, 1
+.loop:
+        cmp     rcx, rdi
+        jae     short .done
+        cmp     byte [rdx + rcx], 10
+        jne     short .next
+        inc     rax
+.next:
+        inc     rcx
+        jmp     short .loop
+.done:
+        ret
+
+; src_col - 1-based column (in Unicode scalar values) of a byte offset.
+;   in:  rdi = offset
+;   out: rax = column.  clobbers: rcx, rdx, r8
+src_col:
+        push    rdi
+        call    file_start
+        pop     rdi
+        mov     r8, rcx                 ; the line cannot start before the file
+        mov     rdx, [diag_src]
+        mov     rcx, rdi                ; walk back to the start of the line
+.back:
+        cmp     rcx, r8
+        jbe     short .count
+        cmp     byte [rdx + rcx - 1], 10
+        je      short .count
+        dec     rcx
+        jmp     short .back
+.count:
+        mov     eax, 1
+.loop:
+        cmp     rcx, rdi
+        jae     short .done
+        movzx   r8d, byte [rdx + rcx]
+        and     r8d, 0xC0
+        cmp     r8d, 0x80               ; continuation bytes don't start a character
+        je      short .next
+        inc     rax
+.next:
+        inc     rcx
+        jmp     short .loop
+.done:
+        ret
+
+; file_start - first byte of the file holding source offset rdi (multi-file
+; programs share one source buffer; see load_files in src/main.eas).
+;   out: rcx = offset, rax = the file's path.  clobbers: rdx, rsi
+file_start:
+        xor     ecx, ecx
+        mov     rax, [diag_path]
+        mov     rsi, [d_files]
+        test    rsi, rsi
+        jz      short .done
+        mov     rdx, [d_nfiles]
+.next:
+        test    rdx, rdx
+        jz      short .done
+        cmp     rdi, [rsi]              ; entries: base, length, path
+        jb      short .done             ; (sorted by base: the last base <= rdi wins)
+        mov     rcx, [rsi]
+        mov     rax, [rsi + 16]
+        add     rsi, 24
+        dec     rdx
+        jmp     short .next
+.done:
+        ret
+
+; diag_error - report an error at a source offset and exit with code 1.
+;   in:  edi = error code, rsi = byte offset (relative to diag_base: the lexer
+;   reports offsets within the file it is lexing)
+diag_error:
+        and     rsp, -16                ; never returns: realign unconditionally
+        add     rsi, [diag_base]
+        mov     ebx, edi
+        call    diag_header
+        mov     edi, ebx
+        call    diag_message            ; rax = NUL-terminated message
+        lea     rdi, [w_err]
+        mov     rsi, rax
+        call    w_cstr
+        jmp     short diag_finish
+
+; diag_finish - end the diagnostic line and exit with code 1. Jump here (or
+; call it) from a routine that has written the rest of the message to w_err.
+diag_finish:
+        and     rsp, -16
+        lea     rdi, [w_err]
+        mov     esi, 10
+        call    w_byte
+        mov     edi, 1
+        call    exit_process
+
+; diag_header - write "<path>:<line>:<col>: error[E<code>]: " to w_err.
+; For routines that build their own message, then jump to diag_finish.
+;   in:  edi = error code, rsi = byte offset
+;   clobbers: caller-saved registers (rbx and r12 are preserved)
+diag_header:
+        push    rbx
+        push    r12
+        sub     rsp, 24                 ; 8 + 16 + 24 = 48: aligned, plus scratch
+        mov     ebx, edi                ; rbx = code
+        mov     r12, rsi                ; r12 = offset
+        mov     rdi, rsi
+        call    file_start              ; rax = the path of the file holding it
+        mov     rsi, rax
+        lea     rdi, [w_err]
+        call    w_cstr
+        lea     rdi, [w_err]
+        mov     esi, ':'
+        call    w_byte
+        mov     rdi, r12
+        call    src_line
+        lea     rdi, [w_err]
+        mov     rsi, rax
+        call    w_u64
+        lea     rdi, [w_err]
+        mov     esi, ':'
+        call    w_byte
+        mov     rdi, r12
+        call    src_col
+        lea     rdi, [w_err]
+        mov     rsi, rax
+        call    w_u64
+        lea     rdi, [w_err]
+        lea     rsi, [msg_error_open]
+        mov     edx, msg_error_open_len
+        call    w_bytes
+        ; four-digit code, zero-padded, built in the scratch space at [rsp]
+        mov     eax, ebx
+        mov     ecx, 10
+        xor     edx, edx
+        div     ecx
+        add     dl, '0'
+        mov     [rsp + 3], dl
+        xor     edx, edx
+        div     ecx
+        add     dl, '0'
+        mov     [rsp + 2], dl
+        xor     edx, edx
+        div     ecx
+        add     dl, '0'
+        mov     [rsp + 1], dl
+        xor     edx, edx
+        div     ecx
+        add     dl, '0'
+        mov     [rsp], dl
+        lea     rdi, [w_err]
+        mov     rsi, rsp
+        mov     edx, 4
+        call    w_bytes
+        lea     rdi, [w_err]
+        lea     rsi, [msg_error_close]
+        mov     edx, msg_error_close_len
+        call    w_bytes
+        add     rsp, 24
+        pop     r12
+        pop     rbx
+        ret
+
+; diag_message - look up the message for an error code.
+;   in:  edi = code
+;   out: rax = NUL-terminated message
+;   clobbers: rcx, rdx
+; The table is a sequence of (dw code, NUL-terminated text), ended by dw 0.
+diag_message:
+        lea     rax, [diag_messages]
+.entry:
+        movzx   ecx, word [rax]
+        test    ecx, ecx
+        jz      short .unknown
+        add     rax, 2
+        cmp     ecx, edi
+        je      short .found
+.skip:
+        cmp     byte [rax], 0
+        lea     rax, [rax + 1]          ; lea leaves the flags alone
+        jne     short .skip
+        jmp     short .entry
+.found:
+        ret
+.unknown:
+        lea     rax, [msg_unknown_error]
+        ret
+
+msg_error_open:         db ': error[E'
+msg_error_open_len      equ $ - msg_error_open
+msg_error_close:        db ']: '
+msg_error_close_len     equ $ - msg_error_close
+msg_unknown_error:      db '(no message for this error code)', 0
+
+diag_messages:
+        dw      E_INVALID_UTF8
+        db      'source file is not valid UTF-8', 0
+        dw      E_UNEXPECTED_CHAR
+        db      'unexpected character', 0
+        dw      E_UNTERMINATED_COMMENT
+        db      'unterminated block comment', 0
+        dw      E_UNTERMINATED_STRING
+        db      'unterminated string literal', 0
+        dw      E_UNTERMINATED_CHAR
+        db      'unterminated character literal', 0
+        dw      E_BAD_ESCAPE
+        db      'unknown or malformed escape sequence', 0
+        dw      E_BAD_NUMBER
+        db      'malformed numeric literal', 0
+        dw      E_BAD_SUFFIX
+        db      'invalid suffix on numeric literal', 0
+        dw      E_CHAR_LENGTH
+        db      'character literal must contain exactly one character', 0
+        dw      E_BAD_UNICODE_ESCAPE
+        db      'invalid Unicode escape', 0
+        dw      E_CONTROL_CHAR
+        db      'control character in literal; use an escape sequence', 0
+        dw      E_CHAINED_COMPARISON
+        db      'comparison operators cannot be chained; use `&&` or parentheses', 0
+        dw      E_BAD_ASSIGN_TARGET
+        db      'invalid target for assignment', 0
+        dw      E_TOO_DEEP
+        db      'nested too deeply (Stage 0 limit: 256 levels)', 0
+        dw      E_ENTRY_ONLY
+        db      'top-level statements are only allowed in the entry file (the first file given)', 0
+        dw      205
+        db      '`break` or `continue` outside a loop', 0
+        dw      306
+        db      'this needs an `unsafe` block', 0
+        dw      308
+        db      '`match` is not exhaustive; add `_` or the missing values', 0
+        dw      310
+        db      'constant evaluation failed (overflow, division by zero, or shift too large)', 0
+        dw      311
+        db      'expected a constant expression', 0
+        dw      312
+        db      'type is too large (Stage 0 limit: 2^31 - 1 bytes)', 0
+        dw      314
+        db      'this cannot be called', 0
+        dw      315
+        db      'cannot assign to this', 0
+        dw      316
+        db      'cannot take the address of this', 0
+        dw      319
+        db      'this value is already matched', 0
+        dw      320
+        db      'not all code paths return a value', 0
+        dw      321
+        db      'only calls can be used as statements', 0
+        dw      322
+        db      'a `void` value cannot be used here', 0
+        dw      323
+        db      'duplicate enum value', 0
+        dw      324
+        db      'enum representation must be an integer type', 0
+        dw      327
+        db      '`void` is only allowed as a return type', 0
+        dw      E_CORE_INTERPOLATION
+        db      'interpolated strings are not part of Envo-Core', 0
+        dw      E_CORE_RAW_STRING
+        db      'raw string literals are not part of Envo-Core', 0
+        dw      E_CORE_DIRECTIVE
+        db      'directives are not part of Envo-Core', 0
+        dw      E_CORE_NON_ASCII
+        db      'non-ASCII characters outside literals and comments are not supported in Envo-Core', 0
+        dw      0
+
+        align   8, db 0
+diag_path:      dq 0
+diag_src:       dq 0
+diag_len:       dq 0
+diag_base:      dq 0                    ; added to lexer offsets (the file being lexed)
+d_files:        dq 0                    ; file table: base, length, path (24 bytes each)
+d_nfiles:       dq 0

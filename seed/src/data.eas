@@ -1,0 +1,297 @@
+; =============================================================================
+; seed/src/data.eas - asm0's tables, messages and state (made by seed/mkdata.py)
+; =============================================================================
+
+        align   8, db 0
+; ---------------------------------------------------------------- registers
+reg_table:
+        db      'rax', 0, 0, 0, 0, 0, 3, 0, 8, 0, 0, 0, 0, 0
+        db      'rcx', 0, 0, 0, 0, 0, 3, 1, 8, 0, 0, 0, 0, 0
+        db      'rdx', 0, 0, 0, 0, 0, 3, 2, 8, 0, 0, 0, 0, 0
+        db      'rbx', 0, 0, 0, 0, 0, 3, 3, 8, 0, 0, 0, 0, 0
+        db      'rsp', 0, 0, 0, 0, 0, 3, 4, 8, 0, 0, 0, 0, 0
+        db      'rbp', 0, 0, 0, 0, 0, 3, 5, 8, 0, 0, 0, 0, 0
+        db      'rsi', 0, 0, 0, 0, 0, 3, 6, 8, 0, 0, 0, 0, 0
+        db      'rdi', 0, 0, 0, 0, 0, 3, 7, 8, 0, 0, 0, 0, 0
+        db      'r8', 0, 0, 0, 0, 0, 0, 2, 8, 8, 0, 0, 0, 0, 0
+        db      'r9', 0, 0, 0, 0, 0, 0, 2, 9, 8, 0, 0, 0, 0, 0
+        db      'r10', 0, 0, 0, 0, 0, 3, 10, 8, 0, 0, 0, 0, 0
+        db      'r11', 0, 0, 0, 0, 0, 3, 11, 8, 0, 0, 0, 0, 0
+        db      'r12', 0, 0, 0, 0, 0, 3, 12, 8, 0, 0, 0, 0, 0
+        db      'r13', 0, 0, 0, 0, 0, 3, 13, 8, 0, 0, 0, 0, 0
+        db      'r14', 0, 0, 0, 0, 0, 3, 14, 8, 0, 0, 0, 0, 0
+        db      'r15', 0, 0, 0, 0, 0, 3, 15, 8, 0, 0, 0, 0, 0
+        db      'eax', 0, 0, 0, 0, 0, 3, 0, 4, 0, 0, 0, 0, 0
+        db      'ecx', 0, 0, 0, 0, 0, 3, 1, 4, 0, 0, 0, 0, 0
+        db      'edx', 0, 0, 0, 0, 0, 3, 2, 4, 0, 0, 0, 0, 0
+        db      'ebx', 0, 0, 0, 0, 0, 3, 3, 4, 0, 0, 0, 0, 0
+        db      'esp', 0, 0, 0, 0, 0, 3, 4, 4, 0, 0, 0, 0, 0
+        db      'ebp', 0, 0, 0, 0, 0, 3, 5, 4, 0, 0, 0, 0, 0
+        db      'esi', 0, 0, 0, 0, 0, 3, 6, 4, 0, 0, 0, 0, 0
+        db      'edi', 0, 0, 0, 0, 0, 3, 7, 4, 0, 0, 0, 0, 0
+        db      'r8d', 0, 0, 0, 0, 0, 3, 8, 4, 0, 0, 0, 0, 0
+        db      'r9d', 0, 0, 0, 0, 0, 3, 9, 4, 0, 0, 0, 0, 0
+        db      'r10d', 0, 0, 0, 0, 4, 10, 4, 0, 0, 0, 0, 0
+        db      'r11d', 0, 0, 0, 0, 4, 11, 4, 0, 0, 0, 0, 0
+        db      'r12d', 0, 0, 0, 0, 4, 12, 4, 0, 0, 0, 0, 0
+        db      'r13d', 0, 0, 0, 0, 4, 13, 4, 0, 0, 0, 0, 0
+        db      'r14d', 0, 0, 0, 0, 4, 14, 4, 0, 0, 0, 0, 0
+        db      'r15d', 0, 0, 0, 0, 4, 15, 4, 0, 0, 0, 0, 0
+        db      'ax', 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0, 0, 0, 0
+        db      'cx', 0, 0, 0, 0, 0, 0, 2, 1, 2, 0, 0, 0, 0, 0
+        db      'dx', 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 0
+        db      'bx', 0, 0, 0, 0, 0, 0, 2, 3, 2, 0, 0, 0, 0, 0
+        db      'sp', 0, 0, 0, 0, 0, 0, 2, 4, 2, 0, 0, 0, 0, 0
+        db      'bp', 0, 0, 0, 0, 0, 0, 2, 5, 2, 0, 0, 0, 0, 0
+        db      'si', 0, 0, 0, 0, 0, 0, 2, 6, 2, 0, 0, 0, 0, 0
+        db      'di', 0, 0, 0, 0, 0, 0, 2, 7, 2, 0, 0, 0, 0, 0
+        db      'r8w', 0, 0, 0, 0, 0, 3, 8, 2, 0, 0, 0, 0, 0
+        db      'r9w', 0, 0, 0, 0, 0, 3, 9, 2, 0, 0, 0, 0, 0
+        db      'r10w', 0, 0, 0, 0, 4, 10, 2, 0, 0, 0, 0, 0
+        db      'r11w', 0, 0, 0, 0, 4, 11, 2, 0, 0, 0, 0, 0
+        db      'r12w', 0, 0, 0, 0, 4, 12, 2, 0, 0, 0, 0, 0
+        db      'r13w', 0, 0, 0, 0, 4, 13, 2, 0, 0, 0, 0, 0
+        db      'r14w', 0, 0, 0, 0, 4, 14, 2, 0, 0, 0, 0, 0
+        db      'r15w', 0, 0, 0, 0, 4, 15, 2, 0, 0, 0, 0, 0
+        db      'al', 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0
+        db      'cl', 0, 0, 0, 0, 0, 0, 2, 1, 1, 0, 0, 0, 0, 0
+        db      'dl', 0, 0, 0, 0, 0, 0, 2, 2, 1, 0, 0, 0, 0, 0
+        db      'bl', 0, 0, 0, 0, 0, 0, 2, 3, 1, 0, 0, 0, 0, 0
+        db      'spl', 0, 0, 0, 0, 0, 3, 4, 1, 1, 0, 0, 0, 0
+        db      'bpl', 0, 0, 0, 0, 0, 3, 5, 1, 1, 0, 0, 0, 0
+        db      'sil', 0, 0, 0, 0, 0, 3, 6, 1, 1, 0, 0, 0, 0
+        db      'dil', 0, 0, 0, 0, 0, 3, 7, 1, 1, 0, 0, 0, 0
+        db      'r8b', 0, 0, 0, 0, 0, 3, 8, 1, 0, 0, 0, 0, 0
+        db      'r9b', 0, 0, 0, 0, 0, 3, 9, 1, 0, 0, 0, 0, 0
+        db      'r10b', 0, 0, 0, 0, 4, 10, 1, 0, 0, 0, 0, 0
+        db      'r11b', 0, 0, 0, 0, 4, 11, 1, 0, 0, 0, 0, 0
+        db      'r12b', 0, 0, 0, 0, 4, 12, 1, 0, 0, 0, 0, 0
+        db      'r13b', 0, 0, 0, 0, 4, 13, 1, 0, 0, 0, 0, 0
+        db      'r14b', 0, 0, 0, 0, 4, 14, 1, 0, 0, 0, 0, 0
+        db      'r15b', 0, 0, 0, 0, 4, 15, 1, 0, 0, 0, 0, 0
+        times 16 db 0                   ; the end
+
+; ---------------------------------------------------------------- conditions
+; name[4], length, code, padding
+cond_table:
+        db      'o', 0, 0, 0, 1, 0, 0, 0
+        db      'no', 0, 0, 2, 1, 0, 0
+        db      'b', 0, 0, 0, 1, 2, 0, 0
+        db      'c', 0, 0, 0, 1, 2, 0, 0
+        db      'nae', 0, 3, 2, 0, 0
+        db      'ae', 0, 0, 2, 3, 0, 0
+        db      'nb', 0, 0, 2, 3, 0, 0
+        db      'nc', 0, 0, 2, 3, 0, 0
+        db      'e', 0, 0, 0, 1, 4, 0, 0
+        db      'z', 0, 0, 0, 1, 4, 0, 0
+        db      'ne', 0, 0, 2, 5, 0, 0
+        db      'nz', 0, 0, 2, 5, 0, 0
+        db      'be', 0, 0, 2, 6, 0, 0
+        db      'na', 0, 0, 2, 6, 0, 0
+        db      'a', 0, 0, 0, 1, 7, 0, 0
+        db      'nbe', 0, 3, 7, 0, 0
+        db      's', 0, 0, 0, 1, 8, 0, 0
+        db      'ns', 0, 0, 2, 9, 0, 0
+        db      'p', 0, 0, 0, 1, 10, 0, 0
+        db      'pe', 0, 0, 2, 10, 0, 0
+        db      'np', 0, 0, 2, 11, 0, 0
+        db      'po', 0, 0, 2, 11, 0, 0
+        db      'l', 0, 0, 0, 1, 12, 0, 0
+        db      'nge', 0, 3, 12, 0, 0
+        db      'ge', 0, 0, 2, 13, 0, 0
+        db      'nl', 0, 0, 2, 13, 0, 0
+        db      'le', 0, 0, 2, 14, 0, 0
+        db      'ng', 0, 0, 2, 14, 0, 0
+        db      'g', 0, 0, 0, 1, 15, 0, 0
+        db      'nle', 0, 3, 15, 0, 0
+        times 8 db 0
+
+; ---------------------------------------------------------------- mnemonics
+; name, length, handler, argument
+        align   8, db 0
+mnemonics:
+        dq      s_m_add, 3, h_alu, 0
+        dq      s_m_or, 2, h_alu, 1
+        dq      s_m_adc, 3, h_alu, 2
+        dq      s_m_sbb, 3, h_alu, 3
+        dq      s_m_and, 3, h_alu, 4
+        dq      s_m_sub, 3, h_alu, 5
+        dq      s_m_xor, 3, h_alu, 6
+        dq      s_m_cmp, 3, h_alu, 7
+        dq      s_m_mov, 3, h_mov, 0
+        dq      s_m_movzx, 5, h_movx, 0xB6
+        dq      s_m_movsx, 5, h_movx, 0xBE
+        dq      s_m_movsxd, 6, h_movsxd, 0
+        dq      s_m_lea, 3, h_lea, 0
+        dq      s_m_test, 4, h_test, 0
+        dq      s_m_xchg, 4, h_xchg, 0
+        dq      s_m_inc, 3, h_group, 0xFF00
+        dq      s_m_dec, 3, h_group, 0xFF01
+        dq      s_m_not, 3, h_group, 0xF702
+        dq      s_m_neg, 3, h_group, 0xF703
+        dq      s_m_mul, 3, h_group, 0xF704
+        dq      s_m_div, 3, h_group, 0xF706
+        dq      s_m_idiv, 4, h_group, 0xF707
+        dq      s_m_imul, 4, h_imul, 0
+        dq      s_m_rol, 3, h_shift, 0
+        dq      s_m_ror, 3, h_shift, 1
+        dq      s_m_shl, 3, h_shift, 4
+        dq      s_m_shr, 3, h_shift, 5
+        dq      s_m_sar, 3, h_shift, 7
+        dq      s_m_push, 4, h_push, 0
+        dq      s_m_pop, 3, h_push, 1
+        dq      s_m_call, 4, h_call, 0
+        dq      s_m_ret, 3, h_fixed, 0x01000000000000C3
+        dq      s_m_syscall, 7, h_fixed, 0x020000000000050F
+        dq      s_m_nop, 3, h_fixed, 0x0100000000000090
+        dq      s_m_ud2, 3, h_fixed, 0x0200000000000B0F
+        dq      s_m_int3, 4, h_fixed, 0x01000000000000CC
+        dq      s_m_hlt, 3, h_fixed, 0x01000000000000F4
+        dq      s_m_cqo, 3, h_fixed, 0x0200000000009948
+        dq      s_m_cdq, 3, h_fixed, 0x0100000000000099
+        dq      s_m_cdqe, 4, h_fixed, 0x0200000000009848
+        dq      s_m_lodsb, 5, h_fixed, 0x01000000000000AC
+        dq      0, 0, 0, 0
+
+s_m_add:      db 'add'
+s_m_or:       db 'or'
+s_m_adc:      db 'adc'
+s_m_sbb:      db 'sbb'
+s_m_and:      db 'and'
+s_m_sub:      db 'sub'
+s_m_xor:      db 'xor'
+s_m_cmp:      db 'cmp'
+s_m_mov:      db 'mov'
+s_m_movzx:    db 'movzx'
+s_m_movsx:    db 'movsx'
+s_m_movsxd:   db 'movsxd'
+s_m_lea:      db 'lea'
+s_m_test:     db 'test'
+s_m_xchg:     db 'xchg'
+s_m_inc:      db 'inc'
+s_m_dec:      db 'dec'
+s_m_not:      db 'not'
+s_m_neg:      db 'neg'
+s_m_mul:      db 'mul'
+s_m_div:      db 'div'
+s_m_idiv:     db 'idiv'
+s_m_imul:     db 'imul'
+s_m_rol:      db 'rol'
+s_m_ror:      db 'ror'
+s_m_shl:      db 'shl'
+s_m_shr:      db 'shr'
+s_m_sar:      db 'sar'
+s_m_push:     db 'push'
+s_m_pop:      db 'pop'
+s_m_call:     db 'call'
+s_m_ret:      db 'ret'
+s_m_syscall:  db 'syscall'
+s_m_nop:      db 'nop'
+s_m_ud2:      db 'ud2'
+s_m_int3:     db 'int3'
+s_m_hlt:      db 'hlt'
+s_m_cqo:      db 'cqo'
+s_m_cdq:      db 'cdq'
+s_m_cdqe:     db 'cdqe'
+s_m_lodsb:    db 'lodsb'
+
+; ---------------------------------------------------------------- words
+s_equ:       db 'equ'
+s_include:   db 'include'
+s_bits:      db 'bits'
+s_default:   db 'default'
+s_org:       db 'org'
+s_align:     db 'align'
+s_times:     db 'times'
+s_byte:      db 'byte'
+s_word:      db 'word'
+s_dword:     db 'dword'
+s_qword:     db 'qword'
+s_rep:       db 'rep'
+s_movsb:     db 'movsb'
+s_stosb:     db 'stosb'
+s_short:     db 'short'
+s_near:      db 'near'
+s_jmp:       db 'jmp'
+s_set:       db 'set'
+s_cmov:      db 'cmov'
+
+; ---------------------------------------------------------------- messages
+msg_usage:     db 'usage: asm0 <file.eas> <output>', 10
+msg_usage_len     equ $ - msg_usage
+msg_write:     db 'cannot write the output'
+msg_write_len     equ $ - msg_write
+msg_passes:    db 'the passes disagree on the size'
+msg_passes_len    equ $ - msg_passes
+msg_deep:      db '%include nested too deeply'
+msg_deep_len      equ $ - msg_deep
+msg_read:      db 'asm0: cannot read '
+msg_read_len      equ $ - msg_read
+msg_prefix:    db 'asm0: '
+msg_prefix_len    equ $ - msg_prefix
+msg_long:      db 'line or name too long'
+msg_long_len      equ $ - msg_long
+msg_char:      db 'unexpected character'
+msg_char_len      equ $ - msg_char
+msg_string:    db 'unterminated string'
+msg_string_len    equ $ - msg_string
+msg_twice:     db 'a name defined twice'
+msg_twice_len     equ $ - msg_twice
+msg_moved:     db 'a label moved between the passes (an instruction changed size)'
+msg_moved_len     equ $ - msg_moved
+msg_div:       db 'division by zero in an expression'
+msg_div_len       equ $ - msg_div
+msg_expr:      db 'malformed expression'
+msg_expr_len      equ $ - msg_expr
+msg_undefined: db 'undefined name'
+msg_undefined_len equ $ - msg_undefined
+msg_syntax:    db 'syntax error'
+msg_syntax_len    equ $ - msg_syntax
+msg_extra:     db 'unexpected text after the statement'
+msg_extra_len     equ $ - msg_extra
+msg_full:      db 'output larger than 16 MiB'
+msg_full_len      equ $ - msg_full
+msg_org:       db 'org after output'
+msg_org_len       equ $ - msg_org
+msg_align:     db 'align takes n, db 0'
+msg_align_len     equ $ - msg_align
+msg_times:     db 'times takes a known count and a data directive'
+msg_times_len     equ $ - msg_times
+msg_operand:   db 'bad operands'
+msg_operand_len   equ $ - msg_operand
+msg_mnemonic:  db 'unknown instruction'
+msg_mnemonic_len  equ $ - msg_mnemonic
+msg_jump_size: db 'a jump must say short or near'
+msg_jump_size_len equ $ - msg_jump_size
+msg_far:       db 'short jump out of range'
+msg_far_len       equ $ - msg_far
+msg_colon:      db ': '
+
+; ---------------------------------------------------------------- state
+        align   8, db 0
+g_pass:         dq 0
+g_addr:         dq 0
+g_org:          dq 0
+g_here:         dq 0
+g_stmt:         dq 0
+g_size:         dq 0
+g_seen_out:     dq 0
+g_known:        dq 0
+g_syms:         dq 0
+g_out:          dq 0
+g_toks:         dq 0
+g_ntok:         dq 0
+g_top:          dq 0
+g_dir_len:      dq 0
+g_depth:        dq 0
+g_file:         dq 0
+g_line:         dq 0
+g_global:       dq 0
+g_global_len:   dq 0
+g_nops:         dq 0
+g_ilen:         dq 0
+g_rip_at:       dq 0
+g_rip_target:   dq 0
+g_ib:           times 32 db 0
+g_ops:          times 192 db 0
+g_name:         times 512 db 0

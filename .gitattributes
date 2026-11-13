@@ -1,0 +1,9 @@
+# Every text file is LF; the seed and the .eas sources depend on exact bytes.
+* text=auto eol=lf
+
+# Windows PowerShell 5.1 reads its scripts reliably with CRLF.
+*.ps1 text eol=crlf
+
+*.exe binary
+*.bin binary
+*.hex text eol=lf

@@ -1,0 +1,367 @@
+// The EIR printer (eir.md section 3). Values and blocks are renumbered in order of
+// definition (%0, %1, …, ^bb0, ^bb1, …), so the output is canonical: printing a module,
+// reading it back and printing it again gives the same text ([eir.text.4]).
+
+struct Printer {
+    *Module M;
+    *Buf Out;
+    Vec Num;        // u32 per value: its canonical number + 1 (0 = not numbered yet)
+    u32 Next;
+}
+
+void PType(*Printer p, u32 t) {
+    unsafe {
+        ETy ty = ETyGet(p.M, t);
+        if (ty.Kind == EK_STRUCT) {
+            BufByte(p.Out, '$');
+            BufStr(p.Out, ty.Name);
+        } else if (ty.Kind == EK_ARRAY) {
+            BufByte(p.Out, '[');
+            BufU64(p.Out, ty.Count as u64);
+            BufStr(p.Out, " x ");
+            PType(p, ty.Elem);
+            BufByte(p.Out, ']');
+        } else {
+            BufStr(p.Out, ty.Name);
+        }
+    }
+}
+
+// Gives value v the next number.
+void PNumber(*Printer p, u32 v) {
+    unsafe {
+        MemStoreU32(VecAt(&p.Num, v as usize), p.Next + 1);
+        p.Next++;
+    }
+}
+
+void PValue(*Printer p, u32 v) {
+    unsafe {
+        BufByte(p.Out, '%');
+        BufU64(p.Out, (MemLoadU32(VecAt(&p.Num, v as usize)) - 1) as u64);
+    }
+}
+
+void PBlockName(*Printer p, u32 b, u32 firstBlock) {
+    unsafe {
+        BufStr(p.Out, "^bb");
+        BufU64(p.Out, (b - firstBlock) as u64);
+    }
+}
+
+// An integer constant of type t: signed types print negative values with a minus sign;
+// floats print their bit pattern as 0f followed by 16 hex digits.
+void PConst(*Printer p, u32 t, u64 v) {
+    *Module m;
+    unsafe { m = p.M; }
+    *Buf o;
+    unsafe { o = p.Out; }
+    if (EIsFloat(m, t)) {
+        BufStr(o, "0f");
+        BufHex(o, v, 16);
+        return;
+    }
+    if (EIsSigned(m, t) && (v as i64) < 0) {
+        BufByte(o, '-');
+        BufU64(o, 0 -% v);
+        return;
+    }
+    BufU64(o, v);
+}
+
+void PString(*Buf o, str s) {
+    BufByte(o, '"');
+    for (usize i = 0; i < s.Len; i++) {
+        u8 c = s[i];
+        if (c == '"') BufStr(o, "\\\"");
+        else if (c == 0x5C) BufStr(o, "\\\\");
+        else if (c == 10) BufStr(o, "\\n");
+        else if (c < 0x20 || c >= 0x7F) {
+            BufStr(o, "\\x");
+            BufHex(o, c as u64, 2);
+        } else BufByte(o, c);
+    }
+    BufByte(o, '"');
+}
+
+void PInit(*Printer p, u32 i) {
+    *Module m;
+    *Buf o;
+    unsafe {
+        m = p.M;
+        o = p.Out;
+    }
+    EInit init = EInitGet(m, i);
+    if (init.Kind == EI_ZERO) BufStr(o, "zero");
+    else if (init.Kind == EI_BYTES) {
+        BufStr(o, "bytes ");
+        PString(o, init.Bytes);
+    } else if (init.Kind == EI_INT) {
+        BufU64(o, init.Int);
+    } else if (init.Kind == EI_ADDR) {
+        BufByte(o, '@');
+        BufStr(o, init.Bytes);
+    } else {
+        BufByte(o, '{');
+        u32 e = init.First;
+        bool first = true;
+        while (e != 0) {
+            if (first) BufByte(o, ' ');
+            else BufStr(o, ", ");
+            first = false;
+            PInit(p, e);
+            e = EInitGet(m, e).Next;
+        }
+        BufStr(o, " }");
+    }
+}
+
+// Operand o of an instruction: a value, an integer, a global or a branch target.
+void POp(*Printer p, u32 o, u32 firstBlock, u32 valueType) {
+    *Module m;
+    *Buf ob;
+    unsafe {
+        m = p.M;
+        ob = p.Out;
+    }
+    EOp op = EOpGet(m, o);
+    if (op.Kind == OK_VALUE) {
+        PValue(p, op.Ref);
+    } else if (op.Kind == OK_INT || op.Kind == OK_CASE) {
+        PConst(p, valueType, op.Int);
+    } else if (op.Kind == OK_GLOBAL) {
+        BufByte(ob, '@');
+        BufStr(ob, op.Str);
+    } else {
+        PBlockName(p, op.Ref, firstBlock);
+        if (op.NArgs > 0) {
+            BufByte(ob, '(');
+            for (u32 i = 0; i < op.NArgs; i++) {
+                if (i > 0) BufStr(ob, ", ");
+                PValue(p, EArg(m, op.Args + i));
+            }
+            BufByte(ob, ')');
+        }
+    }
+}
+
+void PInst(*Printer p, u32 i, u32 firstBlock) {
+    *Module m;
+    *Buf o;
+    unsafe {
+        m = p.M;
+        o = p.Out;
+    }
+    EInst inst = EInstGet(m, i);
+    OpInfo info = OpTable(inst.Op);
+    BufStr(o, "  ");
+    if (inst.Result != 0) {
+        PValue(p, inst.Result);
+        BufStr(o, " = ");
+    }
+    BufStr(o, info.Name);
+    u8 sh = info.Shape;
+    u32 n = inst.NOps;
+    u32 f = inst.FirstOp;
+    if (sh == SH_CONST) {
+        BufByte(o, ' ');
+        PType(p, inst.Ty);
+        BufByte(o, ' ');
+        PConst(p, inst.Ty, inst.Imm);
+    } else if (sh == SH_CONV) {
+        BufByte(o, ' ');
+        PType(p, inst.Ty);
+        BufStr(o, " -> ");
+        PType(p, inst.Ty2);
+        BufByte(o, ' ');
+        POp(p, f, firstBlock, 0);
+    } else if (sh == SH_FIELD) {
+        BufByte(o, ' ');
+        PType(p, inst.Ty);
+        BufByte(o, ' ');
+        POp(p, f, firstBlock, 0);
+        BufStr(o, ", ");
+        BufU64(o, inst.Imm);
+    } else if (sh == SH_CALL) {
+        BufByte(o, ' ');
+        POp(p, f, firstBlock, 0);
+        BufByte(o, '(');
+        for (u32 k = 1; k < n; k++) {
+            if (k > 1) BufStr(o, ", ");
+            POp(p, f + k, firstBlock, 0);
+        }
+        BufByte(o, ')');
+    } else if (sh == SH_CALLIND) {
+        if (inst.Str.Len > 0) {
+            BufStr(o, " abi ");
+            PString(o, inst.Str);
+        }
+        BufByte(o, ' ');
+        PType(p, inst.Ty);
+        BufStr(o, " (");
+        for (u32 k = 0; k + 1 < n; k++) {
+            if (k > 0) BufStr(o, ", ");
+            POp(p, f + k, firstBlock, 0);
+        }
+        BufStr(o, ") ");
+        POp(p, f + n - 1, firstBlock, 0);
+    } else if (sh == SH_INTRINSIC) {
+        BufByte(o, ' ');
+        BufStr(o, inst.Str);
+        BufByte(o, '(');
+        for (u32 k = 0; k < n; k++) {
+            if (k > 0) BufStr(o, ", ");
+            POp(p, f + k, firstBlock, 0);
+        }
+        BufByte(o, ')');
+    } else if (sh == SH_SWITCH) {
+        BufByte(o, ' ');
+        PType(p, inst.Ty);
+        BufByte(o, ' ');
+        POp(p, f, firstBlock, 0);
+        BufStr(o, ", [");
+        u32 k = 1;
+        bool first = true;
+        while (k + 1 < n) {
+            if (!first) BufStr(o, ", ");
+            first = false;
+            POp(p, f + k, firstBlock, inst.Ty);
+            BufStr(o, ": ");
+            POp(p, f + k + 1, firstBlock, 0);
+            k += 2;
+        }
+        BufStr(o, "], ");
+        POp(p, f + n - 1, firstBlock, 0);
+    } else if (sh == SH_PANIC) {
+        BufByte(o, ' ');
+        PString(o, PanicReason(inst.Imm));
+    } else {
+        // type operand (if the shape has one), then the operands separated by commas
+        bool typed = sh == SH_SLOT || sh == SH_BIN || sh == SH_UN || sh == SH_CMP || sh == SH_SELECT ||
+            sh == SH_LOAD || sh == SH_STORE || sh == SH_ELEM || sh == SH_BOUNDS;
+        if (typed) {
+            BufByte(o, ' ');
+            PType(p, inst.Ty);
+        }
+        for (u32 k = 0; k < n; k++) {
+            if (k > 0) BufByte(o, ',');
+            BufByte(o, ' ');
+            POp(p, f + k, firstBlock, ET_U64);
+        }
+    }
+    BufByte(o, 10);
+}
+
+void PFunc(*Printer p, u32 fi) {
+    *Module m;
+    *Buf o;
+    unsafe {
+        m = p.M;
+        o = p.Out;
+        p.Next = 0;
+    }
+    EFunc f = EFuncGet(m, fi);
+    BufByte(o, 10);
+    if (f.Extern) BufStr(o, "extern @");
+    else BufStr(o, "func @");
+    BufStr(o, f.Name);
+    BufByte(o, '(');
+    for (u32 i = 0; i < f.NParams; i++) {
+        if (i > 0) BufStr(o, ", ");
+        u32 v = f.FirstValue + i;
+        PNumber(p, v);
+        PValue(p, v);
+        BufStr(o, ": ");
+        PType(p, EValGet(m, v).Type);
+    }
+    BufStr(o, ") -> ");
+    PType(p, f.Ret);
+    if (f.Abi.Len > 0) {
+        BufStr(o, " abi ");
+        PString(o, f.Abi);
+    }
+    if (f.Extern) {
+        BufByte(o, 10);
+        return;
+    }
+    // number block parameters and results in order of definition first
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        EBlock blk = EBlockGet(m, b);
+        if (b != f.FirstBlock) {
+            for (u32 k = 0; k < blk.NParams; k++) PNumber(p, blk.FirstParam + k);
+        }
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            u32 r = EInstGet(m, i).Result;
+            if (r != 0) PNumber(p, r);
+        }
+    }
+    BufStr(o, " {\n");
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        EBlock blk = EBlockGet(m, b);
+        PBlockName(p, b, f.FirstBlock);
+        if (b != f.FirstBlock && blk.NParams > 0) {
+            BufByte(o, '(');
+            for (u32 k = 0; k < blk.NParams; k++) {
+                if (k > 0) BufStr(o, ", ");
+                u32 v = blk.FirstParam + k;
+                PValue(p, v);
+                BufStr(o, ": ");
+                PType(p, EValGet(m, v).Type);
+            }
+            BufByte(o, ')');
+        }
+        BufStr(o, ":\n");
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) PInst(p, i, f.FirstBlock);
+        if (BufLen(o) >= 1 << 16) Flush();
+    }
+    BufStr(o, "}\n");
+}
+
+// Prints module m in canonical text form.
+void PrintModule(*Module m, *Buf o) {
+    Printer p;
+    p.M = m;
+    p.Out = o;
+    unsafe { p.Num = SideTable(4, VecLen(&m.Vals)); }
+    BufStr(o, "eir ");
+    unsafe {
+        BufU64(o, m.Version as u64);
+        BufStr(o, " target ");
+        PString(o, m.Target);
+        BufByte(o, 10);
+        u32 types = ECount(&m.Types);
+        bool any = false;
+        for (u32 t = ET_PTR + 1; t < types; t++) {
+            ETy ty = ETyGet(m, t);
+            if (ty.Kind != EK_STRUCT || !ty.Defined) continue;
+            if (!any) BufByte(o, 10);
+            any = true;
+            BufStr(o, "type $");
+            BufStr(o, ty.Name);
+            BufStr(o, " = ");
+            if (ty.Packed) BufStr(o, "packed ");
+            BufByte(o, '{');
+            for (u32 i = 0; i < ty.NFields; i++) {
+                if (i == 0) BufByte(o, ' ');
+                else BufStr(o, ", ");
+                PType(&p, EField(m, ty.Fields + i));
+            }
+            BufStr(o, " }\n");
+        }
+        u32 globals = ECount(&m.Globals);
+        if (globals > 1) BufByte(o, 10);
+        for (u32 g = 1; g < globals; g++) {
+            EGlobal gl = EGlobalGet(m, g);
+            BufStr(o, "global @");
+            BufStr(o, gl.Name);
+            BufStr(o, ": ");
+            PType(&p, gl.Type);
+            if (gl.ReadOnly) BufStr(o, " readonly");
+            BufStr(o, " = ");
+            PInit(&p, gl.Init);
+            BufByte(o, 10);
+        }
+        u32 funcs = ECount(&m.Funcs);
+        for (u32 f = 1; f < funcs; f++) PFunc(&p, f);
+    }
+}

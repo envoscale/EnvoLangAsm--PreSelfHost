@@ -1,0 +1,984 @@
+// The parser: recursive descent over the token array, one function per grammar rule
+// (envo-core.md section 5.1). It follows bootstrap/stage0/src/parser.eas routine for
+// routine, so the two compilers build the same trees and report the same first error at
+// the same token (PLAN D14).
+//
+// Conventions, as in Stage 0:
+//   - Parse functions return a node index and report errors themselves; errors never
+//     return, so there is no error propagation.
+//   - Speculation ([core.decl.1]) saves the position and the node count, tries
+//     TryType, and restores both to backtrack. TryType never reports errors.
+//   - Nesting depth is counted by PEnter ([core.syntax.4]); each function that enters
+//     levels restores the depth it started with.
+//   - Never hold a *Node across NodeNew: the node Vec may move when it grows.
+
+const usize MAX_DEPTH = 256;
+
+const u32 E_EXPECTED = 101;
+const u32 E_CHAINED_COMPARISON = 102;
+const u32 E_BAD_ASSIGN_TARGET = 103;
+const u32 E_TOO_DEEP = 104;
+const u32 E_ENTRY_ONLY = 210;
+const u32 E_CORE_CONSTRUCT = 905;
+
+struct Parser {
+    *Vec Toks;      // Token, every file's tokens in order
+    usize Pos;      // index of the current token
+    usize End;      // one past this file's last token (its EOF)
+    usize Depth;
+    *Vec Nodes;     // Node
+    bool Core;      // Envo-Core only (--core)
+    bool InPattern; // parsing a match pattern: `_` allowed, no lambdas
+    Vec Undo;       // token splits to undo when backtracking (parser_s1.envo)
+}
+
+struct NodeList {
+    u32 Head;
+    u32 Tail;
+}
+
+// ------------------------------------------------------------------ tokens
+
+Token PTok(*Parser p, usize i) {
+    unsafe { return *(VecAt(p.Toks, i) as *Token); }
+}
+
+u16 PKind(*Parser p) {
+    unsafe { return PTok(p, p.Pos).Kind; }
+}
+
+// The kind of the token k places ahead, clamped to this file's EOF.
+u16 PKindAt(*Parser p, usize k) {
+    unsafe {
+        usize i = p.Pos + k;
+        if (i > p.End - 1) i = p.End - 1;
+        return PTok(p, i).Kind;
+    }
+}
+
+// Consumes the current token and returns its index. EOF is never consumed.
+u32 PAdvance(*Parser p) {
+    unsafe {
+        usize i = p.Pos;
+        if (PTok(p, i).Kind != TK_EOF) p.Pos = i + 1;
+        return i as u32;
+    }
+}
+
+bool PAccept(*Parser p, u16 kind) {
+    if (PKind(p) != kind) return false;
+    PAdvance(p);
+    return true;
+}
+
+u32 PExpect(*Parser p, u16 kind) {
+    if (PKind(p) != kind) {
+        if (kind == TK_IDENT) PErrExpected(p, "an identifier");
+        PErrExpectedKind(p, kind);
+    }
+    return PAdvance(p);
+}
+
+// End = ';' | before '}' | before EOF
+void PEnd(*Parser p) {
+    u16 k = PKind(p);
+    if (k == TK_SEMI) {
+        PAdvance(p);
+        return;
+    }
+    if (k == TK_RBRACE || k == TK_EOF) return;
+    PErrExpectedKind(p, TK_SEMI);
+}
+
+// One more nesting level ([core.syntax.4]).
+void PEnter(*Parser p) {
+    unsafe {
+        p.Depth++;
+        if (p.Depth > MAX_DEPTH) PErrAt(p, E_TOO_DEEP, p.Pos);
+    }
+}
+
+usize PDepth(*Parser p) {
+    unsafe { return p.Depth; }
+}
+
+void PSetDepth(*Parser p, usize d) {
+    unsafe { p.Depth = d; }
+}
+
+usize PPos(*Parser p) {
+    unsafe { return p.Pos; }
+}
+
+// Can explicit generic arguments follow this expression? (a name or a member)
+bool PIsNameLike(*Parser p, u32 e) {
+    unsafe { return PNode(p, e).Kind == NK_NAME || PNode(p, e).Kind == NK_MEMBER; }
+}
+
+bool PCore(*Parser p) {
+    unsafe { return p.Core; }
+}
+
+// ------------------------------------------------------------------ nodes
+
+*Node NodeAt(*Vec nodes, u32 n) {
+    unsafe { return VecAt(nodes, n as usize) as *Node; }
+}
+
+*Node PNode(*Parser p, u32 n) {
+    unsafe { return NodeAt(p.Nodes, n); }
+}
+
+u32 NodeNew(*Parser p, u16 kind, u32 tok) {
+    unsafe {
+        u32 n = VecLen(p.Nodes) as u32;
+        *Node node = VecPush(p.Nodes) as *Node;
+        node.Kind = kind;
+        node.Tok = tok;
+        return n;
+    }
+}
+
+void NSetA(*Parser p, u32 n, u32 v) {
+    unsafe { PNode(p, n).A = v; }
+}
+
+void NSetB(*Parser p, u32 n, u32 v) {
+    unsafe { PNode(p, n).B = v; }
+}
+
+void NSetC(*Parser p, u32 n, u32 v) {
+    unsafe { PNode(p, n).C = v; }
+}
+
+void NSetD(*Parser p, u32 n, u32 v) {
+    unsafe { PNode(p, n).D = v; }
+}
+
+void NSetOp(*Parser p, u32 n, u16 op) {
+    unsafe { PNode(p, n).Op = op; }
+}
+
+void ListAdd(*Parser p, *NodeList list, u32 n) {
+    unsafe {
+        if (list.Tail == 0) list.Head = n;
+        else PNode(p, list.Tail).Next = n;
+        list.Tail = n;
+    }
+}
+
+// May this expression be assigned to? ([core.syntax.3])
+bool IsPlace(*Parser p, u32 n) {
+    unsafe {
+        *Node node = PNode(p, n);
+        if (node.Kind == NK_NAME || node.Kind == NK_MEMBER || node.Kind == NK_INDEX) return true;
+        return node.Kind == NK_UNARY && node.Op == TK_STAR;
+    }
+}
+
+// ------------------------------------------------------------------ errors
+
+// "`text`" for a token, or "end of file".
+void BufTokDesc(*Buf b, *Parser p, usize tok) {
+    Token t = PTok(p, tok);
+    if (t.Kind == TK_EOF) {
+        BufStr(b, "end of file");
+        return;
+    }
+    BufByte(b, '`');
+    BufStr(b, StrSub(SrcGet(t.File).Text, t.Start as usize, (t.Start + t.Len) as usize));
+    BufByte(b, '`');
+}
+
+void PFailAt(*Parser p, usize tok, u32 code, str msg) {
+    Token t = PTok(p, tok);
+    Fail(t.File, t.Start as usize, code, msg);
+}
+
+// E0101 at the current token: "expected <what>, found <token>".
+void PErrExpected(*Parser p, str what) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "expected ");
+        BufStr(&b, what);
+        BufStr(&b, ", found ");
+        BufTokDesc(&b, p, p.Pos);
+        PFailAt(p, p.Pos, E_EXPECTED, BufView(&b));
+    }
+}
+
+void PErrExpectedKind(*Parser p, u16 kind) {
+    Buf b = BufNew(16);
+    unsafe {
+        BufByte(&b, '`');
+        BufStr(&b, TokSpelling(kind));
+        BufByte(&b, '`');
+        PErrExpected(p, BufCopy(&b));
+    }
+}
+
+// E0905 in Envo-Core (E0950 in Envo-S1): "not part of Envo-Core: <what>", or the
+// token's text when what is empty.
+void PErrNotCore(*Parser p, str what, usize tok) {
+    Buf b = BufNew(64);
+    u32 code = E_CORE_CONSTRUCT;
+    unsafe {
+        if (p.Core) {
+            BufStr(&b, "not part of Envo-Core: ");
+        } else {
+            BufStr(&b, "not part of Envo-S1: ");
+            code = E_NOT_S1;
+        }
+        if (what.Len == 0) BufTokDesc(&b, p, tok);
+        else BufStr(&b, what);
+        PFailAt(p, tok, code, BufView(&b));
+    }
+}
+
+void PErrAt(*Parser p, u32 code, usize tok) {
+    str msg = "";
+    match code {
+        E_CHAINED_COMPARISON => msg = "comparison operators cannot be chained; use `&&` or parentheses",
+        E_BAD_ASSIGN_TARGET => msg = "invalid target for assignment",
+        E_TOO_DEEP => msg = "nested too deeply (Stage 1 limit: 256 levels)",
+        E_ENTRY_ONLY => msg = "top-level statements are only allowed in the entry file (the first file given)",
+        _ => msg = "?",
+    }
+    PFailAt(p, tok, code, msg);
+}
+
+// ------------------------------------------------------------------ items
+
+// Program = ( Item | Statement )* EOF
+u32 ParseProgram(*Parser p) {
+    NodeList items;
+    u32 prog = NodeNew(p, NK_PROGRAM, 0);
+    while (PKind(p) != TK_EOF) {
+        unsafe { ListAdd(p, &items, ParseToplevel(p)); }
+    }
+    NSetA(p, prog, items.Head);
+    return prog;
+}
+
+u32 ParseToplevel(*Parser p) {
+    bool core;
+    unsafe { core = p.Core; }
+    if (!core) return ParseToplevelS1(p);
+    u16 k = PKind(p);
+    bool visibility = k == TK_KW_PUBLIC || k == TK_KW_PRIVATE;
+    if (visibility) {
+        PAdvance(p);    // no effect in Core: one program, one scope
+        k = PKind(p);
+    }
+    if (k == TK_KW_STRUCT) return ParseStruct(p);
+    if (k == TK_KW_ENUM) return ParseEnum(p);
+    if (k == TK_KW_CONST) return ParseBinding(p, NK_CONST);
+    if (k == TK_KW_STATIC) return ParseBinding(p, NK_STATIC);
+    if (IsFnStart(p)) return ParseFunction(p);
+    if (visibility) PErrExpected(p, "a function, `struct`, `enum`, `const` or `static`");
+    return ParseStatement(p);
+}
+
+// Does "Type IDENT (" start here? Looks ahead only; "Type IDENT <" is a generic function.
+bool IsFnStart(*Parser p) {
+    PMark m = PSave(p);     // also undoes any `>>` split by the type ([lex.punct.2])
+    bool result = false;
+    unsafe {
+        if (TryType(p) != 0 && PKind(p) == TK_IDENT) {
+            u16 next = PKindAt(p, 1);
+            if (next == TK_LPAREN) result = true;
+            else if (next == TK_LT && !p.Core) result = true;
+            else if (next == TK_LT) PErrNotCore(p, "generic functions", p.Pos + 1);
+        }
+    }
+    PRestore(p, m);
+    return result;
+}
+
+// Function = Type IDENT '(' Params? ')' ( Block | '=>' Expr End )
+u32 ParseFunction(*Parser p) {
+    NodeList params;
+    u32 type = ParseDeclType(p);
+    u32 fn = NodeNew(p, NK_FN, PExpect(p, TK_IDENT));
+    NSetA(p, fn, type);
+    bool core;
+    unsafe { core = p.Core; }
+    if (!core) {
+        ParseFunctionRest(p, fn, false);
+        return fn;
+    }
+    PExpect(p, TK_LPAREN);
+    while (PKind(p) != TK_RPAREN) {
+        u16 k = PKind(p);
+        // parameter modes and receivers are full Envo
+        if (k == TK_KW_IN || k == TK_KW_REF || k == TK_KW_OUT || k == TK_KW_THIS) PErrNotCore(p, "", PPos(p));
+        u32 ptype = ParseDeclType(p);
+        u32 param = NodeNew(p, NK_PARAM, PExpect(p, TK_IDENT));
+        NSetA(p, param, ptype);
+        if (PKind(p) == TK_EQ) PErrNotCore(p, "default parameter values", PPos(p));
+        unsafe { ListAdd(p, &params, param); }
+        if (!PAccept(p, TK_COMMA)) break;
+    }
+    PExpect(p, TK_RPAREN);
+    u32 body = 0;
+    if (PKind(p) == TK_LBRACE) {
+        body = ParseBlock(p);
+    } else if (PKind(p) == TK_FAT_ARROW) {
+        PAdvance(p);
+        body = ParseExpr(p);
+        PEnd(p);
+    } else {
+        PErrExpected(p, "`{` or `=>`");
+    }
+    NSetB(p, fn, params.Head);
+    NSetC(p, fn, body);
+    return fn;
+}
+
+// Struct = 'struct' IDENT '{' Field* '}'    Field = Visibility? Type IDENT End
+u32 ParseStruct(*Parser p) {
+    NodeList fields;
+    PAdvance(p);
+    u32 st = NodeNew(p, NK_STRUCT, PExpect(p, TK_IDENT));
+    bool core;
+    unsafe { core = p.Core; }
+    if (!core) {
+        if (PKind(p) == TK_LT) unsafe { PNode(p, st).E = ParseTypeParams(p); }
+        if (PKind(p) == TK_COLON) unsafe { PNode(p, st).F = ParseBases(p); }
+        PExpect(p, TK_LBRACE);
+        ParseStructBody(p, st);
+        return st;
+    }
+    if (PKind(p) == TK_COLON) PErrNotCore(p, "interface lists on structs", PPos(p));
+    if (PKind(p) == TK_LT) PErrNotCore(p, "generic types", PPos(p));
+    PExpect(p, TK_LBRACE);
+    while (PKind(p) != TK_RBRACE) {
+        if (PKind(p) == TK_KW_PUBLIC || PKind(p) == TK_KW_PRIVATE) PAdvance(p);
+        u32 type = ParseDeclType(p);
+        u32 field = NodeNew(p, NK_FIELD, PExpect(p, TK_IDENT));
+        NSetA(p, field, type);
+        u16 k = PKind(p);
+        if (k == TK_LPAREN) PErrNotCore(p, "methods", PPos(p));
+        if (k == TK_LBRACE || k == TK_FAT_ARROW) PErrNotCore(p, "properties", PPos(p));
+        if (k == TK_EQ) PErrNotCore(p, "field initializers", PPos(p));
+        PEnd(p);
+        unsafe { ListAdd(p, &fields, field); }
+    }
+    PAdvance(p);
+    NSetA(p, st, fields.Head);
+    return st;
+}
+
+// Enum = 'enum' IDENT ( ':' Type )? '{' ( Variant ( ',' Variant )* ','? )? '}'
+// Variant = IDENT ( '=' Expr )?
+u32 ParseEnum(*Parser p) {
+    NodeList variants;
+    PAdvance(p);
+    u32 en = NodeNew(p, NK_ENUM, PExpect(p, TK_IDENT));
+    bool core;
+    unsafe { core = p.Core; }
+    if (!core && PKind(p) == TK_LT) unsafe { PNode(p, en).E = ParseTypeParams(p); }
+    if (PAccept(p, TK_COLON)) NSetA(p, en, ParseDeclType(p));
+    PExpect(p, TK_LBRACE);
+    while (PKind(p) != TK_RBRACE) {
+        u32 v = NodeNew(p, NK_VARIANT, PExpect(p, TK_IDENT));
+        if (PKind(p) == TK_LPAREN) {
+            if (core) PErrNotCore(p, "enum payloads", PPos(p));
+            unsafe { PNode(p, v).E = ParsePayload(p); }
+        }
+        if (PAccept(p, TK_EQ)) NSetA(p, v, ParseExpr(p));
+        unsafe { ListAdd(p, &variants, v); }
+        if (PAccept(p, TK_COMMA)) continue;
+        if (PKind(p) == TK_RBRACE) break;
+        PErrExpected(p, "`,` or `}`");
+    }
+    PAdvance(p);
+    NSetB(p, en, variants.Head);
+    return en;
+}
+
+// Const = 'const' Type IDENT '=' Expr End;  Static = 'static' Type IDENT ( '=' Expr )? End
+u32 ParseBinding(*Parser p, u16 kind) {
+    PAdvance(p);
+    u32 type = ParseDeclType(p);
+    u32 n = NodeNew(p, kind, PExpect(p, TK_IDENT));
+    NSetA(p, n, type);
+    if (kind == NK_CONST || PKind(p) == TK_EQ) {
+        PExpect(p, TK_EQ);
+        NSetB(p, n, ParseExpr(p));
+    }
+    PEnd(p);
+    return n;
+}
+
+// ------------------------------------------------------------------ types
+
+// Type = '*' Type | IDENT TypeSuffix*, if one starts here; 0 (and no error) otherwise.
+u32 TryType(*Parser p) {
+    bool core;
+    unsafe { core = p.Core; }
+    if (!core) return TryTypeS1(p);
+    usize stars = 0;
+    usize firstStar = PPos(p);
+    while (PKind(p) == TK_STAR) {
+        PAdvance(p);
+        stars++;
+        if (stars > MAX_DEPTH) return 0;
+    }
+    if (PKind(p) != TK_IDENT) return 0;
+    u32 type = NodeNew(p, NK_TNAME, PAdvance(p));
+    usize suffixes = 0;
+    while (PKind(p) == TK_LBRACKET) {
+        u16 k1 = PKindAt(p, 1);
+        if (k1 == TK_RBRACKET) {
+            suffixes++;
+            if (suffixes > MAX_DEPTH) return 0;
+            u32 open = PAdvance(p);
+            PAdvance(p);
+            u32 slice = NodeNew(p, NK_TSLICE, open);
+            NSetA(p, slice, type);
+            type = slice;
+            continue;
+        }
+        u16 sizeKind = NK_INT;
+        if (k1 == TK_IDENT) sizeKind = NK_NAME;
+        else if (k1 != TK_INT) break;      // '[' starts something else, e.g. an index
+        if (PKindAt(p, 2) != TK_RBRACKET) break;
+        suffixes++;
+        if (suffixes > MAX_DEPTH) return 0;
+        u32 open = PAdvance(p);
+        u32 size = NodeNew(p, sizeKind, PAdvance(p));
+        PAdvance(p);
+        u32 array = NodeNew(p, NK_TARRAY, open);
+        NSetA(p, array, type);
+        NSetB(p, array, size);
+        type = array;
+    }
+    // The leading '*'s: the last one written is the innermost.
+    while (stars > 0) {
+        stars--;
+        u32 ptr = NodeNew(p, NK_TPTR, (firstStar + stars) as u32);
+        NSetA(p, ptr, type);
+        type = ptr;
+    }
+    return type;
+}
+
+u32 ParseType(*Parser p) {
+    u32 t = TryType(p);
+    if (t == 0) PErrExpected(p, "a type");
+    return t;
+}
+
+// A Type in a declaration, where full Envo could continue with '?' or '<'.
+u32 ParseDeclType(*Parser p) {
+    u32 t = ParseType(p);
+    bool core;
+    unsafe { core = p.Core; }
+    if (!core) return t;      // Envo-S1 types already took `?` and `<…>`
+    if (PKind(p) == TK_QUESTION) PErrNotCore(p, "optional types (`T?`)", PPos(p));
+    if (PKind(p) == TK_LT) PErrNotCore(p, "generic types", PPos(p));
+    return t;
+}
+
+// ------------------------------------------------------------------ statements
+
+u32 ParseStatement(*Parser p) {
+    usize saved = PDepth(p);
+    PEnter(p);
+    u32 result = 0;
+    u16 k = PKind(p);
+    if (k == TK_LBRACE) {
+        result = ParseBlock(p);
+    } else if (k == TK_KW_UNSAFE) {
+        u32 tok = PAdvance(p);
+        u32 body = ParseBlock(p);
+        result = NodeNew(p, NK_UNSAFE, tok);
+        NSetA(p, result, body);
+    } else if (k == TK_KW_IF) {
+        u32 tok = PAdvance(p);
+        u32 cond = ParenCondition(p);
+        u32 then = ParseStatement(p);
+        u32 other = 0;
+        if (PAccept(p, TK_KW_ELSE)) other = ParseStatement(p);
+        result = NodeNew(p, NK_IF, tok);
+        NSetA(p, result, cond);
+        NSetB(p, result, then);
+        NSetC(p, result, other);
+    } else if (k == TK_KW_WHILE) {
+        u32 tok = PAdvance(p);
+        u32 cond = ParenCondition(p);
+        u32 body = ParseStatement(p);
+        result = NodeNew(p, NK_WHILE, tok);
+        NSetA(p, result, cond);
+        NSetB(p, result, body);
+    } else if (k == TK_KW_FOR) {
+        // 'for' '(' Simple? ';' Expr? ';' Simple? ')' Statement
+        u32 tok = PAdvance(p);
+        PExpect(p, TK_LPAREN);
+        u32 init = 0;
+        u32 cond = 0;
+        u32 step = 0;
+        if (PKind(p) != TK_SEMI) init = ParseSimple(p);
+        PExpect(p, TK_SEMI);
+        if (PKind(p) != TK_SEMI) cond = ParseExpr(p);
+        PExpect(p, TK_SEMI);
+        if (PKind(p) != TK_RPAREN) step = ParseSimple(p);
+        PExpect(p, TK_RPAREN);
+        u32 body = ParseStatement(p);
+        result = NodeNew(p, NK_FOR, tok);
+        NSetA(p, result, init);
+        NSetB(p, result, cond);
+        NSetC(p, result, step);
+        NSetD(p, result, body);
+    } else if (k == TK_KW_MATCH) {
+        result = ParseMatch(p);
+    } else if (k == TK_KW_FOREACH && !PCore(p)) {
+        result = ParseForeach(p);
+    } else if (k == TK_KW_BREAK || k == TK_KW_CONTINUE) {
+        u16 kind = NK_BREAK;
+        if (k == TK_KW_CONTINUE) kind = NK_CONTINUE;
+        result = NodeNew(p, kind, PAdvance(p));
+        PEnd(p);
+    } else if (k == TK_KW_RETURN) {
+        u32 tok = PAdvance(p);
+        u32 value = 0;
+        u16 next = PKind(p);
+        if (next != TK_SEMI && next != TK_RBRACE && next != TK_EOF) value = ParseExpr(p);
+        result = NodeNew(p, NK_RETURN, tok);
+        NSetA(p, result, value);
+        PEnd(p);
+    } else if (k == TK_KW_STRUCT || k == TK_KW_ENUM || k == TK_KW_CONST || k == TK_KW_STATIC) {
+        PErrNotCore(p, "local items (`struct`, `enum`, `const` and `static` inside a block)", PPos(p));
+    } else {
+        result = ParseSimple(p);
+        PEnd(p);
+    }
+    PSetDepth(p, saved);
+    return result;
+}
+
+// '(' Expr ')'
+u32 ParenCondition(*Parser p) {
+    PExpect(p, TK_LPAREN);
+    u32 e = ParseExpr(p);
+    PExpect(p, TK_RPAREN);
+    return e;
+}
+
+// Block = '{' Statement* '}'
+u32 ParseBlock(*Parser p) {
+    NodeList stmts;
+    u32 block = NodeNew(p, NK_BLOCK, PExpect(p, TK_LBRACE));
+    while (true) {
+        u16 k = PKind(p);
+        if (k == TK_RBRACE) break;
+        if (k == TK_EOF) PErrExpectedKind(p, TK_RBRACE);
+        unsafe { ListAdd(p, &stmts, ParseStatement(p)); }
+    }
+    PAdvance(p);
+    NSetA(p, block, stmts.Head);
+    return block;
+}
+
+// Simple = 'var' IDENT '=' Expr | Type IDENT ( '=' Expr )? | Expr ( AssignOp Expr | '++' | '--' )?
+u32 ParseSimple(*Parser p) {
+    if (PKind(p) == TK_KW_VAR) {
+        PAdvance(p);
+        u32 name = PExpect(p, TK_IDENT);
+        PExpect(p, TK_EQ);
+        u32 value = ParseExpr(p);
+        u32 v = NodeNew(p, NK_VAR, name);
+        NSetB(p, v, value);
+        return v;
+    }
+    usize start = PPos(p);
+    PMark m = PSave(p);
+    // [core.decl.1] Type IDENT followed by '=', ';', '}' or EOF is a declaration.
+    u32 type = TryType(p);
+    if (type != 0 && PKind(p) == TK_IDENT) {
+        u16 next = PKindAt(p, 1);
+        if (next == TK_EQ || next == TK_SEMI || next == TK_RBRACE || next == TK_EOF) {
+            u32 name = PAdvance(p);
+            u32 value = 0;
+            if (PAccept(p, TK_EQ)) value = ParseExpr(p);
+            u32 v = NodeNew(p, NK_VAR, name);
+            NSetA(p, v, type);
+            NSetB(p, v, value);
+            return v;
+        }
+    }
+    PRestore(p, m);     // backtrack, undoing any `>>` split by the type
+    u32 e = ParseExpr(p);
+    u16 k = PKind(p);
+    if (TokClass(k) & TC_ASSIGN != 0) {
+        u32 op = PAdvance(p);
+        if (!IsPlace(p, e)) PErrAt(p, E_BAD_ASSIGN_TARGET, op as usize);
+        u32 value = ParseExpr(p);
+        u32 a = NodeNew(p, NK_ASSIGN, op);
+        NSetA(p, a, e);
+        NSetB(p, a, value);
+        return a;
+    }
+    if (k == TK_PLUS_PLUS || k == TK_MINUS_MINUS) {
+        u16 kind = NK_INC;
+        if (k == TK_MINUS_MINUS) kind = NK_DEC;
+        u32 op = PAdvance(p);
+        if (!IsPlace(p, e)) PErrAt(p, E_BAD_ASSIGN_TARGET, op as usize);
+        u32 s = NodeNew(p, kind, op);
+        NSetA(p, s, e);
+        return s;
+    }
+    u32 stmt = NodeNew(p, NK_EXPR, start as u32);    // positioned at the statement's first token
+    NSetA(p, stmt, e);
+    return stmt;
+}
+
+// 'match' Expr '{' Arm* '}'
+// Arm = Pattern ( '|' Pattern )* '=>' ( Block ','? | Simple ( ',' | before '}' ) )
+u32 ParseMatch(*Parser p) {
+    NodeList arms;
+    u32 tok = PAdvance(p);
+    u32 subject = ParseExpr(p);
+    u32 m = NodeNew(p, NK_MATCH, tok);
+    NSetA(p, m, subject);
+    PExpect(p, TK_LBRACE);
+    while (true) {
+        u16 k = PKind(p);
+        if (k == TK_RBRACE) break;
+        if (k == TK_EOF) PErrExpectedKind(p, TK_RBRACE);
+        NodeList patterns;
+        while (true) {
+            u32 pat = 0;
+            if (!PCore(p)) pat = ParsePattern(p);
+            else if (PKind(p) == TK_KW_UNDERSCORE) pat = NodeNew(p, NK_WILD, PAdvance(p));
+            else pat = ParsePrefix(p);      // not ParseExpr: '|' separates patterns
+            unsafe { ListAdd(p, &patterns, pat); }
+            if (!PAccept(p, TK_PIPE)) break;
+        }
+        u32 guard = 0;
+        if (!PCore(p) && PAccept(p, TK_KW_IF)) guard = ParseExpr(p);
+        u32 arrow = PExpect(p, TK_FAT_ARROW);
+        u32 body = 0;
+        if (PKind(p) == TK_LBRACE) {
+            body = ParseBlock(p);
+            PAccept(p, TK_COMMA);
+        } else {
+            body = ParseSimple(p);
+            if (!PAccept(p, TK_COMMA) && PKind(p) != TK_RBRACE) PErrExpected(p, "`,` or `}`");
+        }
+        u32 arm = NodeNew(p, NK_ARM, arrow);
+        NSetA(p, arm, patterns.Head);
+        NSetB(p, arm, body);
+        unsafe { PNode(p, arm).E = guard; }
+        unsafe { ListAdd(p, &arms, arm); }
+    }
+    PAdvance(p);
+    NSetB(p, m, arms.Head);
+    return m;
+}
+
+// ------------------------------------------------------------------ expressions
+
+u32 ParseExpr(*Parser p) {
+    usize saved = PDepth(p);
+    PEnter(p);
+    u32 e = 0;
+    if (PCore(p)) e = ParseBinary(p, 1);
+    else e = ParseCond(p);
+    PSetDepth(p, saved);
+    return e;
+}
+
+// Binary(p) = Cast ( BinOp(q) Binary(q + 1) )*  for operators with level q >= p.
+// Each operator in a chain counts as a nesting level: the tree is left-deep and later
+// passes walk it recursively.
+u32 ParseBinary(*Parser p, u32 minLevel) {
+    usize saved = PDepth(p);
+    u32 left = ParseCast(p);
+    while (true) {
+        u16 op = PKind(p);
+        u32 cls = TokClass(op);
+        if (cls & TC_NOT_CORE != 0) {
+            if (PCore(p)) PErrNotCore(p, "", PPos(p));
+            break;      // ?, ??, .., => and friends belong to the levels above
+        }
+        u32 level = cls & TC_PREC;
+        if (level == 0 || level < minLevel) break;
+        if (level == PREC_COMPARE) {
+            // [core.syntax.2] a comparison may not take an unparenthesized comparison
+            // as its left operand
+            *Node l = PNode(p, left);
+            bool chained;
+            unsafe {
+                chained = l.Kind == NK_BINARY && l.Flags & NF_PAREN == 0 && TokClass(l.Op) & TC_PREC == PREC_COMPARE;
+            }
+            if (chained) PErrAt(p, E_CHAINED_COMPARISON, PPos(p));
+        }
+        PEnter(p);
+        u32 tok = PAdvance(p);
+        u32 right = ParseBinary(p, level + 1);
+        u32 b = NodeNew(p, NK_BINARY, tok);
+        NSetOp(p, b, op);
+        NSetA(p, b, left);
+        NSetB(p, b, right);
+        left = b;
+    }
+    PSetDepth(p, saved);
+    return left;
+}
+
+// Cast = Prefix ( 'as' Type )*
+u32 ParseCast(*Parser p) {
+    usize saved = PDepth(p);
+    u32 e = ParsePrefix(p);
+    while (PKind(p) == TK_KW_AS) {
+        PEnter(p);
+        u32 tok = PAdvance(p);
+        u32 type = ParseType(p);
+        u32 c = NodeNew(p, NK_CAST, tok);
+        NSetA(p, c, e);
+        NSetB(p, c, type);
+        e = c;
+    }
+    PSetDepth(p, saved);
+    return e;
+}
+
+// Prefix = ( '-' | '!' | '~' | '*' | '&' ) Prefix | Postfix
+u32 ParsePrefix(*Parser p) {
+    usize saved = PDepth(p);
+    PEnter(p);
+    u16 k = PKind(p);
+    u32 result = 0;
+    if (k == TK_MINUS || k == TK_BANG || k == TK_TILDE || k == TK_STAR || k == TK_AMP) {
+        u32 tok = PAdvance(p);
+        u32 operand = ParsePrefix(p);
+        result = NodeNew(p, NK_UNARY, tok);
+        NSetOp(p, result, k);
+        NSetA(p, result, operand);
+    } else {
+        result = ParsePostfix(p);
+    }
+    PSetDepth(p, saved);
+    return result;
+}
+
+// Postfix = Primary ( '(' Args? ')' | '[' Expr ']' | '.' IDENT )*
+u32 ParsePostfix(*Parser p) {
+    usize saved = PDepth(p);
+    u32 e = ParsePrimary(p);
+    while (true) {
+        u16 k = PKind(p);
+        if (k == TK_LPAREN) {
+            PEnter(p);
+            u32 tok = PAdvance(p);
+            NodeList args;
+            while (PKind(p) != TK_RPAREN) {
+                // [own.mode.1] `ref x` passes an exclusive borrow
+                bool refArg = !PCore(p) && PKind(p) == TK_KW_REF;
+                if (refArg) PAdvance(p);
+                u32 a = ParseExpr(p);
+                if (refArg) unsafe { PNode(p, a).Flags = PNode(p, a).Flags | NF_REF; }
+                if (PKind(p) == TK_COLON) PErrNotCore(p, "named arguments", PPos(p));
+                unsafe { ListAdd(p, &args, a); }
+                if (!PAccept(p, TK_COMMA)) break;
+            }
+            PExpect(p, TK_RPAREN);
+            u32 call = NodeNew(p, NK_CALL, tok);
+            NSetA(p, call, e);
+            NSetB(p, call, args.Head);
+            e = call;
+        } else if (k == TK_LBRACKET) {
+            PEnter(p);
+            u32 tok = PAdvance(p);
+            u32 index = ParseExpr(p);
+            PExpect(p, TK_RBRACKET);
+            u32 n = NodeNew(p, NK_INDEX, tok);
+            NSetA(p, n, e);
+            NSetB(p, n, index);
+            e = n;
+        } else if (k == TK_DOT) {
+            PEnter(p);
+            PAdvance(p);
+            u32 n = NodeNew(p, NK_MEMBER, PExpect(p, TK_IDENT));
+            NSetA(p, n, e);
+            e = n;
+        } else if (k == TK_QUESTION && !PCore(p) && !PSpaceBefore(p, PPos(p))) {
+            // [expr.q.1] a joint `?` propagates
+            PEnter(p);
+            u32 n = NodeNew(p, NK_TRY, PAdvance(p));
+            NSetA(p, n, e);
+            e = n;
+        } else if (k == TK_LT && !PCore(p) && PIsNameLike(p, e) && !PSpaceBefore(p, PPos(p))) {
+            u32 args = TryExprTypeArgs(p);
+            if (args == 0) break;
+            unsafe { PNode(p, e).E = args; }
+        } else {
+            break;
+        }
+    }
+    PSetDepth(p, saved);
+    return e;
+}
+
+// Primary = INT | CHAR | STRING | 'true' | 'false' | IDENT | '(' Expr ')'
+//         | 'sizeof' '(' Type ')' | 'alignof' '(' Type ')'
+//         | 'new' Type '{' ( Init ( ',' Init )* ','? )? '}'     Init = IDENT '=' Expr
+u32 ParsePrimary(*Parser p) {
+    u16 k = PKind(p);
+    if (!PCore(p)) {
+        u32 s1 = ParsePrimaryS1(p);
+        if (s1 != 0) return s1;
+    }
+    u16 leaf = NK_NONE;
+    if (k == TK_INT) leaf = NK_INT;
+    else if (k == TK_CHAR) leaf = NK_CHAR;
+    else if (k == TK_STRING) leaf = NK_STRING;
+    else if (k == TK_IDENT) leaf = NK_NAME;
+    else if (k == TK_KW_TRUE || k == TK_KW_FALSE) leaf = NK_BOOL;
+    if (leaf != NK_NONE) return NodeNew(p, leaf, PAdvance(p));
+    if (k == TK_LPAREN) {
+        PAdvance(p);
+        u32 e = ParseExpr(p);
+        if (PKind(p) == TK_COMMA) PErrNotCore(p, "tuples", PPos(p));
+        PExpect(p, TK_RPAREN);
+        unsafe { PNode(p, e).Flags = PNode(p, e).Flags | NF_PAREN; }
+        return e;
+    }
+    if (k == TK_KW_SIZEOF || k == TK_KW_ALIGNOF) {
+        u16 kind = NK_SIZEOF;
+        if (k == TK_KW_ALIGNOF) kind = NK_ALIGNOF;
+        u32 tok = PAdvance(p);
+        PExpect(p, TK_LPAREN);
+        u32 type = ParseDeclType(p);
+        PExpect(p, TK_RPAREN);
+        u32 n = NodeNew(p, kind, tok);
+        NSetA(p, n, type);
+        return n;
+    }
+    if (k == TK_KW_NEW) {
+        u32 tok = PAdvance(p);
+        u32 type = ParseDeclType(p);
+        if (PKind(p) == TK_LPAREN) PErrNotCore(p, "constructors", PPos(p));
+        PExpect(p, TK_LBRACE);
+        NodeList inits;
+        while (PKind(p) != TK_RBRACE) {
+            u32 name = PExpect(p, TK_IDENT);
+            PExpect(p, TK_EQ);
+            u32 value = ParseExpr(p);
+            u32 init = NodeNew(p, NK_INIT, name);
+            NSetA(p, init, value);
+            unsafe { ListAdd(p, &inits, init); }
+            if (PAccept(p, TK_COMMA)) continue;
+            if (PKind(p) == TK_RBRACE) break;
+            PErrExpected(p, "`,` or `}`");
+        }
+        PAdvance(p);
+        u32 n = NodeNew(p, NK_NEW, tok);
+        NSetA(p, n, type);
+        NSetB(p, n, inits.Head);
+        return n;
+    }
+    if (k == TK_FLOAT) PErrNotCore(p, "floating-point literals", PPos(p));
+    if (k == TK_LBRACKET) PErrNotCore(p, "array literals", PPos(p));
+    // [core.syntax.5] a keyword only full Envo has
+    if (k >= TK_KW_FIRST && k <= TK_KW_LAST && TokClass(k) & TC_CORE_KW == 0) PErrNotCore(p, "", PPos(p));
+    PErrExpected(p, "an expression");
+    return 0;
+}
+
+// ------------------------------------------------------------------ files
+
+// Parses each file's tokens on its own and joins their items into one program
+// ([item.mod.3]: top-level statements only in the entry file, E0210). starts holds the
+// index of each file's first token (u64), in file order.
+u32 ParseFiles(*Vec toks, *Vec starts, *Vec nodes, bool core) {
+    Parser p;
+    p.Toks = toks;
+    p.Nodes = nodes;
+    p.Core = core;
+    p.Undo = VecNew(32, 16);       // u64 token index + the Token as it was
+    unsafe {
+        if (VecLen(nodes) == 0) VecPush(nodes);     // node 0 means "none"
+        usize files = VecLen(starts);
+        u32 program = 0;
+        for (usize f = 0; f < files; f++) {
+            p.Pos = VecGetU64(starts, f) as usize;
+            if (f + 1 < files) p.End = VecGetU64(starts, f + 1) as usize;
+            else p.End = VecLen(toks);
+            p.Depth = 0;
+            u32 prog = ParseProgram(&p);
+            if (f == 0) {
+                program = prog;
+                continue;
+            }
+            // Join: every node of a later file must be an item.
+            u32 first = PNode(&p, prog).A;
+            u32 n = first;
+            while (n != 0) {
+                *Node node = PNode(&p, n);
+                if (!NodeIsItem(node.Kind)) PErrAt(&p, E_ENTRY_ONLY, node.Tok as usize);
+                n = node.Next;
+            }
+            if (first == 0) continue;
+            u32 tail = PNode(&p, program).A;
+            if (tail == 0) {
+                PNode(&p, program).A = first;
+                continue;
+            }
+            while (PNode(&p, tail).Next != 0) tail = PNode(&p, tail).Next;
+            PNode(&p, tail).Next = first;
+        }
+        return program;
+    }
+}
+
+// ------------------------------------------------------------------ dump
+
+// `parse`: one node per line, "<2 spaces per level><name>[ <text>] @<line>:<col>"
+// (tests/golden/README.md). Every child slot prints; an empty one prints "-".
+void AstDump(*Vec toks, *Vec nodes, u32 first, usize depth) {
+    *Buf o = Out();
+    u32 n = first;
+    while (n != 0) {
+        Node node;
+        Token t;
+        unsafe {
+            node = *NodeAt(nodes, n);
+            t = *(VecAt(toks, node.Tok as usize) as *Token);
+        }
+        str text = SrcGet(t.File).Text;
+        BufRepeat(o, ' ', depth * 2);
+        BufStr(o, NodeName(node.Kind));
+        if (NodeHasText(node.Kind)) {
+            BufByte(o, ' ');
+            BufStr(o, StrSub(text, t.Start as usize, (t.Start + t.Len) as usize));
+        }
+        BufNodeFlags(o, node.Flags);
+        BufStr(o, " @");
+        BufU64(o, t.Line as u64);
+        BufByte(o, ':');
+        BufU64(o, SrcCol(text, t.Start as usize) as u64);
+        BufByte(o, 10);
+        if (BufLen(o) >= 1 << 16) Flush();
+        u32 slots = NodeSlots(node.Kind);
+        for (u32 s = 0; s < slots; s++) {
+            u32 child = node.A;
+            if (s == 1) child = node.B;
+            if (s == 2) child = node.C;
+            if (s == 3) child = node.D;
+            if (child == 0) {
+                BufRepeat(o, ' ', (depth + 1) * 2);
+                BufStr(o, "-\n");
+            } else {
+                AstDump(toks, nodes, child, depth + 1);
+            }
+        }
+        // Envo-S1 extras print only when present, so Core trees match Stage 0's.
+        if (node.E != 0) AstDump(toks, nodes, node.E, depth + 1);
+        if (node.F != 0) AstDump(toks, nodes, node.F, depth + 1);
+        if (node.G != 0) AstDump(toks, nodes, node.G, depth + 1);
+        n = node.Next;
+    }
+}

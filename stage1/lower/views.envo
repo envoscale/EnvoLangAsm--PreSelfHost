@@ -1,0 +1,153 @@
+// Lowering views, slicing and `foreach` (docs/architecture/stage1.md, "Views"). A view is
+// { ptr, u64 }, the same struct as `str`.
+
+// The start address and length (u64) of an array, a view or a `str` expression a.
+void LowerSequence(*Lower l, u32 a, *u32 ptr, *u32 len) {
+    *Checker c = LC(l);
+    u32 at = LNType(l, a);
+    Type ty = TypeGet(c, at);
+    unsafe {
+        if (ty.Kind == TYK_ARRAY) {
+            *ptr = LowerExpr(l, a);         // an array value is its address
+            *len = LConst(l, ET_U64, ty.Count as u64);
+            return;
+        }
+        u32 st = StrTypeOf(l);
+        u32 view = LowerExpr(l, a);
+        *ptr = LLoad(l, ET_PTR, LField(l, st, view, 0));
+        *len = LLoad(l, ET_U64, LField(l, st, view, 1));
+    }
+}
+
+// Panics with "index out of bounds" when cond holds.
+void BoundsFail(*Lower l, u32 cond) {
+    Trap(l, cond, 1);
+}
+
+// A `str` bound must not split a UTF-8 sequence ([expr.slice.3]).
+void CharBoundary(*Lower l, u32 ptr, u32 len, u32 b) {
+    u32 notZero = LNewBlock(l);
+    u32 inside = LNewBlock(l);
+    u32 done = LNewBlock(l);
+    LCondBr(l, LBin(l, 20, ET_U64, b, LConst(l, ET_U64, 0)), done, notZero);
+    LStart(l, notZero);
+    LCondBr(l, LBin(l, 20, ET_U64, b, len), done, inside);
+    LStart(l, inside);
+    u32 byte = LLoad(l, ET_U8, LElem(l, ET_U8, ptr, b));
+    u32 top = LBin(l, 14, ET_U8, byte, LConst(l, ET_U8, 0xC0));
+    Trap(l, LBin(l, 20, ET_U8, top, LConst(l, ET_U8, 0x80)), 6);
+    LBr(l, done);
+    LStart(l, done);
+}
+
+// a[lo..hi] ([expr.slice.1]–[expr.slice.3]): bounds as u64, then lo <= hi <= length.
+u32 LowerSlice(*Lower l, u32 n, u32 t) {
+    *Checker c = LC(l);
+    Node node = CNode(c, n);
+    Node r = CNode(c, node.B);
+    u32 ptr;
+    u32 len;
+    unsafe { LowerSequence(l, node.A, &ptr, &len); }
+    u32 lo = LConst(l, ET_U64, 0);
+    if (r.A != 0) lo = Index64(l, LNType(l, r.A), LowerExpr(l, r.A));
+    u32 hi = len;
+    if (r.B != 0) {
+        hi = Index64(l, LNType(l, r.B), LowerExpr(l, r.B));
+        if (r.Op == TK_DOT_DOT_EQ) {
+            // hi < length first, so hi + 1 cannot overflow
+            BoundsFail(l, LBin(l, 25, ET_U64, hi, len));
+            hi = LBin(l, 5, ET_U64, hi, LConst(l, ET_U64, 1));
+        }
+    }
+    BoundsFail(l, LBin(l, 24, ET_U64, hi, len));
+    BoundsFail(l, LBin(l, 24, ET_U64, lo, hi));
+    Type at = TypeGet(c, LNType(l, node.A));
+    u32 et = ET_U8;
+    if (at.Kind == TYK_STR) {
+        CharBoundary(l, ptr, len, lo);
+        CharBoundary(l, ptr, len, hi);
+    } else {
+        et = LType(l, at.Elem);
+    }
+    u32 st = StrTypeOf(l);
+    u32 tmp = LSlot(l, st);
+    LStore(l, ET_PTR, LElem(l, et, ptr, lo), LField(l, st, tmp, 0));
+    LStore(l, ET_U64, LBin(l, 6, ET_U64, hi, lo), LField(l, st, tmp, 1));
+    return tmp;
+}
+
+// foreach ([s1.stmt.1]): an index over the sequence, or a counter over a range.
+void LowerForeach(*Lower l, u32 n) {
+    *Checker c = LC(l);
+    Node node = CNode(c, n);
+    u32 s = NSym(c, node.A);
+    u32 et = LNType(l, node.A);
+    u32 eet = LType(l, et);
+    u32 head = LNewBlock(l);
+    u32 body = LNewBlock(l);
+    u32 step = LNewBlock(l);
+    u32 exit = LNewBlock(l);
+    if (NKind(c, node.B) == NK_RANGE) {
+        Node r = CNode(c, node.B);
+        bool inclusive = r.Op == TK_DOT_DOT_EQ;
+        u32 i = LSlot(l, eet);
+        u32 hi = LSlot(l, eet);
+        LStore(l, eet, LowerExpr(l, r.A), i);
+        LStore(l, eet, LowerExpr(l, r.B), hi);
+        SetSymSlot(l, s, i);
+        LBr(l, head);
+        LStart(l, head);
+        u16 cmp = 22;           // i < hi
+        if (inclusive) cmp = 23;    // i <= hi
+        LCondBr(l, LBin(l, cmp, eet, LLoad(l, eet, i), LLoad(l, eet, hi)), body, exit);
+        LStart(l, body);
+        PushLoop(l, step, exit);
+        LowerStmt(l, node.C);
+        PopLoop(l);
+        LJumpIfOpen(l, step);
+        LStart(l, step);
+        // `..=` stops at hi without stepping past it, so hi may be the type's maximum
+        if (inclusive) {
+            u32 more = LNewBlock(l);
+            LCondBr(l, LBin(l, 20, eet, LLoad(l, eet, i), LLoad(l, eet, hi)), exit, more);
+            LStart(l, more);
+        }
+        LStore(l, eet, LBin(l, 5, eet, LLoad(l, eet, i), LConst(l, eet, 1)), i);
+        LBr(l, head);
+        LStart(l, exit);
+        DropTemps(l);
+        return;
+    }
+    u32 ptr;
+    u32 len;
+    unsafe { LowerSequence(l, node.B, &ptr, &len); }
+    // the sequence may view a temporary: it lives until the loop ends ([own.temp.1])
+    usize mark = DropMark(l);
+    KeepTemps(l, 0, true);
+    bool borrow = SymGet(c, s).Flags & SF_BYREF != 0;
+    u32 idx = LSlot(l, ET_U64);
+    LStore(l, ET_U64, LConst(l, ET_U64, 0), idx);
+    u32 copy = 0;
+    if (!borrow) copy = LSlot(l, eet);
+    LBr(l, head);
+    LStart(l, head);
+    LCondBr(l, LBin(l, 22, ET_U64, LLoad(l, ET_U64, idx), len), body, exit);
+    LStart(l, body);
+    u32 at = LElem(l, eet, ptr, LLoad(l, ET_U64, idx));
+    if (borrow) {
+        SetSymSlot(l, s, at);
+    } else {
+        StoreTo(l, et, LoadPlace(l, et, at), copy);
+        SetSymSlot(l, s, copy);
+    }
+    PushLoop(l, step, exit);
+    LowerStmt(l, node.C);
+    PopLoop(l);
+    LJumpIfOpen(l, step);
+    LStart(l, step);
+    LStore(l, ET_U64, LBin(l, 5, ET_U64, LLoad(l, ET_U64, idx), LConst(l, ET_U64, 1)), idx);
+    LBr(l, head);
+    LStart(l, exit);
+    DropDownTo(l, mark, false);
+    DropTemps(l);
+}

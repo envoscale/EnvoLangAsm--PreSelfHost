@@ -1,0 +1,33 @@
+; =============================================================================
+; asm0-linux.eas - top-level build unit: asm0, the seed assembler, for x86-64
+; Linux (PLAN D67). The same layout as Stage 0's envoc0-linux.eas: its header,
+; runtime block and support routines, then the assembler (src/).
+;
+; Built by NASM (`nasm -f bin -I bootstrap/seed/`), by asm0 itself, or from
+; seed-linux.hex with hex2bin; all three give the same bytes.
+; =============================================================================
+        bits    64
+        default rel
+
+%include "../stage0/platform/elf.eas"
+%include "../stage0/platform/runtime-abi.eas"
+%include "../stage0/platform/linux.eas"
+
+sys_open       equ rtl_sys_open
+sys_read       equ rtl_sys_read
+sys_write      equ rtl_sys_write
+sys_close      equ rtl_sys_close
+sys_alloc      equ rtl_sys_alloc
+sys_free       equ rtl_sys_free
+sys_exit       equ rtl_sys_exit
+sys_args       equ rtl_sys_args
+
+%include "../stage0/src/mem.eas"
+%include "../stage0/src/io.eas"
+%include "src/asm.eas"
+%include "src/lines.eas"
+%include "src/encode.eas"
+%include "src/insn.eas"
+%include "src/data.eas"
+
+image_end:

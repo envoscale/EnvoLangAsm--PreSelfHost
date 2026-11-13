@@ -1,0 +1,78 @@
+; =============================================================================
+; platform/pe.eas - envoc0's own PE32+ header (Windows build of envoc0)
+;
+; Headers in the first 0x1000 bytes, then one RWX section ".text" at RVA 0x1000.
+; FileAlignment == SectionAlignment == 0x1000, so a label's file offset equals
+; its RVA, which is label - $$. Fixed base 0x400000, relocations stripped,
+; TimeDateStamp 0 (reproducible). The entry point is the Windows runtime block.
+; Output programs get their headers from src/writer.eas instead.
+; =============================================================================
+
+IMAGE_BASE      equ 0x400000
+PE_ALIGN        equ 0x1000              ; both FileAlignment and SectionAlignment
+
+        org     IMAGE_BASE
+
+; ---------------------------------------------------------------- DOS header
+pe_dos_header:
+        dw      'MZ'                    ; e_magic
+        times 0x3C - ($ - $$) db 0      ; the rest of the DOS header is unused
+        dd      pe_nt_headers - $$      ; e_lfanew
+
+; ---------------------------------------------------------------- NT headers
+pe_nt_headers:
+        dd      'PE'                    ; Signature "PE\0\0"
+        ; IMAGE_FILE_HEADER
+        dw      0x8664                  ; Machine: AMD64
+        dw      1                       ; NumberOfSections
+        dd      0                       ; TimeDateStamp: 0 for reproducible output
+        dd      0                       ; PointerToSymbolTable
+        dd      0                       ; NumberOfSymbols
+        dw      pe_opt_end - pe_opt_header ; SizeOfOptionalHeader
+        dw      0x0023                  ; RELOCS_STRIPPED | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+pe_opt_header:
+        ; IMAGE_OPTIONAL_HEADER64
+        dw      0x020B                  ; Magic: PE32+
+        db      0, 0                    ; Major/MinorLinkerVersion
+        dd      pe_file_end - pe_section_start ; SizeOfCode
+        dd      0                       ; SizeOfInitializedData
+        dd      0                       ; SizeOfUninitializedData
+        dd      rtw_begin - $$          ; AddressOfEntryPoint (RVA): the runtime block
+        dd      pe_section_start - $$   ; BaseOfCode
+        dq      IMAGE_BASE              ; ImageBase
+        dd      PE_ALIGN                ; SectionAlignment
+        dd      PE_ALIGN                ; FileAlignment
+        dw      6, 0                    ; Major/MinorOperatingSystemVersion (Vista+)
+        dw      0, 0                    ; Major/MinorImageVersion
+        dw      6, 0                    ; Major/MinorSubsystemVersion
+        dd      0                       ; Win32VersionValue
+        dd      pe_file_end - $$        ; SizeOfImage: the file is padded to PE_ALIGN,
+                                        ; which is also the section alignment
+        dd      pe_section_start - $$   ; SizeOfHeaders
+        dd      0                       ; CheckSum (not required for EXEs)
+        dw      3                       ; Subsystem: WINDOWS_CUI (console)
+        dw      0x8100                  ; DllCharacteristics: NX_COMPAT | TERMINAL_SERVER_AWARE
+        dq      0x100000                ; SizeOfStackReserve (1 MiB)
+        dq      0x1000                  ; SizeOfStackCommit
+        dq      0x100000                ; SizeOfHeapReserve
+        dq      0x1000                  ; SizeOfHeapCommit
+        dd      0                       ; LoaderFlags
+        dd      16                      ; NumberOfRvaAndSizes
+        ; Data directories
+        dd      0, 0                    ; [0] Export
+        dd      win_import_dir - $$, win_import_dir_end - win_import_dir ; [1] Import
+        times 14 dd 0, 0                ; [2..15] unused (the loader finds the IAT via [1])
+pe_opt_end:
+
+; ---------------------------------------------------------------- section table
+        db      '.text', 0, 0, 0        ; Name
+        dd      image_end - pe_section_start   ; VirtualSize
+        dd      pe_section_start - $$          ; VirtualAddress
+        dd      pe_file_end - pe_section_start ; SizeOfRawData (multiple of PE_ALIGN)
+        dd      pe_section_start - $$          ; PointerToRawData
+        dd      0, 0                    ; PointerToRelocations, PointerToLinenumbers
+        dw      0, 0                    ; NumberOfRelocations, NumberOfLinenumbers
+        dd      0xE0000020              ; CODE | MEM_EXECUTE | MEM_READ | MEM_WRITE
+
+        times PE_ALIGN - ($ - $$) db 0
+pe_section_start:

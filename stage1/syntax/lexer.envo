@@ -1,0 +1,544 @@
+// The lexer (docs/spec/01-lexical.md). It follows bootstrap/stage0/src/lexer.eas step for
+// step, so both compilers produce the same tokens and report the same first error at
+// the same position (PLAN D14). Literal values are validated, not computed; the parser
+// converts the literals it needs.
+//
+// In Envo-Core mode (`--core`) the constructs Core leaves out are E0901-E0904, exactly as
+// in envoc0. In Envo-S1 mode they are E0950, at the same positions.
+
+struct Lexer {
+    str Src;
+    usize Pos;
+    u32 Line;
+    u16 Flags;          // flags for the next token
+    u32 File;
+    *Vec Toks;
+    bool Core;
+    Map Keywords;       // spelling -> kind
+    Map Puncts;         // spelling -> kind
+}
+
+// Error codes of chapter 1.
+const u32 E_INVALID_UTF8 = 1;
+const u32 E_UNEXPECTED_CHAR = 2;
+const u32 E_UNTERMINATED_COMMENT = 3;
+const u32 E_UNTERMINATED_STRING = 4;
+const u32 E_UNTERMINATED_CHAR = 5;
+const u32 E_BAD_ESCAPE = 6;
+const u32 E_BAD_NUMBER = 7;
+const u32 E_BAD_SUFFIX = 8;
+const u32 E_CHAR_LENGTH = 9;
+const u32 E_BAD_UNICODE_ESCAPE = 10;
+const u32 E_CONTROL_CHAR = 11;
+const u32 E_CORE_INTERPOLATION = 901;
+const u32 E_CORE_RAW_STRING = 902;
+const u32 E_CORE_DIRECTIVE = 903;
+const u32 E_CORE_NON_ASCII = 904;
+const u32 E_NOT_S1 = 950;
+
+void LexFail(*Lexer lx, usize off, u32 code) {
+    str msg = "";
+    match code {
+        E_INVALID_UTF8 => msg = "source file is not valid UTF-8",
+        E_UNEXPECTED_CHAR => msg = "unexpected character",
+        E_UNTERMINATED_COMMENT => msg = "unterminated block comment",
+        E_UNTERMINATED_STRING => msg = "unterminated string literal",
+        E_UNTERMINATED_CHAR => msg = "unterminated character literal",
+        E_BAD_ESCAPE => msg = "unknown or malformed escape sequence",
+        E_BAD_NUMBER => msg = "malformed numeric literal",
+        E_BAD_SUFFIX => msg = "invalid suffix on numeric literal",
+        E_CHAR_LENGTH => msg = "character literal must contain exactly one character",
+        E_BAD_UNICODE_ESCAPE => msg = "invalid Unicode escape",
+        E_CONTROL_CHAR => msg = "control character in literal; use an escape sequence",
+        _ => msg = "?",
+    }
+    unsafe { Fail(lx.File, off, code, msg); }
+}
+
+// A construct that Envo-Core (and Envo-S1) leaves out.
+void LexFailSubset(*Lexer lx, usize off, u32 coreCode) {
+    bool core;
+    unsafe { core = lx.Core; }
+    if (core) {
+        str msg = "";
+        match coreCode {
+            E_CORE_INTERPOLATION => msg = "interpolated strings are not part of Envo-Core",
+            E_CORE_RAW_STRING => msg = "raw string literals are not part of Envo-Core",
+            E_CORE_DIRECTIVE => msg = "directives are not part of Envo-Core",
+            _ => msg = "non-ASCII characters outside literals and comments are not supported in Envo-Core",
+        }
+        unsafe { Fail(lx.File, off, coreCode, msg); }
+    }
+    str what = "";
+    match coreCode {
+        E_CORE_INTERPOLATION => what = "not part of Envo-S1: interpolated strings",
+        E_CORE_RAW_STRING => what = "not part of Envo-S1: raw string literals",
+        E_CORE_DIRECTIVE => what = "not part of Envo-S1: directives",
+        _ => what = "not part of Envo-S1: non-ASCII characters outside literals and comments",
+    }
+    unsafe { Fail(lx.File, off, E_NOT_S1, what); }
+}
+
+// [lex.src.1] The offset of the first byte that makes text invalid UTF-8, or text.Len.
+usize Utf8Invalid(str text) {
+    usize i = 0;
+    usize n = text.Len;
+    while (i < n) {
+        u8 b = text[i];
+        if (b < 0x80) {
+            i++;
+            continue;
+        }
+        if (b < 0xC2 || b >= 0xF5) return i;
+        if (b < 0xE0) {
+            if (i + 1 >= n || text[i + 1] & 0xC0 != 0x80) return i;
+            i += 2;
+            continue;
+        }
+        if (b < 0xF0) {
+            if (i + 2 >= n) return i;
+            u8 lo = 0x80;
+            u8 hi = 0xBF;
+            if (b == 0xE0) lo = 0xA0;
+            if (b == 0xED) hi = 0x9F;
+            u8 c1 = text[i + 1];
+            if (c1 < lo || c1 > hi || text[i + 2] & 0xC0 != 0x80) return i;
+            i += 3;
+            continue;
+        }
+        if (i + 3 >= n) return i;
+        u8 lo4 = 0x80;
+        u8 hi4 = 0xBF;
+        if (b == 0xF0) lo4 = 0x90;
+        if (b == 0xF4) hi4 = 0x8F;
+        u8 d1 = text[i + 1];
+        if (d1 < lo4 || d1 > hi4 || text[i + 2] & 0xC0 != 0x80 || text[i + 3] & 0xC0 != 0x80) return i;
+        i += 4;
+    }
+    return n;
+}
+
+bool IsIdentCont(u8 c) {
+    return c == '_' || (c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z');
+}
+
+bool IsLetter(u8 c) {
+    return (c | 0x20) >= 'a' && (c | 0x20) <= 'z';
+}
+
+// The value of a digit or letter for bases up to 36, or 99.
+u32 DigitValue(u8 c) {
+    if (c >= '0' && c <= '9') return (c - '0') as u32;
+    u8 l = c | 0x20;
+    if (l >= 'a' && l <= 'z') return (l - 'a') as u32 + 10;
+    return 99;
+}
+
+// 0 if s is not a numeric suffix, 1 for an integer suffix, 2 for a float suffix.
+u32 SuffixKind(str s) {
+    if (StrEq(s, "f32") || StrEq(s, "f64")) return 2;
+    if (StrEq(s, "i8") || StrEq(s, "i16") || StrEq(s, "i32") || StrEq(s, "i64") || StrEq(s, "i128") ||
+        StrEq(s, "isize") || StrEq(s, "u8") || StrEq(s, "u16") || StrEq(s, "u32") || StrEq(s, "u64") ||
+        StrEq(s, "u128") || StrEq(s, "usize")) return 1;
+    return 0;
+}
+
+u8 LexAt(*Lexer lx, usize i) {
+    unsafe { return lx.Src[i]; }
+}
+
+usize LexLen(*Lexer lx) {
+    unsafe { return lx.Src.Len; }
+}
+
+void LexEmit(*Lexer lx, u16 kind, usize start) {
+    unsafe {
+        *Token t = VecPush(lx.Toks) as *Token;
+        t.Kind = kind;
+        t.Flags = lx.Flags;
+        t.Start = start as u32;
+        t.Len = (lx.Pos - start) as u32;
+        t.Line = lx.Line;
+        t.File = lx.File;
+        lx.Flags = 0;
+    }
+}
+
+// [lex.esc.1], [lex.esc.2]: validates the escape whose backslash is at lx.Pos and moves
+// past it. A backslash at the end of the file only moves one byte, so the caller reports
+// the unterminated literal.
+void LexEscape(*Lexer lx) {
+    usize p;
+    usize n = LexLen(lx);
+    unsafe { p = lx.Pos; }
+    if (p + 1 >= n) {
+        unsafe { lx.Pos = p + 1; }
+        return;
+    }
+    u8 c = LexAt(lx, p + 1);
+    if (c == 'n' || c == 'r' || c == 't' || c == '0' || c == 0x5C || c == 0x27 || c == '"') {
+        unsafe { lx.Pos = p + 2; }
+        return;
+    }
+    if (c == 'x') {
+        if (p + 3 >= n) LexFail(lx, p, E_BAD_ESCAPE);
+        u8 h = LexAt(lx, p + 2);
+        if (h < '0' || h > '7') LexFail(lx, p, E_BAD_ESCAPE);
+        if (DigitValue(LexAt(lx, p + 3)) >= 16) LexFail(lx, p, E_BAD_ESCAPE);
+        unsafe { lx.Pos = p + 4; }
+        return;
+    }
+    if (c != 'u') LexFail(lx, p, E_BAD_ESCAPE);
+    if (p + 2 >= n || LexAt(lx, p + 2) != '{') LexFail(lx, p, E_BAD_UNICODE_ESCAPE);
+    usize q = p + 3;
+    u64 v = 0;
+    while (true) {
+        if (q >= n) LexFail(lx, p, E_BAD_UNICODE_ESCAPE);
+        u8 d = LexAt(lx, q);
+        if (d == '}') break;
+        u32 dv = DigitValue(d);
+        if (dv >= 16) LexFail(lx, p, E_BAD_UNICODE_ESCAPE);
+        v = (v << 4) | dv as u64;
+        q++;
+        if (q - p > 3 + 6) LexFail(lx, p, E_BAD_UNICODE_ESCAPE);
+    }
+    if (q - p == 3 || v > 0x10FFFF || v & 0xFFFFF800 == 0xD800) LexFail(lx, p, E_BAD_UNICODE_ESCAPE);
+    unsafe { lx.Pos = q + 1; }
+}
+
+void LexNumber(*Lexer lx, usize start) {
+    usize n = LexLen(lx);
+    usize p = start;
+    bool isFloat = false;
+    u32 radix = 10;
+    if (LexAt(lx, p) == '0' && p + 1 < n) {
+        u8 c = LexAt(lx, p + 1);
+        if (c == 'x') radix = 16;
+        if (c == 'b') radix = 2;
+        if (c == 'o') radix = 8;
+    }
+    if (radix != 10) {
+        // [lex.int.1], [lex.int.2]
+        p += 2;
+        u32 digits = 0;
+        while (p < n) {
+            u8 c = LexAt(lx, p);
+            if (c != '_') {
+                u32 v = DigitValue(c);
+                if (v >= radix) {
+                    if (v < 10) LexFail(lx, p, E_BAD_NUMBER);
+                    break;
+                }
+                digits++;
+            }
+            p++;
+        }
+        if (digits == 0) LexFail(lx, start, E_BAD_NUMBER);
+    } else {
+        while (p < n) {
+            u8 c = LexAt(lx, p);
+            if (c != '_' && (c < '0' || c > '9')) break;
+            p++;
+        }
+        // [lex.float.2] a fraction needs a digit right after the '.'
+        if (p + 1 < n && LexAt(lx, p) == '.' && LexAt(lx, p + 1) >= '0' && LexAt(lx, p + 1) <= '9') {
+            isFloat = true;
+            p += 2;
+            while (p < n) {
+                u8 c = LexAt(lx, p);
+                if (c != '_' && (c < '0' || c > '9')) break;
+                p++;
+            }
+        }
+        if (p < n && LexAt(lx, p) | 0x20 == 'e') {
+            isFloat = true;
+            p++;
+            if (p >= n) LexFail(lx, start, E_BAD_NUMBER);
+            if (LexAt(lx, p) == '+' || LexAt(lx, p) == '-') p++;
+            u32 edigits = 0;
+            while (p < n) {
+                u8 c = LexAt(lx, p);
+                if (c != '_') {
+                    if (c < '0' || c > '9') break;
+                    edigits++;
+                }
+                p++;
+            }
+            if (edigits == 0) LexFail(lx, start, E_BAD_NUMBER);
+        }
+    }
+    // [lex.int.3], [lex.float.3]
+    if (p < n && IsIdentCont(LexAt(lx, p))) {
+        usize s = p;
+        while (p < n && IsIdentCont(LexAt(lx, p))) p++;
+        str suffix;
+        unsafe { suffix = StrSub(lx.Src, s, p); }
+        u32 k = SuffixKind(suffix);
+        if (k == 0) LexFail(lx, s, E_BAD_SUFFIX);
+        if (k == 1 && isFloat) LexFail(lx, s, E_BAD_SUFFIX);
+        if (k == 2) {
+            if (radix != 10) LexFail(lx, s, E_BAD_SUFFIX);
+            isFloat = true;
+        }
+    }
+    unsafe { lx.Pos = p; }
+    if (isFloat) LexEmit(lx, TK_FLOAT, start);
+    else LexEmit(lx, TK_INT, start);
+}
+
+void LexString(*Lexer lx, usize start) {
+    usize n = LexLen(lx);
+    // [lex.str.3] `"""` always starts a raw string.
+    if (start + 2 < n && LexAt(lx, start + 1) == '"' && LexAt(lx, start + 2) == '"') {
+        LexFailSubset(lx, start, E_CORE_RAW_STRING);
+    }
+    unsafe { lx.Pos = start + 1; }
+    while (true) {
+        usize p;
+        unsafe { p = lx.Pos; }
+        if (p >= n) LexFail(lx, start, E_UNTERMINATED_STRING);
+        u8 c = LexAt(lx, p);
+        if (c == '"') {
+            unsafe { lx.Pos = p + 1; }
+            break;
+        }
+        if (c == 0x5C) {
+            LexEscape(lx);
+            continue;
+        }
+        if (c == 10 || c == 13) LexFail(lx, start, E_UNTERMINATED_STRING);
+        if (c != 9 && (c < 0x20 || c == 0x7F)) LexFail(lx, p, E_CONTROL_CHAR);
+        unsafe { lx.Pos = p + 1; }
+    }
+    LexEmit(lx, TK_STRING, start);
+}
+
+void LexChar(*Lexer lx, usize start) {
+    usize n = LexLen(lx);
+    usize p = start + 1;
+    if (p >= n) LexFail(lx, start, E_UNTERMINATED_CHAR);
+    u8 c = LexAt(lx, p);
+    if (c == 0x27) LexFail(lx, start, E_CHAR_LENGTH);
+    if (c == 10 || c == 13) LexFail(lx, start, E_UNTERMINATED_CHAR);
+    if (c == 0x5C) {
+        unsafe { lx.Pos = p; }
+        LexEscape(lx);
+        unsafe { p = lx.Pos; }
+    } else {
+        if (c != 9 && (c < 0x20 || c == 0x7F)) LexFail(lx, p, E_CONTROL_CHAR);
+        // One Unicode scalar; the input is valid UTF-8, so the lead byte gives the length.
+        if (c < 0x80) p += 1;
+        else if (c < 0xE0) p += 2;
+        else if (c < 0xF0) p += 3;
+        else p += 4;
+    }
+    if (p >= n) LexFail(lx, start, E_UNTERMINATED_CHAR);
+    if (LexAt(lx, p) != 0x27) {
+        // A closing quote later on this line means several characters (E0009);
+        // otherwise the literal was never closed (E0005).
+        usize q = p;
+        while (true) {
+            if (q >= n || LexAt(lx, q) == 10) LexFail(lx, start, E_UNTERMINATED_CHAR);
+            if (LexAt(lx, q) == 0x27) LexFail(lx, start, E_CHAR_LENGTH);
+            q++;
+        }
+    }
+    unsafe { lx.Pos = p + 1; }
+    LexEmit(lx, TK_CHAR, start);
+}
+
+// Skips whitespace and comments, recording them in the next token's flags. Returns false
+// at the end of the file.
+bool LexTrivia(*Lexer lx) {
+    usize n = LexLen(lx);
+    unsafe {
+        while (lx.Pos < n) {
+            u8 c = lx.Src[lx.Pos];
+            if (c == ' ' || c == 9 || c == 13) {
+                lx.Flags = lx.Flags | TF_SPACE_BEFORE;
+                lx.Pos++;
+            } else if (c == 10) {
+                lx.Flags = lx.Flags | TF_SPACE_BEFORE | TF_NEWLINE_BEFORE;
+                lx.Line++;
+                lx.Pos++;
+            } else if (c == '/' && lx.Pos + 1 < n && lx.Src[lx.Pos + 1] == '/') {
+                // [lex.comment.1] runs to the LF (not included)
+                lx.Flags = lx.Flags | TF_SPACE_BEFORE;
+                while (lx.Pos < n && lx.Src[lx.Pos] != 10) lx.Pos++;
+            } else if (c == '/' && lx.Pos + 1 < n && lx.Src[lx.Pos + 1] == '*') {
+                // [lex.comment.2] nests
+                lx.Flags = lx.Flags | TF_SPACE_BEFORE;
+                usize open = lx.Pos;
+                lx.Pos += 2;
+                u32 depth = 1;
+                while (depth > 0) {
+                    if (lx.Pos >= n) LexFail(lx, open, E_UNTERMINATED_COMMENT);
+                    u8 b = lx.Src[lx.Pos];
+                    if (b == 10) {
+                        lx.Line++;
+                        lx.Flags = lx.Flags | TF_NEWLINE_BEFORE;
+                        lx.Pos++;
+                    } else if (b == '*' && lx.Pos + 1 < n && lx.Src[lx.Pos + 1] == '/') {
+                        lx.Pos += 2;
+                        depth--;
+                    } else if (b == '/' && lx.Pos + 1 < n && lx.Src[lx.Pos + 1] == '*') {
+                        lx.Pos += 2;
+                        depth++;
+                    } else {
+                        lx.Pos++;
+                    }
+                }
+            } else {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void LexToken(*Lexer lx) {
+    usize start;
+    unsafe { start = lx.Pos; }
+    usize n = LexLen(lx);
+    u8 c = LexAt(lx, start);
+    if (c >= 0x80) LexFailSubset(lx, start, E_CORE_NON_ASCII);
+    if (IsLetter(c) || c == '_') {
+        // [lex.ident.1], [lex.ident.2]
+        usize p = start + 1;
+        while (p < n && IsIdentCont(LexAt(lx, p))) p++;
+        unsafe { lx.Pos = p; }
+        str word;
+        u64 kind;
+        unsafe {
+            word = StrSub(lx.Src, start, p);
+            if (!MapGet(&lx.Keywords, word, &kind)) kind = TK_IDENT as u64;
+        }
+        LexEmit(lx, kind as u16, start);
+        return;
+    }
+    if (c >= '0' && c <= '9') {
+        LexNumber(lx, start);
+        return;
+    }
+    if (c == '"') {
+        LexString(lx, start);
+        return;
+    }
+    if (c == 0x27) {
+        LexChar(lx, start);
+        return;
+    }
+    if (c == '@') {
+        // [lex.ident.3] @name
+        if (start + 1 >= n) LexFail(lx, start, E_UNEXPECTED_CHAR);
+        u8 d = LexAt(lx, start + 1);
+        if (d != '_' && !IsLetter(d)) LexFail(lx, start, E_UNEXPECTED_CHAR);
+        usize p = start + 2;
+        while (p < n && IsIdentCont(LexAt(lx, p))) p++;
+        if (p - start == 2 && d == '_') LexFail(lx, start, E_UNEXPECTED_CHAR);
+        unsafe { lx.Pos = p; }
+        LexEmit(lx, TK_IDENT, start);
+        return;
+    }
+    if (c == '$') {
+        // [lex.punct.4] only `$"` means anything
+        if (start + 1 < n && LexAt(lx, start + 1) == '"') LexFailSubset(lx, start, E_CORE_INTERPOLATION);
+        LexFail(lx, start, E_UNEXPECTED_CHAR);
+    }
+    if (c == '#') {
+        // [lex.dir.1] directives start a line
+        u16 flags;
+        unsafe { flags = lx.Flags; }
+        if (flags & TF_NEWLINE_BEFORE != 0) LexFailSubset(lx, start, E_CORE_DIRECTIVE);
+        LexFail(lx, start, E_UNEXPECTED_CHAR);
+    }
+    // [lex.punct.1] maximal munch
+    usize len = 3;
+    while (len > 0) {
+        if (start + len <= n) {
+            u64 kind;
+            bool found;
+            unsafe { found = MapGet(&lx.Puncts, StrSub(lx.Src, start, start + len), &kind); }
+            if (found) {
+                unsafe { lx.Pos = start + len; }
+                LexEmit(lx, kind as u16, start);
+                return;
+            }
+        }
+        len--;
+    }
+    LexFail(lx, start, E_UNEXPECTED_CHAR);
+}
+
+// Tokenizes source file `file` (its text must not start with a BOM; SrcAdd removes it)
+// and appends the tokens, ending with TK_EOF, to toks. Stops at the first error.
+void Lex(u32 file, *Vec toks, bool core) {
+    SrcFile f = SrcGet(file);
+    usize bad = Utf8Invalid(f.Text);
+    Lexer lx;
+    lx.Src = f.Text;
+    lx.Pos = 0;
+    lx.Line = 1;
+    lx.Flags = TF_SPACE_BEFORE | TF_NEWLINE_BEFORE;    // [lex.flags.1], [lex.flags.2]
+    lx.File = file;
+    lx.Toks = toks;
+    lx.Core = core;
+    lx.Keywords = MapNew(64);
+    lx.Puncts = MapNew(64);
+    unsafe {
+        if (bad != f.Text.Len) LexFail(&lx, bad, E_INVALID_UTF8);
+        for (u16 k = TK_KW_FIRST; k <= TK_KW_LAST; k++) MapPut(&lx.Keywords, TokSpelling(k), k as u64);
+        for (u16 k = TK_PUNCT_FIRST; k <= TK_PUNCT_LAST; k++) MapPut(&lx.Puncts, TokSpelling(k), k as u64);
+        // [lex.shebang.1] "#!" at the very start: skip to the end of the line.
+        if (f.Text.Len >= 2 && f.Text[0] == '#' && f.Text[1] == '!') {
+            while (lx.Pos < f.Text.Len && f.Text[lx.Pos] != 10) lx.Pos++;
+        }
+        while (LexTrivia(&lx)) LexToken(&lx);
+        // [lex.eof.1]
+        lx.Pos = f.Text.Len;
+        LexEmit(&lx, TK_EOF, f.Text.Len);
+    }
+}
+
+// The column of byte offset off: Unicode scalar values from the start of its line, from 1.
+u32 SrcCol(str text, usize off) {
+    usize lineStart = off;
+    while (lineStart > 0 && text[lineStart - 1] != 10) lineStart--;
+    u32 col = 1;
+    for (usize i = lineStart; i < off; i++) {
+        if (text[i] & 0xC0 != 0x80) col++;
+    }
+    return col;
+}
+
+// `lex`: one line per token, "<line>:<col> <n|s|j> <class> <text>" (01-lexical.md 1.11).
+void LexDump(*Vec toks) {
+    *Buf o = Out();
+    usize count = VecLen(toks);
+    for (usize i = 0; i < count; i++) {
+        Token t;
+        unsafe { t = *(VecAt(toks, i) as *Token); }
+        str text = SrcGet(t.File).Text;
+        BufU64(o, t.Line as u64);
+        BufByte(o, ':');
+        BufU64(o, SrcCol(text, t.Start as usize) as u64);
+        if (t.Flags & TF_NEWLINE_BEFORE != 0) BufStr(o, " n ");
+        else if (t.Flags & TF_SPACE_BEFORE != 0) BufStr(o, " s ");
+        else BufStr(o, " j ");
+        if (t.Kind >= TK_PUNCT_FIRST) {
+            BufStr(o, "punct ");
+            BufStr(o, TokSpelling(t.Kind));
+        } else if (t.Kind >= TK_KW_FIRST) {
+            BufStr(o, "kw ");
+            BufStr(o, TokSpelling(t.Kind));
+        } else {
+            BufStr(o, TokSpelling(t.Kind));
+            if (t.Kind != TK_EOF) {
+                BufByte(o, ' ');
+                BufStr(o, StrSub(text, t.Start as usize, (t.Start + t.Len) as usize));
+            }
+        }
+        BufByte(o, 10);
+        if (BufLen(o) >= 1 << 16) Flush();
+    }
+}

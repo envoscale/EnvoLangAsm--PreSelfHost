@@ -1,0 +1,2871 @@
+; =============================================================================
+; src/codegen.eas - x86-64 code generation for Envo-Core (M1.7)
+;
+; A deliberately simple stack machine (docs/architecture/bootstrap.md, "Code
+; generation"); speed is Stage 2's job:
+;   - an expression leaves its value in rax (scalars, normalized: sign-extended
+;     for signed types, zero-extended for unsigned ones and bool), in rax/rdx
+;     (str and slices: pointer, length), or its *address* in rax (structs and
+;     arrays);
+;   - temporaries live on the machine stack (push/pop around sub-expressions);
+;   - every local, parameter and aggregate temporary has a fixed rbp-relative
+;     slot, assigned before the body is generated (c_nvalue of its node);
+;   - run-time checks ([type.int.1]-[type.int.4], [type.array.1]) jump to
+;     shared trap stubs that call the runtime block's RT_ENTRY_TRAP.
+;
+; Calling convention for compiled functions and built-ins (runtime-abi.eas):
+; arguments pushed left to right (8 bytes per scalar, 16 for str/slices, the
+; size rounded up to 8 for aggregates), then, for an aggregate result, the
+; address of the caller's result slot. The caller pops everything. Results come
+; back in rax (rax/rdx for str and slices; aggregates are written through the
+; hidden pointer).
+;
+; The section the writer emits is: [runtime block][trap stubs][functions][data].
+; The block is copied first, so the code buffer starts with it and runtime
+; entries are at known offsets. Data comes after the code and is reached
+; RIP-relative through fixups resolved by g_finish.
+; =============================================================================
+
+VC_VOID         equ 0                   ; value classes (g_class)
+VC_SCALAR       equ 1
+VC_PAIR         equ 2
+VC_AGGREGATE    equ 3
+
+FX_CALL         equ 1                   ; fixups: rel32 to a function (symbol)
+FX_DATA         equ 2                   ; rel32 from code to a data offset
+FX_ABSOLUTE     equ 3                   ; 64-bit address of a data offset, stored in data
+FX_ENTRY        equ 16                  ; bytes per fixup: kind, position, target, pad
+
+G_CODE_MAX      equ 0x1000000           ; 16 MiB of code
+G_DATA_MAX      equ 0x1000000           ; 16 MiB of data
+
+CC_O            equ 0x80                ; second opcode byte of jcc rel32
+CC_B            equ 0x82
+CC_AE           equ 0x83
+CC_E            equ 0x84
+CC_NE           equ 0x85
+CC_JMP          equ 0                   ; "unconditional" for g_jump
+
+; =============================================================================
+; Entry
+; =============================================================================
+
+; generate - generate code for a checked program.
+;   in: edi = program node, rsi = runtime block address, rdx = its size
+;   out: g_code / g_clen and g_data / g_dlen hold the section's code and data;
+;        g_main is __main's code offset. Fixups are resolved except FX_ABSOLUTE,
+;        which needs the image address (g_resolve_absolute).
+; ebx = program node, r12d = item
+generate:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12, rsi
+        mov     r13, rdx
+        mov     edi, G_CODE_MAX
+        call    arena_alloc
+        mov     [g_code], rax
+        mov     edi, G_DATA_MAX
+        call    arena_alloc
+        mov     [g_data], rax
+        mov     rdi, [n_cap]            ; at most a few fixups per node
+        shl     rdi, 6
+        call    arena_alloc
+        mov     [g_fixups], rax
+        mov     qword [g_nfix], 0
+        mov     qword [g_dlen], 0
+        lea     rax, [g_loop_stack - 8]
+        mov     [g_loop], rax
+        ; the runtime block
+        mov     rdi, [g_code]
+        mov     rsi, r12
+        mov     rcx, r13
+        rep movsb
+        mov     [g_clen], r13
+        ; trap stubs: mov edi, reason; call RT_ENTRY_TRAP
+        mov     r12d, 1
+.stub:
+        cmp     r12d, TRAP_UNREACHABLE
+        ja      short .stubs_done
+        call    g_here
+        lea     rcx, [g_trap_stubs]
+        mov     [rcx + r12*4], eax
+        mov     edi, 0xBF               ; mov edi, imm32
+        call    g_byte
+        mov     edi, r12d
+        call    g_dword
+        mov     edi, RT_ENTRY_TRAP * RT_ENTRY_SIZE
+        call    g_call_offset
+        inc     r12d
+        jmp     short .stub
+.stubs_done:
+        ; statics get their data slots and initial values
+        mov     edi, ebx
+        call    g_statics
+        ; functions in program order, then the top-level statements as __main
+        mov     edi, ebx
+        call    node_ptr
+        mov     r12d, [rax + N_A]
+.function:
+        test    r12d, r12d
+        jz      short .functions_done
+        mov     edi, r12d
+        call    node_kind
+        cmp     eax, NK_FN
+        jne     short .next_function
+        mov     edi, r12d
+        call    g_function
+.next_function:
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .function
+.functions_done:
+        mov     edi, ebx
+        call    g_main_function
+        call    g_finish
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Emitting bytes
+; =============================================================================
+
+; g_here - current code offset.  out: eax
+g_here:
+        mov     rax, [g_clen]
+        ret
+
+; g_byte / g_dword / g_qword - append to the code.  in: edi / edi / rdi
+g_byte:
+        mov     rax, [g_clen]
+        cmp     rax, G_CODE_MAX - 16
+        jae     near g_too_big
+        mov     rdx, [g_code]
+        mov     [rdx + rax], dil
+        inc     rax
+        mov     [g_clen], rax
+        ret
+g_dword:
+        mov     rax, [g_clen]
+        cmp     rax, G_CODE_MAX - 16
+        jae     near g_too_big
+        mov     rdx, [g_code]
+        mov     [rdx + rax], edi
+        add     rax, 4
+        mov     [g_clen], rax
+        ret
+g_qword:
+        mov     rax, [g_clen]
+        cmp     rax, G_CODE_MAX - 16
+        jae     near g_too_big
+        mov     rdx, [g_code]
+        mov     [rdx + rax], rdi
+        add     rax, 8
+        mov     [g_clen], rax
+        ret
+g_too_big:
+        lea     rdi, [msg_code_too_big]
+        mov     esi, msg_code_too_big_len
+        jmp     near fatal
+
+; g_t - append a template: a length byte followed by that many bytes.
+;   in: rsi = template.  clobbers: rcx, rdx, rdi, rsi, rax
+g_t:
+        movzx   ecx, byte [rsi]
+        inc     rsi
+        mov     rax, [g_clen]
+        lea     rdx, [rax + rcx]
+        cmp     rdx, G_CODE_MAX - 16
+        jae     near g_too_big
+        mov     rdi, [g_code]
+        add     rdi, rax
+        mov     [g_clen], rdx
+        rep movsb
+        ret
+
+; g_t_dword - a template followed by a 32-bit operand.  in: rsi, edi
+g_t_dword:
+        push    rdi
+        call    g_t
+        pop     rdi
+        jmp     near g_dword
+
+; g_patch - point the rel32 at code offset edi to code offset esi.
+g_patch:
+        mov     eax, esi
+        sub     eax, edi
+        sub     eax, 4
+        mov     rdx, [g_code]
+        mov     [rdx + rdi], eax
+        ret
+
+; g_jump - emit a jump (edi = CC_* byte, or CC_JMP) to code offset esi.
+g_jump:
+        push    rbx
+        mov     ebx, esi
+        call    g_jump_open
+        mov     edi, eax
+        mov     esi, ebx
+        call    g_patch
+        pop     rbx
+        ret
+
+; g_jump_open - emit a jump with an unresolved rel32.  in: edi = CC_* or CC_JMP.
+;   out: eax = offset of the rel32 (for g_patch, or as a patch-list link)
+g_jump_open:
+        push    rbx
+        mov     ebx, edi
+        test    ebx, ebx
+        jnz     short .conditional
+        mov     edi, 0xE9
+        call    g_byte
+        jmp     short .operand
+.conditional:
+        mov     edi, 0x0F
+        call    g_byte
+        mov     edi, ebx
+        call    g_byte
+.operand:
+        call    g_here
+        mov     ebx, eax
+        xor     edi, edi
+        call    g_dword
+        mov     eax, ebx
+        pop     rbx
+        ret
+
+; g_jump_link - emit an unresolved jump and add it to a patch list. Each pending
+; rel32 holds the previous list head + 1 (0 ends the list), so the list costs no
+; memory.  in: edi = CC_*, rsi = address of the list head (u32).
+g_jump_link:
+        push    rbx
+        mov     rbx, rsi
+        call    g_jump_open
+        mov     ecx, [rbx]
+        mov     rdx, [g_code]
+        mov     [rdx + rax], ecx
+        inc     eax
+        mov     [rbx], eax
+        pop     rbx
+        ret
+
+; g_patch_list - resolve every jump in list edi to code offset esi.
+g_patch_list:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        mov     r12d, esi
+.next:
+        test    ebx, ebx
+        jz      short .done
+        dec     ebx
+        mov     rdx, [g_code]
+        mov     eax, [rdx + rbx]        ; the next link
+        push    rax
+        push    rax
+        mov     edi, ebx
+        mov     esi, r12d
+        call    g_patch
+        pop     rax
+        pop     rax
+        mov     ebx, eax
+        jmp     short .next
+.done:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; g_call_offset - call rel32 to code offset edi.
+g_call_offset:
+        push    rbx
+        mov     ebx, edi
+        mov     edi, 0xE8
+        call    g_byte
+        call    g_here
+        mov     esi, ebx
+        mov     edi, eax
+        push    rax
+        push    rax
+        xor     edi, edi
+        call    g_dword
+        pop     rdi
+        pop     rdi
+        mov     esi, ebx
+        call    g_patch
+        pop     rbx
+        ret
+
+; g_fixup - record a fixup.  in: edi = kind, esi = position, edx = target
+g_fixup:
+        mov     rax, [g_nfix]
+        mov     rcx, rax
+        shl     rcx, 4
+        add     rcx, [g_fixups]
+        mov     [rcx], edi
+        mov     [rcx + 4], esi
+        mov     [rcx + 8], edx
+        inc     rax
+        mov     [g_nfix], rax
+        ret
+
+; g_imm - mov rax, imm (the short form when the value fits a signed 32 bits).
+;   in: rdi = value
+g_imm:
+        push    rbx
+        mov     rbx, rdi
+        movsxd  rax, ebx
+        cmp     rax, rbx
+        jne     short .wide
+        lea     rsi, [t_mov_rax_imm32]
+        mov     edi, ebx
+        call    g_t_dword
+        pop     rbx
+        ret
+.wide:
+        lea     rsi, [t_mov_rax_imm64]
+        call    g_t
+        mov     rdi, rbx
+        call    g_qword
+        pop     rbx
+        ret
+
+; g_rbp_address - lea rax, [rbp + edi]
+g_rbp_address:
+        lea     rsi, [t_lea_rax_rbp]
+        jmp     near g_t_dword
+
+; g_data_address - lea rax, [rip + data offset edi]
+g_data_address:
+        push    rbx
+        mov     ebx, edi
+        lea     rsi, [t_lea_rax_rip]
+        call    g_t
+        call    g_here
+        mov     esi, eax
+        mov     edi, FX_DATA
+        mov     edx, ebx
+        call    g_fixup
+        xor     edi, edi
+        call    g_dword
+        pop     rbx
+        ret
+
+; g_trap_if - jcc (edi = CC_*) to the stub for reason esi.
+g_trap_if:
+        lea     rax, [g_trap_stubs]
+        mov     esi, [rax + rsi*4]
+        jmp     near g_jump
+
+; =============================================================================
+; Data
+; =============================================================================
+
+; d_alloc - reserve data space.  in: edi = size, esi = alignment.  out: eax = offset
+d_alloc:
+        mov     rax, [g_dlen]
+        lea     rcx, [rsi - 1]
+        add     rax, rcx
+        not     rcx
+        and     rax, rcx
+        lea     rdx, [rax + rdi]
+        cmp     rdx, G_DATA_MAX
+        jae     short .too_big
+        mov     [g_dlen], rdx
+        ret
+.too_big:
+        lea     rdi, [msg_data_too_big]
+        mov     esi, msg_data_too_big_len
+        jmp     near fatal
+
+; d_string - the decoded bytes of a string literal, placed in data once per
+; literal node.  in: esi = STRING node.  out: eax = data offset, edx = length
+; rbx = token text, r12 = remaining length, r13d = offset, r14 = length written
+d_string:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     r15d, esi
+        mov     edi, esi                ; cached: c_nsym of a string node holds offset + 1
+        push    rdi
+        push    rdi
+        call    nsym_get
+        pop     rdi
+        pop     rdi
+        test    eax, eax
+        jz      short .uncached
+        dec     eax
+        mov     r13d, eax
+        mov     edi, r15d
+        call    nvalue_get
+        mov     edx, eax
+        mov     eax, r13d
+        jmp     near .out
+.uncached:
+        mov     edi, r15d
+        call    node_tok
+        mov     edi, eax
+        call    tok_text
+        lea     rbx, [rax + 1]          ; inside the quotes
+        lea     r12, [rdx - 2]
+        mov     rax, [g_dlen]
+        mov     r13d, eax
+        xor     r14d, r14d
+.loop:
+        test    r12, r12
+        jz      near .done
+        movzx   eax, byte [rbx]
+        cmp     eax, 0x5C
+        je      short .escape
+        inc     rbx
+        dec     r12
+        call    .put
+        jmp     short .loop
+.escape:
+        movzx   eax, byte [rbx + 1]
+        cmp     eax, 'u'
+        je      short .unicode
+        cmp     eax, 'x'
+        je      short .hex
+        mov     ecx, 10
+        cmp     eax, 'n'
+        je      short .simple
+        mov     ecx, 13
+        cmp     eax, 'r'
+        je      short .simple
+        mov     ecx, 9
+        cmp     eax, 't'
+        je      short .simple
+        xor     ecx, ecx
+        cmp     eax, '0'
+        je      short .simple
+        mov     ecx, eax                ; \\ \' \"
+.simple:
+        mov     eax, ecx
+        add     rbx, 2
+        sub     r12, 2
+        call    .put
+        jmp     short .loop
+.hex:
+        movzx   eax, byte [rbx + 2]
+        call    digit_value
+        shl     eax, 4
+        mov     ecx, eax
+        movzx   eax, byte [rbx + 3]
+        push    rcx
+        push    rcx
+        call    digit_value
+        pop     rcx
+        pop     rcx
+        or      eax, ecx
+        add     rbx, 4
+        sub     r12, 4
+        call    .put
+        jmp     near .loop
+.unicode:                               ; \u{H..H}: encode the scalar as UTF-8
+        add     rbx, 3
+        sub     r12, 3
+        xor     ecx, ecx
+.u_digit:
+        movzx   eax, byte [rbx]
+        inc     rbx
+        dec     r12
+        cmp     eax, '}'
+        je      short .u_encode
+        push    rcx
+        push    rcx
+        call    digit_value
+        pop     rcx
+        pop     rcx
+        shl     ecx, 4
+        or      ecx, eax
+        jmp     short .u_digit
+.u_encode:
+        mov     eax, ecx
+        cmp     ecx, 0x80
+        jb      short .u_one
+        cmp     ecx, 0x800
+        jb      short .u_two
+        cmp     ecx, 0x10000
+        jb      short .u_three
+        shr     eax, 18
+        or      eax, 0xF0
+        call    .put
+        mov     eax, ecx
+        shr     eax, 12
+        and     eax, 0x3F
+        or      eax, 0x80
+        call    .put
+        jmp     short .u_last2
+.u_three:
+        shr     eax, 12
+        or      eax, 0xE0
+        call    .put
+.u_last2:
+        mov     eax, ecx
+        shr     eax, 6
+        and     eax, 0x3F
+        or      eax, 0x80
+        call    .put
+        jmp     short .u_last1
+.u_two:
+        shr     eax, 6
+        or      eax, 0xC0
+        call    .put
+.u_last1:
+        mov     eax, ecx
+        and     eax, 0x3F
+        or      eax, 0x80
+.u_one:
+        call    .put
+        jmp     near .loop
+.done:
+        mov     rax, [g_dlen]
+        cmp     rax, G_DATA_MAX - 16
+        jae     near d_alloc.too_big
+        mov     edi, r15d               ; cache it on the node
+        lea     esi, [r13 + 1]
+        call    nsym_set
+        mov     edi, r15d
+        mov     rsi, r14
+        call    nvalue_set
+        mov     eax, r13d
+        mov     edx, r14d
+.out:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+; .put - append byte al to the data (r14 counts).
+.put:
+        mov     rdx, [g_data]
+        mov     rsi, [g_dlen]
+        mov     [rdx + rsi], al
+        inc     rsi
+        mov     [g_dlen], rsi
+        inc     r14
+        ret
+
+; g_statics - give every static a data slot holding its initial value.
+; ebx = item, r12d = symbol, r13 = data offset, r14d = type
+g_statics:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        call    node_ptr
+        mov     ebx, [rax + N_A]
+.item:
+        test    ebx, ebx
+        jz      near .done
+        mov     edi, ebx
+        call    node_kind
+        cmp     eax, NK_STATIC
+        jne     near .next
+        mov     edi, ebx
+        call    nsym_get
+        mov     r12d, eax
+        mov     edi, eax
+        call    sym_ptr
+        mov     r14d, [rax + S_TYPE]
+        mov     edi, r14d
+        xor     esi, esi
+        call    size_of
+        mov     edi, eax
+        mov     esi, edx
+        call    d_alloc
+        mov     r13d, eax
+        mov     edi, r12d
+        call    sym_ptr
+        mov     [rax + S_AUX], r13d     ; codegen: the static's data offset
+        ; initial value: scalars from the checker; a str from its literal
+        cmp     byte [rax + S_STATE], 2
+        jne     short .maybe_string
+        mov     rcx, [rax + S_VALUE]
+        mov     edi, r14d
+        call    scalar_size
+        mov     rdx, [g_data]
+        add     rdx, r13
+        cmp     eax, 1
+        je      short .v1
+        cmp     eax, 2
+        je      short .v2
+        cmp     eax, 4
+        je      short .v4
+        mov     [rdx], rcx
+        jmp     short .next
+.v1:
+        mov     [rdx], cl
+        jmp     short .next
+.v2:
+        mov     [rdx], cx
+        jmp     short .next
+.v4:
+        mov     [rdx], ecx
+        jmp     short .next
+.maybe_string:
+        cmp     r14d, T_STR
+        jne     short .next
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        test    eax, eax
+        jz      short .next
+        mov     r15d, eax
+        mov     edi, eax
+        call    string_node_of
+        test    eax, eax
+        jz      short .next
+        mov     esi, eax
+        call    d_string
+        mov     rcx, [g_data]
+        mov     [rcx + r13 + 8], rdx    ; length
+        mov     edx, eax                ; pointer: an absolute address, fixed later
+        mov     edi, FX_ABSOLUTE
+        mov     esi, r13d
+        call    g_fixup
+.next:
+        mov     edi, ebx
+        call    node_ptr
+        mov     ebx, [rax + N_NEXT]
+        jmp     near .item
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; string_node_of - the STRING node an expression denotes: a literal, or a const
+; whose initializer is one.  in: edi = node.  out: eax = string node or 0
+string_node_of:
+        push    rbx
+        mov     ebx, edi
+        call    node_kind
+        cmp     eax, NK_STRING
+        je      short .self
+        cmp     eax, NK_NAME
+        jne     short .none
+        mov     edi, ebx
+        call    nsym_get
+        test    eax, eax
+        jz      short .none
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_CONST
+        jne     short .none
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        pop     rbx
+        jmp     near string_node_of
+.self:
+        mov     eax, ebx
+        pop     rbx
+        ret
+.none:
+        xor     eax, eax
+        pop     rbx
+        ret
+
+; =============================================================================
+; Types for code generation
+; =============================================================================
+
+; value_class - VC_* of type edi.  out: eax
+value_class:
+        call    ty_kind
+        cmp     eax, TYK_VOID
+        je      short .void
+        cmp     eax, TYK_STR
+        je      short .pair
+        cmp     eax, TYK_SLICE
+        je      short .pair
+        cmp     eax, TYK_STRUCT
+        je      short .aggregate
+        cmp     eax, TYK_ARRAY
+        je      short .aggregate
+        mov     eax, VC_SCALAR
+        ret
+.void:
+        mov     eax, VC_VOID
+        ret
+.pair:
+        mov     eax, VC_PAIR
+        ret
+.aggregate:
+        mov     eax, VC_AGGREGATE
+        ret
+
+; scalar_size - byte size of scalar type edi (enums: their representation).
+;   out: eax = size, edx = 1 if signed
+scalar_size:
+        call    ty_ptr
+        cmp     byte [rax + TY_KIND], TYK_ENUM
+        jne     short .direct
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     edi, [rax + S_AUX]
+        call    ty_ptr
+.direct:
+        movzx   edx, byte [rax + TY_SIGNED]
+        mov     eax, [rax + TY_SIZE]
+        ret
+
+; slot_size - stack bytes a value of type edi takes as an argument (multiple of 8).
+slot_size:
+        push    rbx
+        mov     ebx, edi
+        call    value_class
+        cmp     eax, VC_PAIR
+        je      short .pair
+        cmp     eax, VC_AGGREGATE
+        je      short .aggregate
+        mov     eax, 8
+        pop     rbx
+        ret
+.pair:
+        mov     eax, 16
+        pop     rbx
+        ret
+.aggregate:
+        mov     edi, ebx
+        xor     esi, esi
+        call    size_of
+        add     eax, 7
+        and     eax, -8
+        pop     rbx
+        ret
+
+; g_load - load the value of type edi from the address in rax.
+g_load:
+        push    rbx
+        mov     ebx, edi
+        call    value_class
+        cmp     eax, VC_AGGREGATE
+        je      short .done             ; an aggregate's value is its address
+        cmp     eax, VC_PAIR
+        je      short .pair
+        mov     edi, ebx
+        call    scalar_size
+        lea     rsi, [t_load8]
+        cmp     eax, 8
+        je      short .emit
+        lea     rsi, [t_load4s]
+        test    edx, edx
+        jnz     short .s4
+        lea     rsi, [t_load4u]
+.s4:
+        cmp     eax, 4
+        je      short .emit
+        lea     rsi, [t_load2s]
+        test    edx, edx
+        jnz     short .s2
+        lea     rsi, [t_load2u]
+.s2:
+        cmp     eax, 2
+        je      short .emit
+        lea     rsi, [t_load1s]
+        test    edx, edx
+        jnz     short .emit
+        lea     rsi, [t_load1u]
+.emit:
+        call    g_t
+        jmp     short .done
+.pair:
+        lea     rsi, [t_load_pair]
+        call    g_t
+.done:
+        pop     rbx
+        ret
+
+; g_store - store the value in rax (rax/rdx; for aggregates, the source
+; address) of type edi to the address in rcx.
+g_store:
+        push    rbx
+        mov     ebx, edi
+        call    value_class
+        cmp     eax, VC_AGGREGATE
+        je      short .aggregate
+        cmp     eax, VC_PAIR
+        je      short .pair
+        mov     edi, ebx
+        call    scalar_size
+        lea     rsi, [t_store8]
+        cmp     eax, 8
+        je      short .emit
+        lea     rsi, [t_store4]
+        cmp     eax, 4
+        je      short .emit
+        lea     rsi, [t_store2]
+        cmp     eax, 2
+        je      short .emit
+        lea     rsi, [t_store1]
+.emit:
+        call    g_t
+        jmp     short .done
+.pair:
+        lea     rsi, [t_store_pair]
+        call    g_t
+        jmp     short .done
+.aggregate:
+        lea     rsi, [t_copy_setup]     ; rdi = rcx, rsi = rax
+        call    g_t
+        mov     edi, ebx
+        xor     esi, esi
+        call    size_of
+        mov     edi, eax
+        call    g_copy_bytes
+.done:
+        pop     rbx
+        ret
+
+; g_copy_bytes - mov ecx, edi; rep movsb
+g_copy_bytes:
+        lea     rsi, [t_mov_ecx_imm32]
+        call    g_t_dword
+        lea     rsi, [t_rep_movsb]
+        jmp     near g_t
+
+; g_normalize - bring rax back to the canonical form of scalar type edi
+; (truncate to its width, then sign- or zero-extend).
+g_normalize:
+        call    scalar_size
+        cmp     eax, 8
+        je      short .done
+        lea     rsi, [t_norm4s]
+        test    edx, edx
+        jnz     short .s4
+        lea     rsi, [t_norm4u]
+.s4:
+        cmp     eax, 4
+        je      short .emit
+        lea     rsi, [t_norm2s]
+        test    edx, edx
+        jnz     short .s2
+        lea     rsi, [t_norm2u]
+.s2:
+        cmp     eax, 2
+        je      short .emit
+        lea     rsi, [t_norm1s]
+        test    edx, edx
+        jnz     short .emit
+        lea     rsi, [t_norm1u]
+.emit:
+        jmp     near g_t
+.done:
+        ret
+
+; g_check_fits - trap unless rax is already canonical for narrow type edi:
+; normalize a copy in rcx and compare. (64-bit types use the CPU flags instead.)
+g_check_fits:
+        call    scalar_size
+        cmp     eax, 8
+        je      short .done
+        lea     rsi, [t_fit4s]
+        test    edx, edx
+        jnz     short .s4
+        lea     rsi, [t_fit4u]
+.s4:
+        cmp     eax, 4
+        je      short .emit
+        lea     rsi, [t_fit2s]
+        test    edx, edx
+        jnz     short .s2
+        lea     rsi, [t_fit2u]
+.s2:
+        cmp     eax, 2
+        je      short .emit
+        lea     rsi, [t_fit1s]
+        test    edx, edx
+        jnz     short .emit
+        lea     rsi, [t_fit1u]
+.emit:
+        call    g_t
+        lea     rsi, [t_cmp_rcx_rax]
+        call    g_t
+        mov     edi, CC_NE
+        mov     esi, TRAP_OVERFLOW
+        jmp     near g_trap_if
+.done:
+        ret
+
+; =============================================================================
+; Functions and frames
+; =============================================================================
+
+; g_function - code for function node edi.
+; ebx = node, r12d = symbol, r13d = parameter, r14 = parameter offset
+g_function:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    nsym_get
+        mov     r12d, eax
+        call    g_here
+        mov     r13d, eax
+        mov     edi, r12d
+        call    sym_ptr
+        mov     [rax + S_AUX2], r13d    ; codegen: the function's code offset
+        mov     ecx, [rax + S_TYPE]
+        mov     [g_ret], ecx
+        ; parameters: the last one is nearest the return address
+        mov     edi, ecx
+        call    value_class
+        xor     r14d, r14d
+        cmp     eax, VC_AGGREGATE
+        sete    r14b
+        mov     [g_hidden], r14d
+        shl     r14d, 3
+        add     r14d, 16                ; above saved rbp and the return address
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r14d
+        call    g_place_params
+        ; locals, then the prologue
+        mov     qword [g_frame], 0
+        mov     edi, ebx
+        mov     esi, N_C
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        call    g_frame_walk
+        call    g_prologue
+        mov     edi, r13d
+        call    node_kind
+        cmp     eax, NK_BLOCK
+        je      short .block
+        ; `=> expr`: the value is the result
+        mov     edi, r13d
+        call    g_return_value
+        call    g_epilogue
+        jmp     short .done
+.block:
+        mov     edi, r13d
+        call    g_stmt
+        call    g_epilogue              ; falling off the end of a void function
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_place_params - give parameters their rbp offsets: the last parameter sits at
+; the lowest address (esi), earlier ones above it.  in: edi = first parameter
+g_place_params:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        test    edi, edi
+        jz      short .done
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_ptr
+        mov     edi, [rax + N_NEXT]     ; later parameters first
+        mov     esi, r12d
+        call    g_place_params
+        mov     r12d, eax               ; offset after the later parameters
+        mov     rsi, r12
+        mov     edi, ebx
+        call    nvalue_set
+        mov     edi, ebx
+        call    ntype_get
+        mov     edi, eax
+        call    slot_size
+        add     eax, r12d
+        jmp     short .out
+.done:
+        mov     eax, esi
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; g_frame_walk - give every local and aggregate temporary under node edi an
+; rbp slot (stored negative in c_nvalue), growing g_frame.
+g_frame_walk:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        test    edi, edi
+        jz      near .done
+        mov     ebx, edi
+        call    node_kind
+        mov     r12d, eax
+        cmp     eax, NK_VAR
+        je      short .slot_of_type
+        cmp     eax, NK_MATCH
+        je      short .slot_scalar
+        cmp     eax, NK_NEW
+        je      short .slot_of_type
+        cmp     eax, NK_CALL
+        jne     short .children
+        mov     edi, ebx                ; a call with an aggregate result
+        call    ntype_get
+        mov     edi, eax
+        call    value_class
+        cmp     eax, VC_AGGREGATE
+        jne     short .children
+.slot_of_type:
+        mov     edi, ebx
+        call    ntype_get
+        mov     edi, eax
+        xor     esi, esi
+        call    size_of
+        jmp     short .slot
+.slot_scalar:
+        mov     eax, 8
+        mov     edx, 8
+.slot:
+        cmp     edx, 8
+        jae     short .aligned
+        mov     edx, 8                  ; every slot is at least 8-aligned
+.aligned:
+        mov     rcx, [g_frame]
+        add     rcx, rax
+        lea     r8, [rdx - 1]
+        add     rcx, r8
+        not     r8
+        and     rcx, r8
+        mov     [g_frame], rcx
+        neg     rcx
+        mov     edi, ebx
+        mov     rsi, rcx
+        call    nvalue_set
+.children:
+        ; type nodes and patterns hold no locals; the generic walk is harmless
+        mov     edi, ebx
+        call    node_ptr
+        mov     r12, rax
+        mov     edi, [r12 + N_A]
+        call    g_frame_list
+        mov     edi, [r12 + N_B]
+        call    g_frame_list
+        mov     edi, [r12 + N_C]
+        call    g_frame_list
+        mov     edi, ebx
+        call    node_kind
+        cmp     eax, NK_FOR             ; slot d is a child only for `for`
+        jne     short .done
+        mov     edi, [r12 + N_D]
+        call    g_frame_list
+.done:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; g_frame_list - g_frame_walk over a list.
+g_frame_list:
+        push    rbx
+.next:
+        test    edi, edi
+        jz      short .done
+        mov     ebx, edi
+        call    g_frame_walk
+        mov     edi, ebx
+        call    node_ptr
+        mov     edi, [rax + N_NEXT]
+        jmp     short .next
+.done:
+        pop     rbx
+        ret
+
+; g_prologue - push rbp; mov rbp, rsp; sub rsp, frame (16-aligned). A frame of a page or
+; more is reserved a page at a time, touching each (a stack probe): the OS grows the
+; stack through one guard page, and jumping past it crashes or lands in other memory.
+g_prologue:
+        push    rbx
+        lea     rsi, [t_prologue]
+        call    g_t
+        mov     rbx, [g_frame]
+        add     rbx, 15
+        and     rbx, -16
+        cmp     rbx, 4096
+        jb      short .rest
+        mov     rdi, rbx
+        shr     rdi, 12
+        lea     rsi, [t_probe_count]
+        call    g_t_dword
+        lea     rsi, [t_probe_loop]
+        call    g_t
+        and     rbx, 4095
+.rest:
+        mov     rdi, rbx
+        lea     rsi, [t_sub_rsp]
+        call    g_t_dword
+        pop     rbx
+        ret
+
+; g_epilogue - mov rsp, rbp; pop rbp; ret
+g_epilogue:
+        lea     rsi, [t_epilogue]
+        jmp     near g_t
+
+; g_return_value - compute expression edi as the function's result: aggregates
+; are copied through the hidden pointer at [rbp + 16].
+g_return_value:
+        push    rbx
+        mov     ebx, edi
+        call    g_value
+        cmp     dword [g_hidden], 0
+        je      short .done
+        lea     rsi, [t_return_aggregate] ; mov rsi, rax; mov rdi, [rbp + 16]
+        call    g_t
+        mov     edi, [g_ret]
+        xor     esi, esi
+        call    size_of
+        mov     edi, eax
+        call    g_copy_bytes
+.done:
+        pop     rbx
+        ret
+
+; g_main_function - the top-level statements as __main, which returns the exit
+; code (0 unless a top-level `return` says otherwise).
+g_main_function:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        call    g_here
+        mov     [g_main], eax
+        mov     dword [g_ret], T_I32
+        mov     dword [g_hidden], 0
+        mov     qword [g_frame], 0
+        mov     edi, ebx
+        call    node_ptr
+        mov     r12d, [rax + N_A]
+.frame:
+        test    r12d, r12d
+        jz      short .framed
+        mov     edi, r12d
+        call    g_is_item
+        test    eax, eax
+        jnz     short .frame_next
+        mov     edi, r12d
+        call    g_frame_walk
+.frame_next:
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .frame
+.framed:
+        call    g_prologue
+        mov     edi, ebx
+        call    node_ptr
+        mov     r12d, [rax + N_A]
+.stmt:
+        test    r12d, r12d
+        jz      short .end
+        mov     edi, r12d
+        call    g_is_item
+        test    eax, eax
+        jnz     short .stmt_next
+        mov     edi, r12d
+        call    g_stmt
+.stmt_next:
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .stmt
+.end:
+        xor     edi, edi
+        call    g_imm
+        call    g_epilogue
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; g_is_item - is node edi an item (not a top-level statement)?  out: eax
+g_is_item:
+        call    node_kind
+        cmp     eax, NK_FN
+        je      short .yes
+        cmp     eax, NK_STRUCT
+        je      short .yes
+        cmp     eax, NK_ENUM
+        je      short .yes
+        cmp     eax, NK_CONST
+        je      short .yes
+        cmp     eax, NK_STATIC
+        je      short .yes
+        xor     eax, eax
+        ret
+.yes:
+        mov     eax, 1
+        ret
+
+; g_finish - resolve FX_CALL and FX_DATA fixups now that every function has an
+; offset and the data's place (after the code, 16-aligned) is known.
+g_finish:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rax, [g_clen]
+        add     rax, 15
+        and     rax, -16
+        mov     [g_data_base], rax
+        xor     ebx, ebx
+.next:
+        cmp     rbx, [g_nfix]
+        jae     short .done
+        mov     r12, rbx
+        shl     r12, 4
+        add     r12, [g_fixups]
+        mov     eax, [r12]
+        cmp     eax, FX_CALL
+        je      short .call
+        cmp     eax, FX_DATA
+        jne     short .skip
+        mov     esi, [r12 + 8]          ; data offset -> section offset
+        add     rsi, [g_data_base]
+        mov     edi, [r12 + 4]
+        call    g_patch
+        jmp     short .skip
+.call:
+        mov     edi, [r12 + 8]
+        call    sym_ptr
+        mov     esi, [rax + S_AUX2]
+        mov     edi, [r12 + 4]
+        call    g_patch
+.skip:
+        inc     rbx
+        jmp     short .next
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_resolve_absolute - FX_ABSOLUTE fixups, once the section's address is known.
+;   in: rdi = address of section offset 0
+g_resolve_absolute:
+        xor     ecx, ecx
+.next:
+        cmp     rcx, [g_nfix]
+        jae     short .done
+        mov     rax, rcx
+        shl     rax, 4
+        add     rax, [g_fixups]
+        cmp     dword [rax], FX_ABSOLUTE
+        jne     short .skip
+        mov     edx, [rax + 8]          ; target data offset
+        add     rdx, [g_data_base]
+        add     rdx, rdi
+        mov     r8d, [rax + 4]          ; where, in the data
+        mov     r9, [g_data]
+        mov     [r9 + r8], rdx
+.skip:
+        inc     rcx
+        jmp     short .next
+.done:
+        ret
+
+; =============================================================================
+; Statements
+; =============================================================================
+
+; g_stmt - code for statement node edi.
+; ebx = node, r12d..r15d = parts; [rsp] = loop context
+g_stmt:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        call    node_kind
+        cmp     eax, NK_BLOCK
+        je      near .block
+        cmp     eax, NK_UNSAFE
+        je      near .unsafe
+        cmp     eax, NK_IF
+        je      near .if
+        cmp     eax, NK_WHILE
+        je      near .while
+        cmp     eax, NK_FOR
+        je      near .for
+        cmp     eax, NK_BREAK
+        je      near .break
+        cmp     eax, NK_CONTINUE
+        je      near .continue
+        cmp     eax, NK_RETURN
+        je      near .return
+        cmp     eax, NK_MATCH
+        je      near .match
+        cmp     eax, NK_VAR
+        je      near .var
+        cmp     eax, NK_ASSIGN
+        je      near .assign
+        cmp     eax, NK_INC
+        je      near .step
+        cmp     eax, NK_DEC
+        je      near .step
+        ; NK_EXPR: evaluate and drop
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    g_value
+        jmp     near .out
+
+.block:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+.block_next:
+        test    r12d, r12d
+        jz      near .out
+        mov     edi, r12d
+        call    g_stmt
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .block_next
+
+.unsafe:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    g_stmt
+        jmp     near .out
+
+.if:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    g_condition             ; eax = rel32 of the jump taken when false
+        mov     r12d, eax
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    g_stmt
+        mov     edi, ebx
+        mov     esi, N_C
+        call    node_slot
+        mov     r13d, eax
+        test    eax, eax
+        jz      short .if_no_else
+        mov     edi, CC_JMP
+        call    g_jump_open
+        mov     r14d, eax
+        call    g_here
+        mov     esi, eax
+        mov     edi, r12d
+        call    g_patch
+        mov     edi, r13d
+        call    g_stmt
+        call    g_here
+        mov     esi, eax
+        mov     edi, r14d
+        call    g_patch
+        jmp     near .out
+.if_no_else:
+        call    g_here
+        mov     esi, eax
+        mov     edi, r12d
+        call    g_patch
+        jmp     near .out
+
+.while:
+        call    g_here
+        mov     r12d, eax               ; top
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    g_condition
+        mov     r13d, eax               ; exit jump
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    g_loop_body             ; eax = break list, edx = continue list
+        mov     r14d, eax
+        mov     edi, edx
+        mov     esi, r12d
+        call    g_patch_list
+        mov     edi, CC_JMP
+        mov     esi, r12d
+        call    g_jump
+        call    g_here
+        mov     r15d, eax
+        mov     edi, r13d
+        mov     esi, eax
+        call    g_patch
+        mov     edi, r14d
+        mov     esi, r15d
+        call    g_patch_list
+        jmp     near .out
+
+.for:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        test    eax, eax
+        jz      short .for_top
+        mov     edi, eax
+        call    g_stmt
+.for_top:
+        call    g_here
+        mov     r12d, eax
+        xor     r13d, r13d
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        test    eax, eax
+        jz      short .for_body
+        mov     edi, eax
+        call    g_condition
+        lea     r13d, [rax + 1]         ; exit jump + 1 (0 = none)
+.for_body:
+        mov     edi, ebx
+        mov     esi, N_D
+        call    node_slot
+        mov     edi, eax
+        call    g_loop_body
+        mov     r14d, eax               ; breaks
+        mov     r15d, edx               ; continues: they go to the step
+        call    g_here
+        mov     esi, eax
+        mov     edi, r15d
+        call    g_patch_list
+        mov     edi, ebx
+        mov     esi, N_C
+        call    node_slot
+        test    eax, eax
+        jz      short .for_back
+        mov     edi, eax
+        call    g_stmt
+.for_back:
+        mov     edi, CC_JMP
+        mov     esi, r12d
+        call    g_jump
+        call    g_here
+        mov     r15d, eax
+        test    r13d, r13d
+        jz      short .for_breaks
+        lea     edi, [r13 - 1]
+        mov     esi, eax
+        call    g_patch
+.for_breaks:
+        mov     edi, r14d
+        mov     esi, r15d
+        call    g_patch_list
+        jmp     near .out
+
+.break:
+        mov     edi, CC_JMP
+        mov     rsi, [g_loop]
+        call    g_jump_link
+        jmp     near .out
+.continue:
+        mov     edi, CC_JMP
+        mov     rsi, [g_loop]
+        add     rsi, 4
+        call    g_jump_link
+        jmp     near .out
+
+.return:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        test    eax, eax
+        jz      short .return_void
+        mov     edi, eax
+        call    g_return_value
+        call    g_epilogue
+        jmp     near .out
+.return_void:
+        xor     edi, edi                ; top-level `return;` exits with 0
+        call    g_imm
+        call    g_epilogue
+        jmp     near .out
+
+.var:
+        mov     edi, ebx
+        call    nvalue_get
+        mov     r12d, eax               ; the slot
+        mov     edi, ebx
+        call    ntype_get
+        mov     r13d, eax
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        test    eax, eax
+        jz      short .var_zero
+        mov     edi, eax
+        call    g_value
+        lea     rsi, [t_push_pair]      ; keep the value while the address is made
+        call    g_t
+        mov     edi, r12d
+        call    g_rbp_address
+        lea     rsi, [t_mov_rcx_rax_pop_pair]
+        call    g_t
+        mov     edi, r13d
+        call    g_store
+        jmp     near .out
+.var_zero:
+        mov     edi, r12d
+        call    g_rbp_address
+        mov     edi, r13d
+        xor     esi, esi
+        call    size_of
+        mov     edi, eax
+        call    g_zero_bytes
+        jmp     near .out
+
+.assign:
+        mov     edi, ebx
+        call    node_ptr
+        mov     r12d, [rax + N_A]       ; target
+        mov     r13d, [rax + N_B]       ; value
+        mov     r14d, [rax + N_TOK]
+        mov     edi, r12d
+        call    ntype_get
+        mov     r15d, eax
+        mov     edi, r12d
+        call    g_address
+        lea     rsi, [t_push_rax]
+        call    g_t
+        mov     edi, r14d
+        call    tok_addr
+        cmp     dword [rax + TOK_LEN], 1
+        jne     short .compound
+        mov     edi, r13d
+        call    g_value
+        lea     rsi, [t_pop_rcx]
+        call    g_t
+        mov     edi, r15d
+        call    g_store
+        jmp     near .out
+.compound:
+        lea     rsi, [t_load_from_stack_top] ; mov rax, [rsp]
+        call    g_t
+        mov     edi, r15d
+        call    g_load
+        lea     rsi, [t_push_rax]
+        call    g_t
+        mov     edi, r13d
+        call    g_value
+        lea     rsi, [t_operands]       ; rcx = right, rax = left
+        call    g_t
+        mov     edi, r14d               ; the operator without its '='
+        call    tok_addr
+        mov     edi, [rax + TOK_START]
+        add     rdi, [diag_src]
+        mov     esi, [rax + TOK_LEN]
+        dec     esi
+        mov     edx, r15d
+        call    g_arith_text
+        lea     rsi, [t_pop_rcx]
+        call    g_t
+        mov     edi, r15d
+        call    g_store
+        jmp     near .out
+
+.step:                                  ; x++ / x--
+        mov     edi, ebx
+        call    node_kind
+        mov     r14d, eax
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+        mov     edi, eax
+        call    ntype_get
+        mov     r15d, eax
+        mov     edi, r12d
+        call    g_address
+        lea     rsi, [t_push_rax]
+        call    g_t
+        mov     edi, r15d
+        call    g_load
+        mov     edi, 1
+        lea     rsi, [t_mov_ecx_imm32]
+        call    g_t_dword
+        lea     rdi, [s_plus]
+        cmp     r14d, NK_INC
+        je      short .step_op
+        lea     rdi, [s_minus]
+.step_op:
+        mov     esi, 1
+        mov     edx, r15d
+        call    g_arith_text
+        lea     rsi, [t_pop_rcx]
+        call    g_t
+        mov     edi, r15d
+        call    g_store
+        jmp     near .out
+
+.match:
+        mov     edi, ebx
+        call    g_match
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_condition - evaluate a bool and jump when it is false.
+;   in: edi = expression.  out: eax = rel32 offset of that jump (for g_patch)
+g_condition:
+        call    g_value
+        lea     rsi, [t_test_rax]
+        call    g_t
+        mov     edi, CC_E
+        jmp     near g_jump_open
+
+; g_loop_body - a loop body with fresh break/continue lists.
+;   in: edi = statement.  out: eax = break list, edx = continue list
+g_loop_body:
+        push    rbx
+        sub     rsp, 16
+        mov     [rsp], edi
+        mov     rax, [g_loop]           ; push a context: two u32 list heads
+        add     rax, 8
+        mov     [g_loop], rax
+        mov     qword [rax], 0
+        mov     edi, [rsp]
+        call    g_stmt
+        mov     rcx, [g_loop]
+        mov     eax, [rcx]
+        mov     edx, [rcx + 4]
+        sub     rcx, 8
+        mov     [g_loop], rcx
+        add     rsp, 16
+        pop     rbx
+        ret
+
+; g_zero_bytes - zero edi bytes at the address in rax.
+g_zero_bytes:
+        push    rbx
+        mov     ebx, edi
+        lea     rsi, [t_zero_setup]     ; rdi = rax, xor eax, eax
+        call    g_t
+        lea     rsi, [t_mov_ecx_imm32]
+        mov     edi, ebx
+        call    g_t_dword
+        lea     rsi, [t_rep_stosb]
+        call    g_t
+        pop     rbx
+        ret
+
+; g_match - [core.stmt.7]: compare the scrutinee with each arm's constants.
+; ebx = node, r12d = slot, r13d = arm, r14d = pattern, r15d = scalar type;
+; [rsp] = end list, [rsp + 4] = this arm's body list
+g_match:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        mov     qword [rsp], 0
+        call    nvalue_get
+        mov     r12d, eax
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        call    ntype_get
+        mov     r15d, eax
+        mov     edi, r13d
+        call    g_value
+        lea     rsi, [t_push_rax]
+        call    g_t
+        mov     edi, r12d
+        call    g_rbp_address
+        lea     rsi, [t_pop_rcx_swap]   ; rcx = address, rax = value
+        call    g_t
+        mov     edi, T_I64              ; store all 8 bytes of the normalized value
+        call    g_store_scalar8
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax
+.arm:
+        test    r13d, r13d
+        jz      near .no_arm
+        mov     dword [rsp + 4], 0
+        mov     edi, r12d
+        call    g_rbp_address
+        lea     rsi, [t_load8]
+        call    g_t
+        mov     edi, r13d
+        mov     esi, N_A
+        call    node_slot
+        mov     r14d, eax
+.pattern:
+        test    r14d, r14d
+        jz      short .no_pattern
+        mov     edi, r14d
+        call    node_kind
+        cmp     eax, NK_WILD
+        jne     short .compare
+        mov     edi, CC_JMP
+        lea     rsi, [rsp + 4]
+        call    g_jump_link
+        jmp     short .pattern_next
+.compare:
+        mov     edi, r14d
+        call    nvalue_get
+        mov     rdi, rax
+        lea     rsi, [t_mov_rcx_imm64]
+        push    rdi
+        push    rdi
+        call    g_t
+        pop     rdi
+        pop     rdi
+        call    g_qword
+        lea     rsi, [t_cmp_rax_rcx]
+        call    g_t
+        mov     edi, CC_E
+        lea     rsi, [rsp + 4]
+        call    g_jump_link
+.pattern_next:
+        mov     edi, r14d
+        call    node_ptr
+        mov     r14d, [rax + N_NEXT]
+        jmp     short .pattern
+.no_pattern:
+        mov     edi, CC_JMP             ; none matched: on to the next arm
+        call    g_jump_open
+        mov     r14d, eax
+        call    g_here                  ; the body
+        mov     esi, eax
+        mov     edi, [rsp + 4]
+        call    g_patch_list
+        mov     edi, r13d
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    g_stmt
+        mov     edi, CC_JMP
+        mov     rsi, rsp
+        call    g_jump_link
+        call    g_here
+        mov     esi, eax
+        mov     edi, r14d
+        call    g_patch
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     near .arm
+.no_arm:
+        mov     edi, CC_JMP             ; exhaustive, so this cannot happen
+        mov     esi, TRAP_UNREACHABLE
+        call    g_trap_if
+        call    g_here
+        mov     esi, eax
+        mov     edi, [rsp]
+        call    g_patch_list
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_store_scalar8 - mov [rcx], rax
+g_store_scalar8:
+        lea     rsi, [t_store8]
+        jmp     near g_t
+
+; =============================================================================
+; Expressions
+; =============================================================================
+
+; g_address - the address of a place, or of an aggregate value.
+;   in: edi = node.  out: code leaving the address in rax
+; ebx = node, r12d = object, r13d = type
+g_address:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        call    node_kind
+        cmp     eax, NK_NAME
+        je      short .name
+        cmp     eax, NK_MEMBER
+        je      near .member
+        cmp     eax, NK_INDEX
+        je      near .index
+        cmp     eax, NK_UNARY
+        jne     short .value
+        mov     edi, ebx
+        call    node_ptr
+        cmp     word [rax + N_OP], TK_STAR
+        jne     short .value
+        mov     edi, [rax + N_A]        ; *p: the pointer's value is the address
+        call    g_value
+        jmp     near .out
+.value:
+        mov     edi, ebx                ; an aggregate value is already an address
+        call    g_value
+        jmp     near .out
+.name:
+        mov     edi, ebx
+        call    nsym_get
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_STATIC
+        je      short .static
+        mov     edi, [rax + S_NODE]     ; a local or parameter: its slot
+        call    nvalue_get
+        mov     edi, eax
+        call    g_rbp_address
+        jmp     near .out
+.static:
+        mov     edi, [rax + S_AUX]
+        call    g_data_address
+        jmp     near .out
+.member:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+        mov     edi, eax
+        call    ntype_get
+        mov     r13d, eax
+        mov     edi, eax
+        call    ty_kind
+        cmp     eax, TYK_PTR
+        jne     short .member_struct
+        mov     edi, r12d               ; through a pointer: its value
+        call    g_value
+        mov     edi, r13d
+        call    ty_ptr
+        mov     r13d, [rax + TY_ELEM]
+        jmp     short .member_offset
+.member_struct:
+        mov     edi, r12d
+        call    g_address
+.member_offset:
+        mov     edi, r13d
+        mov     esi, ebx
+        call    struct_field_named
+        mov     edi, eax
+        call    nvalue_get
+        test    eax, eax
+        jz      short .out
+        mov     edi, eax
+        lea     rsi, [t_add_rax_imm32]
+        call    g_t_dword
+        jmp     short .out
+.index:
+        mov     edi, ebx
+        call    g_index_address
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_index_address - [core.expr.6]: element address, with bounds checks for
+; arrays, slices and str.  in: edi = index node
+; ebx = node, r12d = object, r13d = object type, r14d = element size
+g_index_address:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    node_ptr
+        mov     r12d, [rax + N_A]
+        mov     edi, r12d
+        call    ntype_get
+        mov     r13d, eax
+        mov     edi, ebx
+        call    ntype_get
+        mov     edi, eax
+        xor     esi, esi
+        call    size_of
+        mov     r14d, eax
+        mov     edi, r13d
+        call    ty_kind
+        mov     r15d, eax
+        cmp     eax, TYK_ARRAY
+        je      short .array
+        mov     edi, r12d               ; slices, str and pointers: by value
+        call    g_value
+        lea     rsi, [t_push_pair]
+        call    g_t
+        jmp     short .index
+.array:
+        mov     edi, r12d
+        call    g_address
+        lea     rsi, [t_push_pair]
+        call    g_t
+.index:
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    g_value
+        lea     rsi, [t_index_operands] ; rcx = index; pop rax, rdx
+        call    g_t
+        cmp     r15d, TYK_PTR
+        je      short .scale
+        cmp     r15d, TYK_ARRAY
+        jne     short .length_check
+        mov     edi, r13d
+        call    ty_ptr
+        mov     edi, [rax + TY_COUNT]
+        lea     rsi, [t_cmp_rcx_imm32]
+        call    g_t_dword
+        jmp     short .bounds
+.length_check:
+        lea     rsi, [t_cmp_rcx_rdx]
+        call    g_t
+.bounds:
+        mov     edi, CC_AE
+        mov     esi, TRAP_BOUNDS
+        call    g_trap_if
+.scale:
+        cmp     r14d, 1
+        je      short .add
+        mov     edi, r14d
+        lea     rsi, [t_imul_rcx_imm32]
+        call    g_t_dword
+.add:
+        lea     rsi, [t_add_rax_rcx]
+        call    g_t
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_value - code computing the value of expression node edi (see the header).
+; ebx = node, r12d = type, r13d..r15d = parts
+g_value:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        call    ntype_get
+        mov     r12d, eax
+        ; constants the checker evaluated (unsuffixed literal expressions)
+        mov     edi, ebx
+        call    is_untyped
+        test    eax, eax
+        jnz     near .constant
+        mov     edi, ebx
+        call    node_kind
+        cmp     eax, NK_INT
+        je      near .int
+        cmp     eax, NK_CHAR
+        je      near .char
+        cmp     eax, NK_BOOL
+        je      near .bool
+        cmp     eax, NK_SIZEOF
+        je      near .constant
+        cmp     eax, NK_ALIGNOF
+        je      near .constant
+        cmp     eax, NK_STRING
+        je      near .string
+        cmp     eax, NK_NAME
+        je      near .name
+        cmp     eax, NK_MEMBER
+        je      near .member
+        cmp     eax, NK_INDEX
+        je      near .load_place
+        cmp     eax, NK_CALL
+        je      near .call
+        cmp     eax, NK_UNARY
+        je      near .unary
+        cmp     eax, NK_BINARY
+        je      near .binary
+        cmp     eax, NK_CAST
+        je      near .cast
+        jmp     near .new
+
+.constant:
+        mov     edi, ebx
+        call    nvalue_get
+        mov     rdi, rax
+        call    g_imm
+        jmp     near .out
+.char:
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        call    char_value
+        mov     rdi, rax
+        call    g_imm
+        jmp     near .out
+.bool:
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        lea     rsi, [s_true]
+        mov     edx, 4
+        call    tok_is
+        mov     edi, eax
+        call    g_imm
+        jmp     near .out
+.int:                                   ; a suffixed literal
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        call    literal_value
+        mov     rdi, rax
+        mov     esi, r12d
+        call    wrap_value
+        mov     rdi, rax
+        call    g_imm
+        jmp     near .out
+
+.string:
+        mov     esi, ebx
+        call    d_string
+        mov     r13d, edx
+        mov     edi, eax
+        call    g_data_address
+        mov     edi, r13d
+        lea     rsi, [t_mov_edx_imm32]
+        call    g_t_dword
+        jmp     near .out
+
+.name:
+        mov     edi, ebx
+        call    nsym_get
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_CONST
+        jne     near .load_place
+        mov     edi, r12d               ; a const: its value, or its string
+        call    value_class
+        cmp     eax, VC_PAIR
+        je      short .const_string
+        mov     edi, ebx
+        call    nsym_get
+        mov     edi, eax
+        call    sym_ptr
+        mov     rdi, [rax + S_VALUE]
+        call    g_imm
+        jmp     near .out
+.const_string:
+        mov     edi, ebx
+        call    string_node_of
+        mov     esi, eax
+        call    d_string
+        mov     r13d, edx
+        mov     edi, eax
+        call    g_data_address
+        mov     edi, r13d
+        lea     rsi, [t_mov_edx_imm32]
+        call    g_t_dword
+        jmp     near .out
+
+.member:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax               ; object
+        mov     edi, eax
+        call    ntype_get
+        mov     r14d, eax
+        test    eax, eax
+        jz      short .variant          ; Enum.Variant: the object is untyped
+        mov     edi, eax
+        call    ty_kind
+        cmp     eax, TYK_STR
+        je      short .view
+        cmp     eax, TYK_SLICE
+        jne     short .load_place
+.view:
+        mov     edi, r13d
+        call    g_value
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        lea     rsi, [s_len]
+        mov     edx, 3
+        call    tok_is
+        test    eax, eax
+        jz      near .out               ; .Ptr is rax already
+        lea     rsi, [t_mov_rax_rdx]
+        call    g_t
+        jmp     near .out
+.variant:
+        mov     edi, r12d
+        mov     esi, ebx
+        call    enum_variant_named
+        mov     edi, eax
+        call    nvalue_get
+        mov     rdi, rax
+        call    g_imm
+        jmp     near .out
+
+.load_place:
+        mov     edi, ebx
+        call    g_address
+        mov     edi, r12d
+        call    g_load
+        jmp     near .out
+
+.call:
+        mov     edi, ebx
+        call    g_call
+        jmp     near .out
+
+.unary:
+        mov     edi, ebx
+        call    node_ptr
+        movzx   r14d, word [rax + N_OP]
+        mov     r13d, [rax + N_A]
+        cmp     r14d, TK_AMP
+        jne     short .unary_value
+        mov     edi, r13d
+        call    g_address
+        jmp     near .out
+.unary_value:
+        cmp     r14d, TK_STAR
+        je      near .load_place
+        mov     edi, r13d
+        call    g_value
+        cmp     r14d, TK_BANG
+        je      short .not
+        cmp     r14d, TK_TILDE
+        je      short .complement
+        lea     rsi, [t_neg_rax]        ; '-'
+        call    g_t
+        mov     edi, r12d
+        call    g_overflow_check
+        jmp     near .out
+.not:
+        lea     rsi, [t_xor_rax_1]
+        call    g_t
+        jmp     near .out
+.complement:
+        lea     rsi, [t_not_rax]
+        call    g_t
+        mov     edi, r12d
+        call    g_normalize
+        jmp     near .out
+
+.binary:
+        mov     edi, ebx
+        call    g_binary
+        jmp     near .out
+
+.cast:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    g_value
+        mov     edi, r12d
+        call    ty_kind
+        cmp     eax, TYK_INT
+        jne     near .out               ; to a pointer: same bits
+        mov     edi, r12d
+        call    g_normalize
+        jmp     near .out
+
+.new:                                   ; [core.expr.10] in the node's slot
+        mov     edi, ebx
+        call    nvalue_get
+        mov     r13d, eax
+        mov     edi, eax
+        call    g_rbp_address
+        mov     edi, r12d
+        xor     esi, esi
+        call    size_of
+        mov     edi, eax
+        call    g_zero_bytes
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r14d, eax
+.init:
+        test    r14d, r14d
+        jz      short .new_done
+        mov     edi, r14d
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    g_value
+        lea     rsi, [t_push_pair]
+        call    g_t
+        mov     edi, r13d
+        call    g_rbp_address
+        mov     edi, r12d
+        mov     esi, r14d
+        call    struct_field_named
+        mov     r15d, eax
+        mov     edi, eax
+        call    nvalue_get
+        mov     edi, eax
+        lea     rsi, [t_add_rax_imm32]
+        call    g_t_dword
+        lea     rsi, [t_mov_rcx_rax_pop_pair]
+        call    g_t
+        mov     edi, r15d
+        call    ntype_get
+        mov     edi, eax
+        call    g_store
+        mov     edi, r14d
+        call    node_ptr
+        mov     r14d, [rax + N_NEXT]
+        jmp     short .init
+.new_done:
+        mov     edi, r13d
+        call    g_rbp_address
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_call - [core.expr.8]: push the arguments, call, pop them.
+; ebx = node, r12d = symbol, r13d = argument, r14d = bytes pushed, r15d = type
+g_call:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    node_ptr
+        mov     edi, [rax + N_A]
+        call    nsym_get_or_lookup
+        mov     r12d, eax
+        xor     r14d, r14d
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax
+.argument:
+        test    r13d, r13d
+        jz      short .arguments_done
+        mov     edi, r13d
+        call    ntype_get
+        mov     r15d, eax
+        mov     edi, r13d
+        call    g_value
+        mov     edi, r15d
+        call    g_push_value
+        add     r14d, eax
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .argument
+.arguments_done:
+        mov     edi, ebx                ; an aggregate result: its slot, last
+        call    ntype_get
+        mov     edi, eax
+        call    value_class
+        cmp     eax, VC_AGGREGATE
+        jne     short .target
+        mov     edi, ebx
+        call    nvalue_get
+        mov     edi, eax
+        call    g_rbp_address
+        lea     rsi, [t_push_rax]
+        call    g_t
+        add     r14d, 8
+.target:
+        mov     edi, r12d
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_BUILTIN
+        jne     short .function
+        imul    edi, [rax + S_AUX2], RT_ENTRY_SIZE
+        call    g_call_offset
+        jmp     short .pop
+.function:
+        mov     edi, 0xE8
+        call    g_byte
+        call    g_here
+        mov     esi, eax
+        mov     edi, FX_CALL
+        mov     edx, r12d
+        call    g_fixup
+        xor     edi, edi
+        call    g_dword
+.pop:
+        test    r14d, r14d
+        jz      short .result
+        mov     edi, r14d
+        lea     rsi, [t_add_rsp_imm32]
+        call    g_t_dword
+.result:
+        mov     edi, ebx
+        call    ntype_get
+        mov     edi, eax
+        call    value_class
+        cmp     eax, VC_AGGREGATE
+        jne     short .done
+        mov     edi, ebx                ; the result is in its slot
+        call    nvalue_get
+        mov     edi, eax
+        call    g_rbp_address
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; nsym_get_or_lookup - symbol of a name node (the checker records callees by
+; lookup only, so look the name up if needed).  in: edi = node.  out: eax
+nsym_get_or_lookup:
+        push    rbx
+        mov     ebx, edi
+        call    nsym_get
+        test    eax, eax
+        jnz     short .done
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        call    tok_text
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    g_find                  ; functions and built-ins are program-scope names
+.done:
+        pop     rbx
+        ret
+
+; g_push_value - push the value just computed, as an argument of type edi.
+;   out: eax = bytes pushed
+g_push_value:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        call    value_class
+        cmp     eax, VC_PAIR
+        je      short .pair
+        cmp     eax, VC_AGGREGATE
+        je      short .aggregate
+        lea     rsi, [t_push_rax]
+        call    g_t
+        mov     eax, 8
+        jmp     short .out
+.pair:
+        lea     rsi, [t_push_pair]
+        call    g_t
+        mov     eax, 16
+        jmp     short .out
+.aggregate:
+        mov     edi, ebx
+        call    slot_size
+        mov     r12d, eax
+        mov     edi, eax
+        lea     rsi, [t_sub_rsp]
+        call    g_t_dword
+        lea     rsi, [t_copy_to_stack]  ; rsi = rax, rdi = rsp
+        call    g_t
+        mov     edi, ebx
+        xor     esi, esi
+        call    size_of
+        mov     edi, eax
+        call    g_copy_bytes
+        mov     eax, r12d
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; g_binary - [core.expr.3], [core.expr.4].  in: edi = binary node
+; ebx = node, r12d = operator, r13d = operand type, r14d = result type
+g_binary:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    node_ptr
+        movzx   r12d, word [rax + N_OP]
+        mov     r15d, [rax + N_A]
+        mov     edi, ebx
+        call    ntype_get
+        mov     r14d, eax
+        mov     edi, r15d
+        call    ntype_get
+        mov     r13d, eax
+        cmp     r12d, TK_AND_AND
+        je      short .and
+        cmp     r12d, TK_OR_OR
+        je      short .or
+        mov     edi, r15d
+        call    g_value
+        lea     rsi, [t_push_rax]
+        call    g_t
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    g_value
+        lea     rsi, [t_operands]
+        call    g_t
+        mov     edi, r12d               ; the operator's spelling
+        shl     edi, 4
+        lea     rax, [tok_table]
+        add     rax, rdi
+        movzx   esi, byte [rax]
+        lea     rdi, [rax + 1]
+        mov     edx, r13d
+        call    g_arith_text
+        jmp     short .done
+.and:                                   ; rax stays 0 when the left side is false
+        mov     edi, r15d
+        call    g_value
+        lea     rsi, [t_test_rax]
+        call    g_t
+        mov     edi, CC_E
+        call    g_jump_open
+        jmp     short .right
+.or:
+        mov     edi, r15d
+        call    g_value
+        lea     rsi, [t_test_rax]
+        call    g_t
+        mov     edi, CC_NE
+        call    g_jump_open
+.right:
+        mov     r15d, eax
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    g_value
+        call    g_here
+        mov     esi, eax
+        mov     edi, r15d
+        call    g_patch
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_arith_text - apply the operator spelled at rdi (esi bytes) to rax (left)
+; and rcx (right) of operand type edx, with run-time checks; the result is in rax.
+; ebx = type, r12 = spelling, r13d = length, r14d = signed, r15d = size
+g_arith_text:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     r12, rdi
+        mov     r13d, esi
+        mov     ebx, edx
+        mov     edi, edx
+        call    scalar_size
+        mov     r15d, eax
+        mov     r14d, edx
+        lea     r8, [arith_ops]
+.find:
+        movzx   ecx, byte [r8]
+        test    ecx, ecx
+        jz      near .done              ; (cannot happen: the checker accepted it)
+        cmp     ecx, r13d
+        jne     short .skip
+        push    r8
+        push    r8
+        lea     rdi, [r8 + 2]
+        mov     rsi, r12
+        mov     rdx, r13
+        call    mem_eq
+        pop     r8
+        pop     r8
+        test    eax, eax
+        jnz     short .found
+.skip:
+        add     r8, 4
+        jmp     short .find
+.found:
+        movzx   eax, byte [r8 + 1]
+        lea     rcx, [arith_handlers]
+        movsxd  rax, dword [rcx + rax*4]
+        add     rax, rcx
+        jmp     rax
+
+; Each handler finishes with .done. Comparison results are bool (0/1).
+.h_add:
+        lea     rsi, [t_add_rax_rcx]
+        call    g_t
+        jmp     short .checked
+.h_sub:
+        lea     rsi, [t_sub_rax_rcx]
+        call    g_t
+        jmp     short .checked
+.h_mul:
+        lea     rsi, [t_imul_rax_rcx]
+        test    r14d, r14d
+        jnz     short .mul_emit
+        cmp     r15d, 8
+        jne     short .mul_emit
+        lea     rsi, [t_mul_rcx]        ; u64: rdx:rax, carry when it overflows
+.mul_emit:
+        call    g_t
+.checked:
+        cmp     r15d, 8
+        jne     short .narrow
+        mov     edi, CC_O
+        test    r14d, r14d
+        jnz     short .flag
+        mov     edi, CC_B
+.flag:
+        mov     esi, TRAP_OVERFLOW
+        call    g_trap_if
+        jmp     near .done
+.narrow:
+        mov     edi, ebx
+        call    g_check_fits
+        jmp     near .done
+.h_wrap_add:
+        lea     rsi, [t_add_rax_rcx]
+        jmp     short .wrapped
+.h_wrap_sub:
+        lea     rsi, [t_sub_rax_rcx]
+        jmp     short .wrapped
+.h_wrap_mul:
+        lea     rsi, [t_imul_rax_rcx]
+.wrapped:
+        call    g_t
+        mov     edi, ebx
+        call    g_normalize
+        jmp     near .done
+.h_div:
+.h_rem:
+        lea     rsi, [t_test_rcx]
+        call    g_t
+        mov     edi, CC_E
+        mov     esi, TRAP_DIVIDE
+        call    g_trap_if
+        test    r14d, r14d
+        jz      short .unsigned_div
+        cmp     r15d, 8
+        jne     short .signed_div
+        lea     rsi, [t_min_div_check]  ; rcx == -1 && rax == MIN -> overflow
+        call    g_t
+        mov     edi, CC_E
+        mov     esi, TRAP_OVERFLOW
+        call    g_trap_if
+.signed_div:
+        lea     rsi, [t_idiv]
+        call    g_t
+        jmp     short .quotient
+.unsigned_div:
+        lea     rsi, [t_div]
+        call    g_t
+.quotient:
+        movzx   eax, byte [r12]
+        cmp     eax, '%'
+        jne     short .div_checked
+        lea     rsi, [t_mov_rax_rdx]
+        call    g_t
+.div_checked:
+        mov     edi, ebx                ; i32 MIN / -1 = 2^31 does not fit
+        call    g_check_fits
+        jmp     near .done
+.h_and:
+        lea     rsi, [t_and_rax_rcx]
+        jmp     short .plain
+.h_or:
+        lea     rsi, [t_or_rax_rcx]
+        jmp     short .plain
+.h_xor:
+        lea     rsi, [t_xor_rax_rcx]
+.plain:
+        call    g_t
+        jmp     near .done
+.h_shl:
+        call    .shift_check
+        lea     rsi, [t_shl]
+        call    g_t
+        mov     edi, ebx
+        call    g_normalize
+        jmp     near .done
+.h_shr:
+        call    .shift_check
+        lea     rsi, [t_shr]
+        test    r14d, r14d
+        jz      short .shr_emit
+        lea     rsi, [t_sar]
+.shr_emit:
+        call    g_t
+        jmp     near .done
+.h_eq:
+        mov     edi, 0x94               ; sete
+        jmp     short .compare
+.h_ne:
+        mov     edi, 0x95
+        jmp     short .compare
+.h_lt:
+        mov     edi, 0x9C               ; setl / setb
+        mov     esi, 0x92
+        jmp     short .ordered
+.h_gt:
+        mov     edi, 0x9F
+        mov     esi, 0x97
+        jmp     short .ordered
+.h_le:
+        mov     edi, 0x9E
+        mov     esi, 0x96
+        jmp     short .ordered
+.h_ge:
+        mov     edi, 0x9D
+        mov     esi, 0x93
+.ordered:
+        test    r14d, r14d
+        jnz     short .compare
+        mov     edi, esi
+.compare:
+        push    rdi
+        push    rdi
+        lea     rsi, [t_cmp_rax_rcx]
+        call    g_t
+        mov     edi, 0x0F
+        call    g_byte
+        pop     rdi
+        pop     rdi
+        call    g_byte
+        mov     edi, 0xC0               ; setcc al
+        call    g_byte
+        lea     rsi, [t_movzx_eax_al]
+        call    g_t
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+; .shift_check - trap unless 0 <= rcx < bits (rcx is canonical, so a negative
+; amount is huge as unsigned).
+.shift_check:
+        mov     edi, r15d
+        shl     edi, 3
+        lea     rsi, [t_cmp_rcx_imm32]
+        call    g_t_dword
+        mov     edi, CC_AE
+        mov     esi, TRAP_SHIFT
+        jmp     near g_trap_if
+
+; g_overflow_check - after `neg rax` on type edi: the flag for 64-bit types,
+; a range check for narrower ones.
+g_overflow_check:
+        push    rbx
+        mov     ebx, edi
+        call    scalar_size
+        cmp     eax, 8
+        jne     short .narrow
+        mov     edi, CC_O
+        mov     esi, TRAP_OVERFLOW
+        call    g_trap_if
+        pop     rbx
+        ret
+.narrow:
+        mov     edi, ebx
+        call    g_check_fits
+        pop     rbx
+        ret
+
+; =============================================================================
+; Data
+; =============================================================================
+
+; Operator table for g_arith_text: length, handler index, spelling (2 bytes).
+arith_ops:
+        db      1, 0, '+', 0
+        db      1, 1, '-', 0
+        db      1, 2, '*', 0
+        db      2, 3, '+%'
+        db      2, 4, '-%'
+        db      2, 5, '*%'
+        db      1, 6, '/', 0
+        db      1, 7, '%', 0
+        db      1, 8, '&', 0
+        db      1, 9, '|', 0
+        db      1, 10, '^', 0
+        db      2, 11, '<<'
+        db      2, 12, '>>'
+        db      2, 13, '=='
+        db      2, 14, '!='
+        db      1, 15, '<', 0
+        db      1, 16, '>', 0
+        db      2, 17, '<='
+        db      2, 18, '>='
+        db      0
+        align   4, db 0
+arith_handlers:
+        dd      g_arith_text.h_add - arith_handlers
+        dd      g_arith_text.h_sub - arith_handlers
+        dd      g_arith_text.h_mul - arith_handlers
+        dd      g_arith_text.h_wrap_add - arith_handlers
+        dd      g_arith_text.h_wrap_sub - arith_handlers
+        dd      g_arith_text.h_wrap_mul - arith_handlers
+        dd      g_arith_text.h_div - arith_handlers
+        dd      g_arith_text.h_rem - arith_handlers
+        dd      g_arith_text.h_and - arith_handlers
+        dd      g_arith_text.h_or - arith_handlers
+        dd      g_arith_text.h_xor - arith_handlers
+        dd      g_arith_text.h_shl - arith_handlers
+        dd      g_arith_text.h_shr - arith_handlers
+        dd      g_arith_text.h_eq - arith_handlers
+        dd      g_arith_text.h_ne - arith_handlers
+        dd      g_arith_text.h_lt - arith_handlers
+        dd      g_arith_text.h_gt - arith_handlers
+        dd      g_arith_text.h_le - arith_handlers
+        dd      g_arith_text.h_ge - arith_handlers
+
+; Instruction templates: a length byte, then the machine code.
+t_mov_rax_imm32:    db 3, 0x48, 0xC7, 0xC0              ; mov rax, simm32
+t_mov_rax_imm64:    db 2, 0x48, 0xB8                    ; mov rax, imm64
+t_mov_rcx_imm64:    db 2, 0x48, 0xB9                    ; mov rcx, imm64
+t_mov_ecx_imm32:    db 1, 0xB9                          ; mov ecx, imm32
+t_mov_edx_imm32:    db 1, 0xBA                          ; mov edx, imm32
+t_lea_rax_rbp:      db 3, 0x48, 0x8D, 0x85              ; lea rax, [rbp + disp32]
+t_lea_rax_rip:      db 3, 0x48, 0x8D, 0x05              ; lea rax, [rip + disp32]
+t_add_rax_imm32:    db 2, 0x48, 0x05                    ; add rax, imm32
+t_sub_rsp:          db 3, 0x48, 0x81, 0xEC              ; sub rsp, imm32
+t_probe_count:      db 2, 0x41, 0xBB                    ; mov r11d, imm32 (pages)
+; .l: sub rsp, 4096; mov [rsp], r11; sub r11, 1; jnz .l
+t_probe_loop:       db 17, 0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00, 0x4C, 0x89, 0x1C, 0x24, 0x49, 0x83, 0xEB, 0x01, 0x75, 0xEF
+t_add_rsp_imm32:    db 3, 0x48, 0x81, 0xC4              ; add rsp, imm32
+t_prologue:         db 4, 0x55, 0x48, 0x89, 0xE5        ; push rbp; mov rbp, rsp
+t_epilogue:         db 5, 0x48, 0x89, 0xEC, 0x5D, 0xC3  ; mov rsp, rbp; pop rbp; ret
+t_push_rax:         db 1, 0x50
+t_push_pair:        db 2, 0x52, 0x50                    ; push rdx; push rax
+t_pop_rcx:          db 1, 0x59
+t_pop_rcx_swap:     db 4, 0x48, 0x89, 0xC1, 0x58        ; mov rcx, rax; pop rax
+t_mov_rcx_rax_pop_pair: db 5, 0x48, 0x89, 0xC1, 0x58, 0x5A ; mov rcx, rax; pop rax; pop rdx
+t_operands:         db 4, 0x48, 0x89, 0xC1, 0x58        ; mov rcx, rax; pop rax
+t_index_operands:   db 5, 0x48, 0x89, 0xC1, 0x58, 0x5A  ; mov rcx, rax; pop rax; pop rdx
+t_load_from_stack_top: db 4, 0x48, 0x8B, 0x04, 0x24     ; mov rax, [rsp]
+t_load8:            db 3, 0x48, 0x8B, 0x00              ; mov rax, [rax]
+t_load4s:           db 3, 0x48, 0x63, 0x00              ; movsxd rax, dword [rax]
+t_load4u:           db 2, 0x8B, 0x00                    ; mov eax, [rax]
+t_load2s:           db 4, 0x48, 0x0F, 0xBF, 0x00        ; movsx rax, word [rax]
+t_load2u:           db 3, 0x0F, 0xB7, 0x00              ; movzx eax, word [rax]
+t_load1s:           db 4, 0x48, 0x0F, 0xBE, 0x00        ; movsx rax, byte [rax]
+t_load1u:           db 3, 0x0F, 0xB6, 0x00              ; movzx eax, byte [rax]
+t_load_pair:        db 7, 0x48, 0x8B, 0x50, 0x08, 0x48, 0x8B, 0x00 ; mov rdx, [rax + 8]; mov rax, [rax]
+t_store8:           db 3, 0x48, 0x89, 0x01              ; mov [rcx], rax
+t_store4:           db 2, 0x89, 0x01                    ; mov [rcx], eax
+t_store2:           db 3, 0x66, 0x89, 0x01              ; mov [rcx], ax
+t_store1:           db 2, 0x88, 0x01                    ; mov [rcx], al
+t_store_pair:       db 7, 0x48, 0x89, 0x01, 0x48, 0x89, 0x51, 0x08 ; mov [rcx], rax; mov [rcx + 8], rdx
+t_copy_setup:       db 6, 0x48, 0x89, 0xCF, 0x48, 0x89, 0xC6 ; mov rdi, rcx; mov rsi, rax
+t_copy_to_stack:    db 6, 0x48, 0x89, 0xC6, 0x48, 0x89, 0xE7 ; mov rsi, rax; mov rdi, rsp
+t_return_aggregate: db 7, 0x48, 0x89, 0xC6, 0x48, 0x8B, 0x7D, 0x10 ; mov rsi, rax; mov rdi, [rbp + 16]
+t_zero_setup:       db 5, 0x48, 0x89, 0xC7, 0x31, 0xC0  ; mov rdi, rax; xor eax, eax
+t_rep_movsb:        db 2, 0xF3, 0xA4
+t_rep_stosb:        db 2, 0xF3, 0xAA
+t_test_rax:         db 3, 0x48, 0x85, 0xC0
+t_test_rcx:         db 3, 0x48, 0x85, 0xC9
+t_cmp_rax_rcx:      db 3, 0x48, 0x39, 0xC8              ; cmp rax, rcx
+t_cmp_rcx_rax:      db 3, 0x48, 0x39, 0xC1              ; cmp rcx, rax
+t_cmp_rcx_rdx:      db 3, 0x48, 0x39, 0xD1              ; cmp rcx, rdx
+t_cmp_rcx_imm32:    db 3, 0x48, 0x81, 0xF9              ; cmp rcx, imm32
+t_imul_rcx_imm32:   db 3, 0x48, 0x69, 0xC9              ; imul rcx, rcx, imm32
+t_add_rax_rcx:      db 3, 0x48, 0x01, 0xC8
+t_sub_rax_rcx:      db 3, 0x48, 0x29, 0xC8
+t_imul_rax_rcx:     db 4, 0x48, 0x0F, 0xAF, 0xC1
+t_mul_rcx:          db 3, 0x48, 0xF7, 0xE1              ; mul rcx
+t_and_rax_rcx:      db 3, 0x48, 0x21, 0xC8
+t_or_rax_rcx:       db 3, 0x48, 0x09, 0xC8
+t_xor_rax_rcx:      db 3, 0x48, 0x31, 0xC8
+t_idiv:             db 5, 0x48, 0x99, 0x48, 0xF7, 0xF9  ; cqo; idiv rcx
+t_div:              db 5, 0x31, 0xD2, 0x48, 0xF7, 0xF1  ; xor edx, edx; div rcx
+t_min_div_check:    ; ZF set exactly when rcx == -1 and rax == MIN (the one overflowing division):
+                    ;   mov rdx, rcx; inc rdx; jnz .no; mov rdx, 1 << 63; cmp rax, rdx; jmp .end
+                    ;   .no: test rsp, rsp (clears ZF: rsp is never 0); .end:
+                    db 26, 0x48, 0x89, 0xCA, 0x48, 0xFF, 0xC2, 0x75, 0x0F
+                    db 0x48, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x48, 0x39, 0xD0, 0xEB, 0x03, 0x48, 0x85, 0xE4
+t_shl:              db 3, 0x48, 0xD3, 0xE0
+t_shr:              db 3, 0x48, 0xD3, 0xE8
+t_sar:              db 3, 0x48, 0xD3, 0xF8
+t_neg_rax:          db 3, 0x48, 0xF7, 0xD8
+t_not_rax:          db 3, 0x48, 0xF7, 0xD0
+t_xor_rax_1:        db 4, 0x48, 0x83, 0xF0, 0x01
+t_mov_rax_rdx:      db 3, 0x48, 0x89, 0xD0
+t_movzx_eax_al:     db 3, 0x0F, 0xB6, 0xC0
+t_norm4s:           db 3, 0x48, 0x63, 0xC0              ; movsxd rax, eax
+t_norm4u:           db 2, 0x89, 0xC0                    ; mov eax, eax
+t_norm2s:           db 4, 0x48, 0x0F, 0xBF, 0xC0        ; movsx rax, ax
+t_norm2u:           db 3, 0x0F, 0xB7, 0xC0              ; movzx eax, ax
+t_norm1s:           db 4, 0x48, 0x0F, 0xBE, 0xC0        ; movsx rax, al
+t_norm1u:           db 3, 0x0F, 0xB6, 0xC0              ; movzx eax, al
+t_fit4s:            db 3, 0x48, 0x63, 0xC8              ; movsxd rcx, eax
+t_fit4u:            db 2, 0x89, 0xC1                    ; mov ecx, eax
+t_fit2s:            db 4, 0x48, 0x0F, 0xBF, 0xC8        ; movsx rcx, ax
+t_fit2u:            db 3, 0x0F, 0xB7, 0xC8              ; movzx ecx, ax
+t_fit1s:            db 4, 0x48, 0x0F, 0xBE, 0xC8        ; movsx rcx, al
+t_fit1u:            db 3, 0x0F, 0xB6, 0xC8              ; movzx ecx, al
+
+s_plus:             db '+'
+s_minus:            db '-'
+msg_code_too_big:   db 'generated code exceeds 16 MiB'
+msg_code_too_big_len equ $ - msg_code_too_big
+msg_data_too_big:   db 'program data exceeds 16 MiB'
+msg_data_too_big_len equ $ - msg_data_too_big
+
+        align   8, db 0
+g_code:         dq 0                    ; section image being built
+g_clen:         dq 0
+g_data:         dq 0
+g_dlen:         dq 0
+g_data_base:    dq 0                    ; section offset of the data
+g_fixups:       dq 0
+g_nfix:         dq 0
+g_frame:        dq 0                    ; bytes of locals in the current function
+g_loop:         dq 0                    ; top of the loop-context stack
+g_main:         dd 0                    ; code offset of __main
+g_ret:          dd 0                    ; return type of the current function
+g_hidden:       dd 0                    ; 1 when it returns an aggregate
+g_trap_stubs:   times TRAP_UNREACHABLE + 1 dd 0
+        align   8, db 0
+g_loop_stack:   times 2 * 300 dd 0      ; break/continue list heads per nesting level

@@ -1,0 +1,203 @@
+// Lowering drops ([own.drop.1], [s1.own.2]; docs/architecture/stage1.md, "Ownership").
+// A local whose type needs a drop (it, or a field, implements `IDrop`) gets a drop flag,
+// set when it is initialized and cleared where the move checker marked a move (NMove 1).
+// At each scope exit (the end of a block, `break`, `continue`, `return`, the end of the
+// function) the live flagged locals of the scopes being left are dropped, newest first. A
+// value that needs a drop but is not moved anywhere (a temporary, NMove 2) is dropped at
+// the end of its statement. Dropping calls the type's `Drop`, then drops the fields that
+// need it, in declaration order.
+
+// The drop flag of local s, or 0.
+u32 DropFlag(*Lower l, u32 s) {
+    unsafe {
+        if (VecLen(&l.DropFlags) <= s as usize) return 0;
+        return MemLoadU32(VecAt(&l.DropFlags, s as usize));
+    }
+}
+
+// Starts tracking local s (just initialized when init is true) if its type needs a drop.
+void TrackDrop(*Lower l, u32 s, u32 t, bool init, u32 tok) {
+    *Checker c = LC(l);
+    if (!NeedsDrop(c, t)) return;
+    if (TyKind(c, t) == TYK_ARRAY) CNotCore(c, "arrays of values with a drop; use `List<T>`", tok);
+    u32 flag = LSlot(l, ET_BOOL);
+    u64 v = 0;
+    if (init) v = 1;
+    LStore(l, ET_BOOL, LConst(l, ET_BOOL, v), flag);
+    unsafe {
+        while (VecLen(&l.DropFlags) <= s as usize) MemStoreU32(VecPush(&l.DropFlags), 0);
+        MemStoreU32(VecAt(&l.DropFlags, s as usize), flag);
+        MemStoreU32(VecPush(&l.Drops), s);
+        MemStoreU32(VecPush(&l.FlagSyms), s);
+    }
+}
+
+// Sets (or clears) local s's drop flag, if it has one.
+void SetDropFlag(*Lower l, u32 s, bool live) {
+    u32 flag = DropFlag(l, s);
+    if (flag == 0) return;
+    u64 v = 0;
+    if (live) v = 1;
+    LStore(l, ET_BOOL, LConst(l, ET_BOOL, v), flag);
+}
+
+// A new function: no local has a drop flag yet. (Flags are kept per symbol, and one
+// generic body is lowered once per instance, so the last instance's must go.)
+void ResetDropFlags(*Lower l) {
+    unsafe {
+        for (usize i = 0; i < VecLen(&l.FlagSyms); i++) MemStoreU32(VecAt(&l.DropFlags, MemLoadU32(VecAt(&l.FlagSyms, i)) as usize), 0);
+        VecClear(&l.FlagSyms);
+        VecClear(&l.Drops);
+        VecClear(&l.KeptTemps);
+    }
+}
+
+// [own.temp.1] A local whose type can hold a view (str, a slice, a struct holding one) may
+// borrow from a temporary of its initializer (`str s = Make().AsStr();`): the statement's temporaries then live until the
+// end of the local's block, dropped with its locals. In Drops such a temporary is its
+// index in KeptTemps with the top bit set.
+void KeepTemps(*Lower l, u32 t, bool always) {
+    *Checker c = LC(l);
+    if (!always && !HoldsBorrow(c, t)) return;
+    unsafe {
+        usize n = VecLen(&l.Temps);
+        for (usize i = 0; i + 1 < n; i += 2) {
+            u32 at = (VecLen(&l.KeptTemps) / 2) as u32;
+            MemStoreU32(VecPush(&l.KeptTemps), MemLoadU32(VecAt(&l.Temps, i)));
+            MemStoreU32(VecPush(&l.KeptTemps), MemLoadU32(VecAt(&l.Temps, i + 1)));
+            MemStoreU32(VecPush(&l.Drops), at | 0x80000000);
+        }
+        VecClear(&l.Temps);
+    }
+}
+
+usize DropMark(*Lower l) {
+    unsafe { return VecLen(&l.Drops); }
+}
+
+// Drops the tracked locals from mark up, newest first, each if its flag is set. keep:
+// they stay tracked (a `break` or `return` leaves them on other paths).
+void DropDownTo(*Lower l, usize mark, bool keep) {
+    unsafe {
+        usize i = VecLen(&l.Drops);
+        while (i > mark) {
+            i--;
+            if (l.Block == 0) break;        // nothing more runs on this path
+            u32 s = MemLoadU32(VecAt(&l.Drops, i));
+            if (s & 0x80000000 != 0) {
+                usize at = ((s & 0x7FFFFFFF) * 2) as usize;
+                DropValue(l, MemLoadU32(VecAt(&l.KeptTemps, at)), MemLoadU32(VecAt(&l.KeptTemps, at + 1)));
+            } else {
+                DropLocal(l, s);
+            }
+        }
+        if (!keep) VecTruncate(&l.Drops, mark);
+    }
+}
+
+void DropLocal(*Lower l, u32 s) {
+    *Checker c = LC(l);
+    u32 flag = DropFlag(l, s);
+    u32 yes = LNewBlock(l);
+    u32 join = LNewBlock(l);
+    LCondBr(l, LLoad(l, ET_BOOL, flag), yes, join);
+    LStart(l, yes);
+    LStore(l, ET_BOOL, LConst(l, ET_BOOL, 0), flag);
+    DropValue(l, LSubst(l, SymGet(c, s).Type), SymSlot(l, s));
+    LBr(l, join);
+    LStart(l, join);
+}
+
+// Drops the value of concrete type t at address p: its own `Drop`, then its fields.
+void DropValue(*Lower l, u32 t, u32 p) {
+    *Checker c = LC(l);
+    if (!NeedsDrop(c, t)) return;
+    Type ty = TypeGet(c, t);
+    if (HasDropImpl(c, t)) {
+        u32 s;
+        u32 env;
+        u32 n;
+        unsafe { DropMethod(c, t, &s, &env, &n); }
+        Vec args = VecNew(4, 1);
+        unsafe {
+            MemStoreU32(VecPush(&args), p);
+            EmitCall(l, InstFunc(l, InstGet(c, s, env, n, 0, 0)), &args, 0);
+        }
+    }
+    if (ty.Kind == TYK_UNION) {
+        DropPayload(l, t, p);
+        return;
+    }
+    u32 et = LType(l, t);
+    u32 f = CNode(c, SymGet(c, ty.Sym).Node).A;
+    u32 i = 0;
+    while (f != 0) {
+        u32 ft = FieldType(c, t, f);
+        if (NeedsDrop(c, ft)) DropValue(l, ft, LField(l, et, p, i));
+        i++;
+        f = CNode(c, f).Next;
+    }
+}
+
+// The `Drop` method type t implements, with its environment.
+void DropMethod(*Checker c, u32 t, *u32 s, *u32 env, *u32 n) {
+    u32 drop;
+    unsafe { drop = c.DropSym; }
+    u32 r = FindImpl(c, t, SymGet(c, drop).Type);
+    ImplRec rec = ImplGet(c, r - 1);
+    u32 m = rec.Methods;
+    while (m != 0) {
+        if (StrEq(TokText(c, NTok(c, m)), "Drop")) break;
+        m = CNode(c, m).Next;
+    }
+    Type ty = TypeGet(c, t);
+    unsafe {
+        *s = NSym(c, m);
+        *env = 0;
+        *n = 0;
+        if (rec.NParams > 0) {
+            *env = ty.Args;
+            *n = ty.NArgs;
+        }
+    }
+}
+
+// A temporary that needs a drop at the end of the statement (NMove 2), of type t at p.
+void TrackTemp(*Lower l, u32 n, u32 t, u32 p) {
+    *Checker c = LC(l);
+    bool temp;
+    unsafe { temp = *VecAt(&c.NMove, n as usize) == 2; }
+    if (!temp || !NeedsDrop(c, t)) return;
+    unsafe {
+        MemStoreU32(VecPush(&l.Temps), t);
+        MemStoreU32(VecPush(&l.Temps), p);
+    }
+}
+
+// Drops the statement's temporaries, newest first.
+void DropTemps(*Lower l) {
+    DropTempsOnPath(l);
+    unsafe { VecClear(&l.Temps); }
+}
+
+// The same on one path out of the statement (an early `return` from `?`): the other paths
+// still have them.
+void DropTempsOnPath(*Lower l) {
+    unsafe {
+        usize i = VecLen(&l.Temps);
+        while (i >= 2) {
+            i -= 2;
+            if (l.Block != 0) DropValue(l, MemLoadU32(VecAt(&l.Temps, i)), MemLoadU32(VecAt(&l.Temps, i + 1)));
+        }
+    }
+}
+
+// The EIR function of instance i, declared on first use (lowering may need instances
+// the checker did not list, such as `Drop` methods).
+u32 InstFunc(*Lower l, u32 i) {
+    *Checker c = LC(l);
+    unsafe {
+        if (!InstAt(c, i).Declared) DeclareInst(l, i);
+    }
+    return InstAt(c, i).Func;
+}

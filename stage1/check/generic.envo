@@ -1,0 +1,875 @@
+// Envo-S1 generics, methods and interfaces (docs/architecture/stage1.md, "Generics and
+// methods"): type parameters and generic instances, substitution and inference, method
+// tables, interface implementations, and the instantiation pass that lists every function
+// body to compile with its type arguments (monomorphization, PLAN D13).
+//
+// A generic item has an environment: a list of type arguments, the owner's first (the
+// struct, impl or interface a method belongs to), then the item's own. A type parameter's
+// symbol holds its index in that list, so substitution is positional. An interface's
+// methods have the implementing type at index 0 ("This"), then the interface's parameters.
+
+struct ImplRec {
+    u32 Target;     // the implementing type, in the impl's generic form
+    u32 Iface;      // the interface type, in the same form
+    u32 Node;       // the impl (or struct) node, for errors
+    u32 Methods;    // first method node
+    u32 NParams;    // the impl's type parameters (the target's arguments, in order)
+}
+
+struct Inst {
+    u32 Sym;        // the function
+    u32 Env;        // its first type argument in Checker.TypeArgs
+    u32 NEnv;
+    u32 Depth;      // instantiation depth (E0350 past MAX_INST_DEPTH)
+    u32 Func;       // its EIR function (set by lowering)
+    bool Declared;  // Func is set
+}
+
+const u32 MAX_INST_DEPTH = 64;
+
+// ------------------------------------------------------------------ environments
+
+u32 EnvGet(*Checker c, u32 first, u32 i) {
+    unsafe { return MemLoadU32(VecAt(&c.TypeArgs, (first + i) as usize)); }
+}
+
+void EnvSet(*Checker c, u32 first, u32 i, u32 t) {
+    unsafe { MemStoreU32(VecAt(&c.TypeArgs, (first + i) as usize), t); }
+}
+
+// n zeroed entries; the first one's index (0 if n is 0).
+u32 EnvNew(*Checker c, u32 n) {
+    if (n == 0) return 0;
+    unsafe {
+        u32 first = VecLen(&c.TypeArgs) as u32;
+        for (u32 i = 0; i < n; i++) MemStoreU32(VecPush(&c.TypeArgs), 0);
+        return first;
+    }
+}
+
+u32 ListCount(*Checker c, u32 first) {
+    u32 n = 0;
+    while (first != 0) {
+        n++;
+        first = CNode(c, first).Next;
+    }
+    return n;
+}
+
+// ------------------------------------------------------------------ types
+
+// The interned instance of generic struct or interface s with the n arguments at first.
+u32 TypeInstance(*Checker c, u8 kind, u32 s, u32 first, u32 n) {
+    Buf key = BufNew(32);
+    unsafe {
+        BufU64(&key, kind as u64);
+        BufByte(&key, ':');
+        BufU64(&key, s as u64);
+        for (u32 i = 0; i < n; i++) {
+            BufByte(&key, ',');
+            BufU64(&key, EnvGet(c, first, i) as u64);
+        }
+        u64 found;
+        if (MapGet(&c.Instances, BufView(&key), &found)) return found as u32;
+        u32 args = EnvNew(c, n);
+        for (u32 i = 0; i < n; i++) EnvSet(c, args, i, EnvGet(c, first, i));
+        u32 t = TypeNew(c, kind);
+        *Type ty = TypePtr(c, t);
+        ty.Sym = s;
+        ty.Name = SymGet(c, s).Name;
+        ty.Args = args;
+        ty.NArgs = n;
+        MapPut(&c.Instances, BufCopy(&key), t as u64);
+        return t;
+    }
+}
+
+// Does type t mention a type parameter?
+bool HasParams(*Checker c, u32 t) {
+    if (t == 0) return false;
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_PARAM) return true;
+    if (ty.Kind == TYK_PTR || ty.Kind == TYK_SLICE || ty.Kind == TYK_ARRAY) return HasParams(c, ty.Elem);
+    if (ty.Kind == TYK_FN && HasParams(c, ty.Elem)) return true;
+    for (u32 i = 0; i < ty.NArgs; i++) {
+        if (HasParams(c, EnvGet(c, ty.Args, i))) return true;
+    }
+    return false;
+}
+
+// t with every type parameter replaced by its entry in the environment (env, n).
+u32 Subst(*Checker c, u32 t, u32 env, u32 n) {
+    if (n == 0 || !HasParams(c, t)) return t;
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_PARAM) {
+        u32 i = SymGet(c, ty.Sym).Value as u32;
+        if (i < n) {
+            u32 r = EnvGet(c, env, i);
+            if (r != 0) return r;
+        }
+        return t;
+    }
+    if (ty.Kind == TYK_PTR || ty.Kind == TYK_SLICE || ty.Kind == TYK_ARRAY) {
+        return TypeDerived(c, ty.Kind, Subst(c, ty.Elem, env, n), ty.Count);
+    }
+    if (ty.Kind == TYK_FN) return FnTypeSubst(c, t, env, n);
+    u32 args = EnvNew(c, ty.NArgs);
+    for (u32 i = 0; i < ty.NArgs; i++) EnvSet(c, args, i, Subst(c, EnvGet(c, ty.Args, i), env, n));
+    return TypeInstance(c, ty.Kind, ty.Sym, args, ty.NArgs);
+}
+
+// Binds the parameters in declared type pt that are still unknown in (env, n) by matching
+// it against the argument type at ([s1.expr.7] inference). Mismatches are reported later.
+void Unify(*Checker c, u32 pt, u32 at, u32 env, u32 n) {
+    if (pt == 0 || at == 0) return;
+    Type p = TypeGet(c, pt);
+    if (p.Kind == TYK_PARAM) {
+        u32 i = SymGet(c, p.Sym).Value as u32;
+        if (i < n && EnvGet(c, env, i) == 0) EnvSet(c, env, i, at);
+        return;
+    }
+    Type a = TypeGet(c, at);
+    if (p.Kind != a.Kind) return;
+    if (p.Kind == TYK_PTR || p.Kind == TYK_SLICE || p.Kind == TYK_ARRAY) {
+        Unify(c, p.Elem, a.Elem, env, n);
+        return;
+    }
+    if (p.Kind == TYK_FN) {
+        if (p.NArgs != a.NArgs) return;
+        Unify(c, p.Elem, a.Elem, env, n);
+    } else if (p.Sym != a.Sym || p.NArgs != a.NArgs) return;
+    for (u32 i = 0; i < p.NArgs; i++) Unify(c, EnvGet(c, p.Args, i), EnvGet(c, a.Args, i), env, n);
+}
+
+// Does pt mention a parameter that (env, n) has not bound yet?
+bool Unbound(*Checker c, u32 pt, u32 env, u32 n) {
+    if (pt == 0) return false;
+    Type p = TypeGet(c, pt);
+    if (p.Kind == TYK_PARAM) {
+        u32 i = SymGet(c, p.Sym).Value as u32;
+        return i < n && EnvGet(c, env, i) == 0;
+    }
+    if (p.Kind == TYK_PTR || p.Kind == TYK_SLICE || p.Kind == TYK_ARRAY) return Unbound(c, p.Elem, env, n);
+    if (p.Kind == TYK_FN && Unbound(c, p.Elem, env, n)) return true;
+    for (u32 i = 0; i < p.NArgs; i++) {
+        if (Unbound(c, EnvGet(c, p.Args, i), env, n)) return true;
+    }
+    return false;
+}
+
+// The type of field node f of struct type t (an instance's arguments substituted).
+u32 FieldType(*Checker c, u32 t, u32 f) {
+    Type ty = TypeGet(c, t);
+    return Subst(c, NType(c, f), ty.Args, ty.NArgs);
+}
+
+// Interface symbol s applied to the n arguments at first.
+u32 IfaceTypeOf(*Checker c, u32 s, u32 first, u32 n) {
+    if (n == 0) return SymGet(c, s).Type;
+    return TypeInstance(c, TYK_IFACE, s, first, n);
+}
+
+// ------------------------------------------------------------------ type parameters
+
+// Declares the type parameters in the list starting at first, with environment indexes
+// from start. Returns how many there are.
+u32 DeclareTParams(*Checker c, u32 first, u32 start) {
+    u32 n = 0;
+    u32 p = first;
+    while (p != 0) {
+        CheckDuplicateInList(c, first, p);
+        u32 s = SymNew(c, SK_TPARAM, p);
+        u32 t = TypeNew(c, TYK_PARAM);
+        unsafe {
+            *Type ty = TypePtr(c, t);
+            ty.Sym = s;
+            ty.Name = SymGet(c, s).Name;
+            *Sym sym = SymPtr(c, s);
+            sym.Value = (start + n) as u64;
+            sym.Type = t;
+        }
+        SetNSym(c, p, s);
+        n++;
+        p = CNode(c, p).Next;
+    }
+    return n;
+}
+
+// The type parameter visible under token tok's name, or 0.
+u32 FindTParam(*Checker c, u32 tok) {
+    u32 lists;
+    unsafe { lists = c.Scope2; }
+    u32 p = lists;
+    while (p != 0) {
+        if (SameName(c, NTok(c, p), tok)) return NSym(c, p);
+        p = CNode(c, p).Next;
+    }
+    unsafe { p = c.Scope1; }
+    while (p != 0) {
+        if (SameName(c, NTok(c, p), tok)) return NSym(c, p);
+        p = CNode(c, p).Next;
+    }
+    return 0;
+}
+
+// The type made of the n parameters of a generic item (its own generic form).
+u32 SelfInstance(*Checker c, u8 kind, u32 s, u32 first, u32 n) {
+    u32 env = EnvNew(c, n);
+    u32 p = first;
+    for (u32 i = 0; i < n; i++) {
+        EnvSet(c, env, i, SymGet(c, NSym(c, p)).Type);
+        p = CNode(c, p).Next;
+    }
+    return TypeInstance(c, kind, s, env, n);
+}
+
+// E0338 at tok.
+void TypeArgCount(*Checker c, u32 tok, u32 want, u32 have) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "wrong number of type arguments: expected ");
+        BufU64(&b, want as u64);
+        BufStr(&b, ", found ");
+        BufU64(&b, have as u64);
+        CFail(c, tok, E_TYPE_ARG_COUNT, BufView(&b));
+    }
+}
+
+// ------------------------------------------------------------------ methods
+
+void BufOwnerKey(*Buf b, *Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_STRUCT || ty.Kind == TYK_ENUM || ty.Kind == TYK_UNION) {
+        BufByte(b, 's');
+        BufU64(b, ty.Sym as u64);
+        return;
+    }
+    BufByte(b, 't');
+    BufU64(b, t as u64);
+}
+
+// The method of type t named by token tok: its symbol | (impl index + 1) << 32, or 0.
+u64 MethodFind(*Checker c, u32 t, u32 tok) {
+    Buf key = BufNew(32);
+    u64 v = 0;
+    unsafe {
+        BufOwnerKey(&key, c, t);
+        BufByte(&key, '.');
+        BufStr(&key, TokText(c, tok));
+        if (!MapGet(&c.Methods, BufView(&key), &v)) return 0;
+    }
+    return v;
+}
+
+// Adds a method to type t's table (E0201 if the name is taken).
+void MethodAdd(*Checker c, u32 t, u32 tok, u64 v) {
+    if (MethodFind(c, t, tok) != 0) CFailName(c, tok, E_DUPLICATE, "`", tok, "` is already defined");
+    Buf key = BufNew(32);
+    unsafe {
+        BufOwnerKey(&key, c, t);
+        BufByte(&key, '.');
+        BufStr(&key, TokText(c, tok));
+        MapPut(&c.Methods, BufCopy(&key), v);
+    }
+}
+
+// The method of interface symbol s named by token tok, or 0.
+u32 IfaceMethodNamed(*Checker c, u32 s, u32 tok) {
+    u32 m = CNode(c, SymGet(c, s).Node).A;
+    while (m != 0) {
+        if (SameName(c, NTok(c, m), tok)) return NSym(c, m);
+        m = CNode(c, m).Next;
+    }
+    return 0;
+}
+
+// The method node named by token tok in the list starting at first, or 0.
+u32 MethodNodeNamed(*Checker c, u32 first, u32 tok) {
+    u32 m = first;
+    while (m != 0) {
+        if (SameName(c, NTok(c, m), tok)) return m;
+        m = CNode(c, m).Next;
+    }
+    return 0;
+}
+
+// Is node p a `this` receiver parameter?
+bool IsReceiver(*Checker c, u32 p) {
+    return CTok(c, NTok(c, p)).Kind == TK_KW_THIS;
+}
+
+// The first ordinary (non-receiver) parameter node of function symbol s.
+u32 FirstParam(*Checker c, u32 s) {
+    u32 p = CNode(c, SymGet(c, s).Node).B;
+    if (p != 0 && IsReceiver(c, p)) p = CNode(c, p).Next;
+    return p;
+}
+
+// Declares method node m of an owner: its symbol, type parameters, receiver and
+// signature. ownerTP is the owner's type parameter list, nOwn its length (1 + the
+// interface's parameters for an interface).
+u32 DeclareMethod(*Checker c, u32 m, u32 ownerType, u32 ownerTP, u32 nOwn, u32 iface) {
+    u32 s = SymNew(c, SK_FN, m);
+    SetNSym(c, m, s);
+    Node fn = CNode(c, m);
+    u32 flags = SF_METHOD;
+    if (fn.Flags & NF_STATIC != 0) flags = flags | SF_STATIC;
+    if (iface != 0 && fn.E != 0) CNotCore(c, "generic methods in an interface", NTok(c, fn.E));
+    u32 own = DeclareTParams(c, fn.E, nOwn);
+    u32 p = fn.B;
+    if (p != 0 && IsReceiver(c, p)) {
+        if (flags & SF_STATIC != 0) CError(c, E_BAD_THIS, NTok(c, p));
+        u32 mode = CNode(c, p).Flags;
+        if (mode & NF_REF != 0) flags = flags | SF_RECV_REF;
+        else if (mode & NF_IN != 0) flags = flags | SF_RECV_IN;
+    } else if (flags & SF_STATIC == 0) {
+        flags = flags | SF_RECV_IN;     // [item.method.1] no receiver: `in this`
+    }
+    if (nOwn + own > 0) flags = flags | SF_GENERIC;
+    unsafe {
+        *Sym sym = SymPtr(c, s);
+        sym.Flags = flags;
+        sym.NEnv = nOwn + own;
+        sym.NOwn = nOwn;
+        sym.OwnerTP = ownerTP;
+        sym.OwnerType = ownerType;
+        sym.Iface = iface;
+    }
+    FnSignature(c, s);
+    return s;
+}
+
+// A struct's methods (in its body) and the interfaces it lists after `:`.
+void DeclareStructMethods(*Checker c, u32 s) {
+    Sym sym = SymGet(c, s);
+    Node st = CNode(c, sym.Node);
+    u32 m = st.G;
+    while (m != 0) {
+        u32 ms = DeclareMethod(c, m, sym.Type, st.E, sym.NEnv, 0);
+        MethodAdd(c, sym.Type, NTok(c, m), ms as u64);
+        m = CNode(c, m).Next;
+    }
+    u32 b = st.F;
+    while (b != 0) {
+        u32 it = ResolveIfaceIn(c, b, st.E);
+        AddImpl(c, sym.Type, it, sym.Node, st.G, sym.NEnv);
+        b = CNode(c, b).Next;
+    }
+}
+
+// An interface type node b, resolved with the type parameters in list tps visible.
+u32 ResolveIfaceIn(*Checker c, u32 b, u32 tps) {
+    u32 s1;
+    u32 s2;
+    unsafe {
+        s1 = c.Scope1;
+        s2 = c.Scope2;
+        c.Scope1 = tps;
+        c.Scope2 = 0;
+    }
+    u32 it = ResolveIface(c, b);
+    unsafe {
+        c.Scope1 = s1;
+        c.Scope2 = s2;
+    }
+    return it;
+}
+
+// A type node that must name an interface (E0336).
+u32 ResolveIface(*Checker c, u32 n) {
+    u32 t = ResolveTypeEx(c, n, false, true);
+    if (TyKind(c, t) != TYK_IFACE) {
+        Buf b = BufNew(48);
+        unsafe {
+            BufByte(&b, '`');
+            BufType(&b, c, t);
+            BufStr(&b, "` is not an interface");
+            CFail(c, NTok(c, n), E_NOT_AN_IFACE, BufView(&b));
+        }
+    }
+    return t;
+}
+
+void AddImpl(*Checker c, u32 target, u32 it, u32 node, u32 methods, u32 nparams) {
+    u32 copy;
+    unsafe { copy = c.CopySym; }
+    if (copy != 0 && TypeGet(c, it).Sym == copy) CFail(c, NTok(c, node), E_NOT_AN_IFACE, "`Copy` is implemented automatically; it cannot be implemented by hand");
+    if (FindImpl(c, target, it) != 0) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufByte(&b, '`');
+            BufType(&b, c, it);
+            BufStr(&b, "` is already implemented for `");
+            BufType(&b, c, target);
+            BufByte(&b, '`');
+            CFail(c, NTok(c, node), E_DUPLICATE, BufView(&b));
+        }
+    }
+    unsafe {
+        *ImplRec r = VecPush(&c.Impls) as *ImplRec;
+        r.Target = target;
+        r.Iface = it;
+        r.Node = node;
+        r.Methods = methods;
+        r.NParams = nparams;
+    }
+}
+
+ImplRec ImplGet(*Checker c, u32 i) {
+    unsafe { return *(VecAt(&c.Impls, i as usize) as *ImplRec); }
+}
+
+// An interface: the parameter for the implementing type, its own parameters, its methods.
+void DeclareIfaceItem(*Checker c, u32 s) {
+    Node it = CNode(c, SymGet(c, s).Node);
+    // "This", the implementing type, is index 0 of every method's environment
+    u32 self = SymNew(c, SK_TPARAM, 0);
+    u32 st = TypeNew(c, TYK_PARAM);
+    unsafe {
+        *Type ty = TypePtr(c, st);
+        ty.Sym = self;
+        ty.Name = "This";
+        *Sym p = SymPtr(c, self);
+        p.Name = "This";
+        p.Type = st;
+    }
+    u32 n = DeclareTParams(c, it.E, 1);
+    unsafe {
+        *Sym sym = SymPtr(c, s);
+        sym.NEnv = n;
+        sym.OwnerType = st;
+        if (n == 0) sym.Type = TypeNamed(c, TYK_IFACE, s);
+        else sym.Type = SelfInstance(c, TYK_IFACE, s, it.E, n);
+    }
+}
+
+void DeclareIfaceMethods(*Checker c, u32 s) {
+    Sym sym = SymGet(c, s);
+    Node it = CNode(c, sym.Node);
+    u32 m = it.A;
+    while (m != 0) {
+        CheckDuplicateInList(c, it.A, m);
+        DeclareMethod(c, m, sym.OwnerType, it.E, sym.NEnv + 1, s);
+        m = CNode(c, m).Next;
+    }
+}
+
+// impl [<T…>] [I for] Type { methods }   ([item.impl.1], [s1.item.4], [s1.item.5])
+void DeclareImpl(*Checker c, u32 n) {
+    Node im = CNode(c, n);
+    u32 count = DeclareTParams(c, im.E, 0);
+    u32 target = 0;
+    u32 it = 0;
+    unsafe {
+        c.Scope1 = im.E;
+        c.Scope2 = 0;
+    }
+    target = ResolveType(c, im.A, false);
+    if (im.B != 0) it = ResolveIface(c, im.B);
+    unsafe { c.Scope1 = 0; }
+    Type tt = TypeGet(c, target);
+    if (count > 0) {
+        // impl<T, U> applies to S<T, U> exactly
+        bool exact = (tt.Kind == TYK_STRUCT || tt.Kind == TYK_UNION) && tt.NArgs == count;
+        u32 p = im.E;
+        for (u32 i = 0; exact && i < count; i++) {
+            if (EnvGet(c, tt.Args, i) != SymGet(c, NSym(c, p)).Type) exact = false;
+            p = CNode(c, p).Next;
+        }
+        if (!exact) CNotCore(c, "an `impl` for some instances of a generic type; its type parameters must be exactly the type's", NTok(c, im.A));
+    } else if (tt.NArgs > 0) {
+        CNotCore(c, "an `impl` for one instance of a generic type", NTok(c, im.A));
+    }
+    if (it != 0) AddImpl(c, target, it, n, im.C, count);
+    u32 m = im.C;
+    while (m != 0) {
+        u32 ms = DeclareMethod(c, m, target, im.E, count, 0);
+        MethodAdd(c, target, NTok(c, m), ms as u64);
+        m = CNode(c, m).Next;
+    }
+}
+
+// [item.iface.1] every implementation provides each method of its interface with the
+// same signature (or inherits a default body), and nothing else.
+void CheckImpls(*Checker c) {
+    u32 count;
+    unsafe { count = VecLen(&c.Impls) as u32; }
+    for (u32 i = 0; i < count; i++) CheckImpl(c, i);
+}
+
+void CheckImpl(*Checker c, u32 i) {
+    ImplRec r = ImplGet(c, i);
+    Type it = TypeGet(c, r.Iface);
+    u32 isym = it.Sym;
+    // the interface's environment for this implementation: [target, interface arguments…]
+    u32 n = 1 + it.NArgs;
+    u32 env = EnvNew(c, n);
+    EnvSet(c, env, 0, r.Target);
+    for (u32 k = 0; k < it.NArgs; k++) EnvSet(c, env, k + 1, EnvGet(c, it.Args, k));
+    u32 im = CNode(c, SymGet(c, isym).Node).A;
+    while (im != 0) {
+        u32 ims = NSym(c, im);
+        u32 f = MethodNodeNamed(c, r.Methods, NTok(c, im));
+        if (f == 0) {
+            if (CNode(c, im).C == 0) {
+                Buf b = BufNew(64);
+                unsafe {
+                    BufByte(&b, '`');
+                    BufType(&b, c, r.Target);
+                    BufStr(&b, "` does not implement `");
+                    BufStr(&b, TokText(c, NTok(c, im)));
+                    BufStr(&b, "` from `");
+                    BufType(&b, c, r.Iface);
+                    BufByte(&b, '`');
+                    CFail(c, NTok(c, r.Node), E_MISSING_METHOD, BufView(&b));
+                }
+            }
+            // the default body serves this type
+            if (MethodFind(c, r.Target, NTok(c, im)) == 0) MethodAdd(c, r.Target, NTok(c, im), ims as u64 | ((i + 1) as u64) << 32);
+        } else if (!SameSignature(c, ims, env, n, NSym(c, f))) {
+            Buf b = BufNew(64);
+            unsafe {
+                BufStr(&b, "method `");
+                BufStr(&b, TokText(c, NTok(c, f)));
+                BufStr(&b, "` does not match its declaration in `");
+                BufType(&b, c, r.Iface);
+                BufByte(&b, '`');
+                CFail(c, NTok(c, f), E_METHOD_MISMATCH, BufView(&b));
+            }
+        }
+        im = CNode(c, im).Next;
+    }
+    // an interface implementation holds only the interface's methods (a struct body may
+    // also have its own)
+    if (NKind(c, r.Node) != NK_IMPL) return;
+    u32 f = r.Methods;
+    while (f != 0) {
+        if (IfaceMethodNamed(c, isym, NTok(c, f)) == 0) {
+            Buf b = BufNew(64);
+            unsafe {
+                BufByte(&b, '`');
+                BufStr(&b, TokText(c, NTok(c, f)));
+                BufStr(&b, "` is not a method of `");
+                BufType(&b, c, r.Iface);
+                BufByte(&b, '`');
+                CFail(c, NTok(c, f), E_NOT_IN_IFACE, BufView(&b));
+            }
+        }
+        f = CNode(c, f).Next;
+    }
+}
+
+// Does method fs have interface method ims's signature, under the interface environment?
+bool SameSignature(*Checker c, u32 ims, u32 env, u32 n, u32 fs) {
+    Sym a = SymGet(c, ims);
+    Sym b = SymGet(c, fs);
+    u32 kinds = SF_STATIC | SF_RECV_IN | SF_RECV_REF;
+    if (a.Flags & kinds != b.Flags & kinds) return false;
+    if (b.NEnv != b.NOwn || a.Aux != b.Aux) return false;
+    if (Subst(c, a.Type, env, n) != b.Type) return false;
+    u32 pa = FirstParam(c, ims);
+    u32 pb = FirstParam(c, fs);
+    for (u32 i = 0; i < a.Aux; i++) {
+        if (Subst(c, ParamType(c, ims, i), env, n) != ParamType(c, fs, i)) return false;
+        u32 modes = NF_IN | NF_REF;
+        if (CNode(c, pa).Flags & modes != CNode(c, pb).Flags & modes) return false;
+        pa = CNode(c, pa).Next;
+        pb = CNode(c, pb).Next;
+    }
+    return true;
+}
+
+// ------------------------------------------------------------------ bounds
+
+// The impl index + 1 of interface type it for type t, or 0.
+u32 FindImpl(*Checker c, u32 t, u32 it) {
+    Type ty = TypeGet(c, t);
+    u32 isym = TypeGet(c, it).Sym;
+    u32 count;
+    unsafe { count = VecLen(&c.Impls) as u32; }
+    for (u32 i = 0; i < count; i++) {
+        ImplRec r = ImplGet(c, i);
+        if (TypeGet(c, r.Iface).Sym != isym) continue;
+        u32 env = 0;
+        u32 n = 0;
+        if (r.NParams == 0) {
+            if (r.Target != t) continue;
+        } else {
+            Type rt = TypeGet(c, r.Target);
+            if ((ty.Kind != TYK_STRUCT && ty.Kind != TYK_UNION) || ty.Sym != rt.Sym || ty.NArgs != r.NParams) continue;
+            env = ty.Args;
+            n = ty.NArgs;
+        }
+        if (Subst(c, r.Iface, env, n) == it) return i + 1;
+    }
+    return 0;
+}
+
+// Does type t implement interface type it here? A type parameter does through the
+// current function's bounds ([type.gen.2]); other types through an implementation.
+bool Implements(*Checker c, u32 t, u32 it) {
+    u32 copy;
+    unsafe { copy = c.CopySym; }
+    if (TyKind(c, t) != TYK_PARAM && copy != 0 && TypeGet(c, it).Sym == copy) return IsCopy(c, t);
+    if (TyKind(c, t) != TYK_PARAM) return FindImpl(c, t, it) != 0;
+    u32 first;
+    u32 n;
+    unsafe {
+        first = c.CurBounds;
+        n = c.NCurBounds;
+    }
+    for (u32 i = 0; i < n; i++) {
+        if (BoundAt(c, first + i, 0) == t && BoundAt(c, first + i, 1) == it) return true;
+    }
+    return false;
+}
+
+// Pair i of Checker.Bounds: k 0 is the parameter type, k 1 the interface type.
+u32 BoundAt(*Checker c, u32 i, u32 k) {
+    unsafe { return MemLoadU32(VecAt(&c.Bounds, (i * 2 + k) as usize)); }
+}
+
+// The interface method named by tok that a bound of parameter type t provides, and in
+// *bound the bound's interface type; 0 if there is none.
+u32 BoundMethod(*Checker c, u32 t, u32 tok, *u32 bound) {
+    u32 first;
+    u32 n;
+    unsafe {
+        first = c.CurBounds;
+        n = c.NCurBounds;
+    }
+    for (u32 i = 0; i < n; i++) {
+        if (BoundAt(c, first + i, 0) != t) continue;
+        u32 it = BoundAt(c, first + i, 1);
+        u32 m = IfaceMethodNamed(c, TypeGet(c, it).Sym, tok);
+        if (m != 0) {
+            unsafe { *bound = it; }
+            return m;
+        }
+    }
+    return 0;
+}
+
+// E0334 "`T` does not implement `I`" at tok.
+void NotImplemented(*Checker c, u32 tok, u32 t, u32 it) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufByte(&b, '`');
+        BufType(&b, c, t);
+        BufStr(&b, "` does not implement `");
+        BufType(&b, c, it);
+        BufByte(&b, '`');
+        CFail(c, tok, E_NOT_IMPLEMENTED, BufView(&b));
+    }
+}
+
+// ------------------------------------------------------------------ instantiation
+
+// Records a call that needs an instance (a generic function or a method), for
+// CollectInstances.
+void RecordCall(*Checker c, u32 call) {
+    unsafe {
+        if (c.CurFn == 0) MemStoreU32(VecPush(&c.MainCalls), call);
+        else MemStoreU32(VecPush(&c.Calls), call);
+    }
+}
+
+// Does a call to function symbol s need an instance?
+bool NeedsInst(*Checker c, u32 s) {
+    return SymGet(c, s).Flags & (SF_METHOD | SF_GENERIC) != 0;
+}
+
+// The function and the concrete environment a checked call runs when the body holding it
+// is compiled with environment (env, n): the recorded arguments substituted, and an
+// interface method resolved to its implementation.
+void CallTarget(*Checker c, u32 call, u32 env, u32 n, *u32 rs, *u32 renv, *u32 rn) {
+    u32 s = NSym(c, call);
+    u64 v = NValue(c, call);
+    u32 cf = (v & 0xFFFFFFFF) as u32;
+    u32 cn = (v >> 32) as u32;
+    u32 e = EnvNew(c, cn);
+    for (u32 i = 0; i < cn; i++) EnvSet(c, e, i, Subst(c, EnvGet(c, cf, i), env, n));
+    unsafe {
+        if (SymGet(c, s).Iface != 0) {
+            ResolveIfaceCall(c, s, e, cn, rs, renv, rn);
+            return;
+        }
+        *rs = s;
+        *renv = e;
+        *rn = cn;
+    }
+}
+
+// The function an interface method runs for the concrete environment [This, interface
+// arguments…]: the implementation's method, or the interface's default body.
+void ResolveIfaceCall(*Checker c, u32 m, u32 env, u32 n, *u32 rs, *u32 renv, *u32 rn) {
+    Sym ms = SymGet(c, m);
+    u32 self = EnvGet(c, env, 0);
+    u32 it = IfaceTypeOf(c, ms.Iface, env + 1, n - 1);
+    u32 r = FindImpl(c, self, it);
+    if (r == 0) Bug("checker: an interface call has no implementation");
+    ImplRec rec = ImplGet(c, r - 1);
+    u32 f = MethodNodeNamed(c, rec.Methods, NTok(c, ms.Node));
+    unsafe {
+        if (f != 0) {
+            *rs = NSym(c, f);
+            *renv = 0;
+            *rn = 0;
+            if (rec.NParams > 0) {
+                Type st = TypeGet(c, self);
+                *renv = st.Args;
+                *rn = st.NArgs;
+            }
+            return;
+        }
+        *rs = m;
+        *renv = env;
+        *rn = n;
+    }
+}
+
+// The instance of function s for environment (env, n), created on first use. depth is
+// how many generic calls led here (E0350 at blame past MAX_INST_DEPTH).
+u32 InstGet(*Checker c, u32 s, u32 env, u32 n, u32 depth, u32 blame) {
+    Buf key = BufNew(32);
+    unsafe {
+        BufU64(&key, s as u64);
+        BufByte(&key, ':');
+        for (u32 i = 0; i < n; i++) {
+            BufU64(&key, EnvGet(c, env, i) as u64);
+            BufByte(&key, ',');
+        }
+        u64 found;
+        if (MapGet(&c.InstMap, BufView(&key), &found)) return found as u32;
+        if (depth > MAX_INST_DEPTH) CError(c, E_INST_TOO_DEEP, blame);
+        u32 idx = VecLen(&c.Insts) as u32;
+        *Inst inst = VecPush(&c.Insts) as *Inst;
+        inst.Sym = s;
+        inst.Env = env;
+        inst.NEnv = n;
+        inst.Depth = depth;
+        inst.Func = 0;
+        inst.Declared = false;
+        MapPut(&c.InstMap, BufCopy(&key), idx as u64);
+        return idx;
+    }
+}
+
+Inst InstAt(*Checker c, u32 i) {
+    unsafe { return *(VecAt(&c.Insts, i as usize) as *Inst); }
+}
+
+// Every function instance the program needs, from the top-level statements and the
+// non-generic functions outward ([type.gen.1]: each instantiation is compiled separately).
+void CollectInstances(*Checker c) {
+    unsafe {
+        for (usize i = 0; i < VecLen(&c.MainCalls); i++) InstantiateCall(c, MemLoadU32(VecAt(&c.MainCalls, i)), 0, 0, 0);
+        for (u32 s = 1; s < VecLen(&c.Syms) as u32; s++) {
+            Sym sym = SymGet(c, s);
+            if (sym.Kind != SK_FN || NeedsInst(c, s)) continue;
+            for (u32 k = 0; k < sym.NCalls; k++) InstantiateCall(c, MemLoadU32(VecAt(&c.Calls, (sym.Calls + k) as usize)), 0, 0, 0);
+        }
+        usize i = 0;
+        while (i < VecLen(&c.Insts)) {
+            Inst inst = InstAt(c, i as u32);
+            Sym sym = SymGet(c, inst.Sym);
+            for (u32 k = 0; k < sym.NCalls; k++) InstantiateCall(c, MemLoadU32(VecAt(&c.Calls, (sym.Calls + k) as usize)), inst.Env, inst.NEnv, inst.Depth);
+            i++;
+        }
+    }
+}
+
+void InstantiateCall(*Checker c, u32 call, u32 env, u32 n, u32 depth) {
+    u32 s;
+    u32 e;
+    u32 k;
+    unsafe { CallTarget(c, call, env, n, &s, &e, &k); }
+    InstGet(c, s, e, k, depth + 1, NTok(c, call));
+}
+
+// ------------------------------------------------------------------ names
+
+// A type's part of an instance's name. Self-delimiting: `0.` pointer, `1.` slice,
+// `2.N.` array, then a name, and for a generic instance its argument count and arguments.
+void BufMangle(*Buf b, *Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_PTR) {
+        BufStr(b, "0.");
+        BufMangle(b, c, ty.Elem);
+        return;
+    }
+    if (ty.Kind == TYK_SLICE) {
+        BufStr(b, "1.");
+        BufMangle(b, c, ty.Elem);
+        return;
+    }
+    if (ty.Kind == TYK_ARRAY) {
+        BufStr(b, "2.");
+        BufU64(b, ty.Count as u64);
+        BufByte(b, '.');
+        BufMangle(b, c, ty.Elem);
+        return;
+    }
+    if (ty.Kind == TYK_FN) {
+        // 3.kind.count, then each parameter's mode and type, then the result
+        BufStr(b, "3.");
+        BufU64(b, ty.Count as u64);
+        BufByte(b, '.');
+        BufU64(b, ty.NArgs as u64);
+        for (u32 i = 0; i < ty.NArgs; i++) {
+            BufByte(b, '.');
+            BufU64(b, EnvGet(c, ty.Sym, i) as u64);
+            BufByte(b, '.');
+            BufMangle(b, c, EnvGet(c, ty.Args, i));
+        }
+        BufByte(b, '.');
+        BufMangle(b, c, ty.Elem);
+        return;
+    }
+    BufTypeName(b, c, t);
+    if (ty.NArgs == 0) return;
+    BufByte(b, '.');
+    BufU64(b, ty.NArgs as u64);
+    for (u32 i = 0; i < ty.NArgs; i++) {
+        BufByte(b, '.');
+        BufMangle(b, c, EnvGet(c, ty.Args, i));
+    }
+}
+
+// The name of named type t (a struct or an enum), prefixed with its namespace as items'
+// EIR names are, so types of the same name in different namespaces stay apart.
+void BufTypeName(*Buf b, *Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Sym != 0 && (ty.Kind == TYK_STRUCT || ty.Kind == TYK_ENUM || ty.Kind == TYK_UNION)) {
+        str ns = SymGet(c, ty.Sym).Ns;
+        if (ns.Len > 0) {
+            BufStr(b, ns);
+            BufByte(b, '.');
+        }
+    }
+    BufStr(b, ty.Name);
+}
+
+// The EIR name of instance i: [owner.]name, then each type argument.
+str InstName(*Checker c, u32 i) {
+    Inst inst = InstAt(c, i);
+    Sym s = SymGet(c, inst.Sym);
+    Buf b = BufNew(32);
+    unsafe {
+        if (s.Iface != 0) {
+            BufStr(&b, SymGet(c, s.Iface).Name);
+            BufByte(&b, '.');
+        } else if (s.Flags & SF_METHOD != 0) {
+            Type ot = TypeGet(c, s.OwnerType);
+            if (ot.Kind == TYK_STRUCT || ot.Kind == TYK_ENUM || ot.Kind == TYK_UNION) BufTypeName(&b, c, s.OwnerType);
+            else BufMangle(&b, c, s.OwnerType);
+            BufByte(&b, '.');
+        }
+        BufStr(&b, s.Name);
+        for (u32 k = 0; k < inst.NEnv; k++) {
+            BufByte(&b, '.');
+            BufMangle(&b, c, EnvGet(c, inst.Env, k));
+        }
+        return BufCopy(&b);
+    }
+}

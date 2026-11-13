@@ -1,0 +1,117 @@
+; =============================================================================
+; src/utf8.eas - UTF-8 validation (spec rule [lex.src.1])
+;
+; The whole source file is validated once before lexing, so the lexer can treat
+; any byte >= 0x80 as part of a well-formed sequence.
+;
+; Well-formed sequences (RFC 3629, Table 3-7 of the Unicode standard):
+;   00..7F
+;   C2..DF  80..BF
+;   E0      A0..BF  80..BF          (E0 80..9F would be overlong)
+;   E1..EC  80..BF  80..BF
+;   ED      80..9F  80..BF          (ED A0..BF would encode surrogates)
+;   EE..EF  80..BF  80..BF
+;   F0      90..BF  80..BF  80..BF  (F0 80..8F would be overlong)
+;   F1..F3  80..BF  80..BF  80..BF
+;   F4      80..8F  80..BF  80..BF  (F4 90.. would exceed U+10FFFF)
+; Everything else (80..C1 as a lead byte, F5..FF) is invalid.
+; =============================================================================
+
+; utf8_validate - find the first invalid byte.
+;   in:  rdi = pointer, rsi = length
+;   out: rax = offset of the first byte of the first invalid sequence, or -1
+;   clobbers: rcx, rdx, r8, r9
+utf8_validate:
+        xor     ecx, ecx                ; rcx = offset
+.loop:
+        cmp     rcx, rsi
+        jae     near .valid
+        movzx   eax, byte [rdi + rcx]
+        cmp     al, 0x80
+        jb      short .ascii
+        cmp     al, 0xC2
+        jb      near .bad
+        cmp     al, 0xE0
+        jb      short .two
+        cmp     al, 0xF0
+        jb      short .three
+        cmp     al, 0xF5
+        jb      near .four
+        jmp     near .bad
+.ascii:
+        inc     rcx
+        jmp     short .loop
+
+.two:
+        lea     rdx, [rcx + 1]
+        cmp     rdx, rsi
+        jae     near .bad                    ; truncated at end of file
+        movzx   edx, byte [rdi + rcx + 1]
+        and     dl, 0xC0
+        cmp     dl, 0x80
+        jne     near .bad
+        add     rcx, 2
+        jmp     short .loop
+
+.three:
+        lea     rdx, [rcx + 2]
+        cmp     rdx, rsi
+        jae     near .bad
+        movzx   edx, byte [rdi + rcx + 1]
+        mov     r8d, 0x80               ; allowed range of the second byte
+        mov     r9d, 0xBF
+        cmp     al, 0xE0
+        jne     short .three_not_e0
+        mov     r8d, 0xA0
+.three_not_e0:
+        cmp     al, 0xED
+        jne     short .three_range
+        mov     r9d, 0x9F
+.three_range:
+        cmp     edx, r8d
+        jb      near .bad
+        cmp     edx, r9d
+        ja      short .bad
+        movzx   edx, byte [rdi + rcx + 2]
+        and     dl, 0xC0
+        cmp     dl, 0x80
+        jne     short .bad
+        add     rcx, 3
+        jmp     near .loop
+
+.four:
+        lea     rdx, [rcx + 3]
+        cmp     rdx, rsi
+        jae     short .bad
+        movzx   edx, byte [rdi + rcx + 1]
+        mov     r8d, 0x80
+        mov     r9d, 0xBF
+        cmp     al, 0xF0
+        jne     short .four_not_f0
+        mov     r8d, 0x90
+.four_not_f0:
+        cmp     al, 0xF4
+        jne     short .four_range
+        mov     r9d, 0x8F
+.four_range:
+        cmp     edx, r8d
+        jb      short .bad
+        cmp     edx, r9d
+        ja      short .bad
+        movzx   edx, byte [rdi + rcx + 2]
+        and     dl, 0xC0
+        cmp     dl, 0x80
+        jne     short .bad
+        movzx   edx, byte [rdi + rcx + 3]
+        and     dl, 0xC0
+        cmp     dl, 0x80
+        jne     short .bad
+        add     rcx, 4
+        jmp     near .loop
+
+.valid:
+        mov     rax, -1
+        ret
+.bad:
+        mov     rax, rcx
+        ret

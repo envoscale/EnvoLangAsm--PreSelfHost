@@ -1,0 +1,211 @@
+// The Stage 1 runtime, part 2 for Windows: the OS layer over KERNEL32.dll, with Stage 0's
+// behaviour (bootstrap/stage0/platform/windows.eas). __wincall(k, a1, …, a10) is a target
+// intrinsic the backend encodes: it calls import k (x64/image.envo, WinImport) with the
+// Microsoft x64 convention. BOOL and DWORD results are 32 bits: only the low half of the
+// result is meaningful for them.
+
+const i64 __W_GETSTDHANDLE = 0;
+const i64 __W_GETCOMMANDLINEW = 1;
+const i64 __W_CREATEFILEW = 2;
+const i64 __W_READFILE = 3;
+const i64 __W_WRITEFILE = 4;
+const i64 __W_CLOSEHANDLE = 5;
+const i64 __W_VIRTUALALLOC = 6;
+const i64 __W_GETLASTERROR = 8;
+const i64 __W_EXITPROCESS = 9;
+const i64 __W_MULTIBYTETOWIDECHAR = 10;
+const i64 __W_WIDECHARTOMULTIBYTE = 11;
+
+static i64 __w_stdin = 0;
+static i64 __w_stdout = 0;
+static i64 __w_stderr = 0;
+
+i64 __w_ptr(*u8 p) {
+    unsafe { return p as isize as i64; }
+}
+
+i64 __w_call0(i64 k) {
+    return __wincall(k, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// The HANDLE for fd: the standard handles for 0-2, the fd itself otherwise.
+i64 __w_handle(i32 fd) {
+    unsafe {
+        if (fd == 0) return __w_stdin;
+        if (fd == 1) return __w_stdout;
+        if (fd == 2) return __w_stderr;
+    }
+    return fd as i64;
+}
+
+void __os_init(i64 sp) {
+    unsafe {
+        __w_stdin = __wincall(__W_GETSTDHANDLE, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        __w_stdout = __wincall(__W_GETSTDHANDLE, -11, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        __w_stderr = __wincall(__W_GETSTDHANDLE, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    __w_build_args();
+}
+
+// Splits the command line into UTF-8 arguments, following the Microsoft C runtime rules
+// so programs see what a C program would:
+//   - argv[0] (the program): if it starts with a quote, everything up to the next quote;
+//     otherwise everything up to a space or tab. No escapes.
+//   - other arguments are separated by spaces and tabs outside quotes;
+//   - 2n backslashes then a quote: n backslashes, and the quote toggles quoting;
+//   - 2n+1 backslashes then a quote: n backslashes and a literal quote;
+//   - backslashes not followed by a quote are literal;
+//   - inside quotes, "" is a literal quote and quoting continues.
+void __w_build_args() {
+    i64 w = __w_call0(__W_GETCOMMANDLINEW);
+    // bytes needed, including the NUL
+    i64 need = __wincall(__W_WIDECHARTOMULTIBYTE, 65001, 0, w, -1, 0, 0, 0, 0, 0, 0) as i32 as i64;
+    if (need <= 0) need = 1;
+    *u8 line = __rt_alloc(need as usize);
+    __wincall(__W_WIDECHARTOMULTIBYTE, 65001, 0, w, -1, __w_ptr(line), need, 0, 0, 0, 0);
+    usize len = __rt_cstr_len(line);
+    *str args = __rt_str_array(len + 2);
+    *u8 text = __rt_alloc(len + 1);
+    usize argc = 0;
+    usize i = 0;
+    usize pos = 0;
+    unsafe {
+        // argv[0]
+        usize start = pos;
+        if (len > 0 && line[0] == '"') {
+            i = 1;
+            while (i < len && line[i] != '"') {
+                text[pos] = line[i];
+                pos++;
+                i++;
+            }
+            if (i < len) i++;
+        } else {
+            while (i < len && line[i] != ' ' && line[i] != 9) {
+                text[pos] = line[i];
+                pos++;
+                i++;
+            }
+        }
+        args[0] = str_from(&text[start], pos - start);
+        argc = 1;
+        while (true) {
+            while (i < len && (line[i] == ' ' || line[i] == 9)) i++;
+            if (i >= len) break;
+            start = pos;
+            bool quoted = false;
+            while (i < len) {
+                u8 c = line[i];
+                if (!quoted && (c == ' ' || c == 9)) break;
+                if (c == 0x5C) {
+                    usize n = 0;
+                    while (i < len && line[i] == 0x5C) {
+                        n++;
+                        i++;
+                    }
+                    if (i < len && line[i] == '"') {
+                        for (usize k = 0; k < n / 2; k++) {
+                            text[pos] = 0x5C;
+                            pos++;
+                        }
+                        if (n % 2 == 1) {
+                            text[pos] = '"';
+                            pos++;
+                            i++;
+                        }
+                    } else {
+                        for (usize k = 0; k < n; k++) {
+                            text[pos] = 0x5C;
+                            pos++;
+                        }
+                    }
+                    continue;
+                }
+                if (c == '"') {
+                    if (quoted && i + 1 < len && line[i + 1] == '"') {
+                        text[pos] = '"';
+                        pos++;
+                        i += 2;
+                        continue;
+                    }
+                    quoted = !quoted;
+                    i++;
+                    continue;
+                }
+                text[pos] = c;
+                pos++;
+                i++;
+            }
+            args[argc] = str_from(&text[start], pos - start);
+            argc++;
+        }
+    }
+    __rt_set_args(argc, args);
+}
+
+isize __os_write(i32 fd, *u8 p, usize n) {
+    if (n > 0x40000000) n = 0x40000000;        // at most 1 GiB per call; callers loop
+    u32 count = 0;
+    i64 ok = 0;
+    unsafe {
+        ok = __wincall(__W_WRITEFILE, __w_handle(fd), __w_ptr(p), n as i64, &count as isize as i64, 0, 0, 0, 0, 0, 0);
+    }
+    if (ok as i32 == 0) return -1;
+    return count as isize;
+}
+
+isize __os_read(i32 fd, *u8 p, usize n) {
+    if (n > 0x40000000) n = 0x40000000;
+    u32 count = 0;
+    i64 ok = 0;
+    unsafe {
+        ok = __wincall(__W_READFILE, __w_handle(fd), __w_ptr(p), n as i64, &count as isize as i64, 0, 0, 0, 0, 0, 0);
+    }
+    if (ok as i32 == 0) {
+        // the writer closed the pipe: that is end of file
+        if (__w_call0(__W_GETLASTERROR) as i32 == 109) return 0;
+        return -1;
+    }
+    return count as isize;
+}
+
+// mode 0 = read, 1 or 2 = write (create/truncate). Paths are UTF-8; invalid UTF-8 fails,
+// and so does a NUL byte (the system would read only the part before it).
+i32 __os_open(*u8 path, usize len, i32 mode) {
+    if (len >= 32768) return -1;
+    *u8 z = __rt_alloc(len + 1);
+    unsafe {
+        for (usize i = 0; i < len; i++) {
+            if (path[i] == 0) return -1;
+            z[i] = path[i];
+        }
+    }
+    // UTF-16 needs at most one unit per UTF-8 byte
+    *u8 wide = __rt_alloc((len + 1) * 2);
+    i64 chars = __wincall(__W_MULTIBYTETOWIDECHAR, 65001, 8, __w_ptr(z), -1, __w_ptr(wide), (len + 1) as i64, 0, 0, 0, 0);
+    if (chars as i32 == 0) return -1;
+    i64 access = 0x80000000;       // GENERIC_READ
+    i64 share = 1;                  // FILE_SHARE_READ
+    i64 disposition = 3;            // OPEN_EXISTING
+    if (mode != 0) {
+        access = 0x40000000;        // GENERIC_WRITE
+        share = 0;
+        disposition = 2;            // CREATE_ALWAYS
+    }
+    i64 h = __wincall(__W_CREATEFILEW, __w_ptr(wide), access, share, 0, disposition, 0x80, 0, 0, 0, 0);
+    return h as i32;
+}
+
+void __os_close(i32 fd) {
+    if (fd < 3) return;
+    __wincall(__W_CLOSEHANDLE, fd as i64, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+*u8 __os_pages(usize n) {
+    i64 p = __wincall(__W_VIRTUALALLOC, 0, n as i64, 0x3000, 4, 0, 0, 0, 0, 0, 0);   // commit | reserve, RW
+    unsafe { return p as isize as *u8; }
+}
+
+void __os_exit(i32 code) {
+    __wincall(__W_EXITPROCESS, code as i64, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}

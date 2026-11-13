@@ -1,0 +1,129 @@
+// `envoc1 selftest`: unit tests for the support library, run by bootstrap.ps1 and
+// bootstrap.sh. Prints "selftest: ok" or the first failure.
+
+void Expect(bool ok, str what) {
+    if (!ok) {
+        ToolFail(what, EXIT_INTERNAL);
+    }
+}
+
+void SelfTestBuf() {
+    Buf b = BufNew(0);
+    unsafe {
+        BufStr(&b, "x=");
+        BufI64(&b, -9223372036854775807 - 1);
+        BufStr(&b, " y=");
+        BufU64(&b, 18446744073709551615);
+        BufStr(&b, " z=");
+        BufHex(&b, 0xBEEF, 8);
+        Expect(StrEq(BufView(&b), "x=-9223372036854775808 y=18446744073709551615 z=0000beef"), "Buf formatting");
+        BufClear(&b);
+        for (usize i = 0; i < 100000; i++) BufByte(&b, (i % 251) as u8);
+        Expect(BufLen(&b) == 100000, "Buf growth length");
+        str v = BufView(&b);
+        Expect(v[99999] == (99999 % 251) as u8, "Buf growth contents");
+    }
+}
+
+void SelfTestText() {
+    Expect(StrEq("abc", "abc") && !StrEq("abc", "abd") && !StrEq("ab", "abc"), "StrEq");
+    Expect(StrStartsWith("envoc1", "envo") && !StrStartsWith("en", "envo"), "StrStartsWith");
+    Expect(StrEndsWith("main.envo", ".envo") && !StrEndsWith("main.eir", ".envo"), "StrEndsWith");
+    Expect(StrEq(StrSub("hello world", 6, 11), "world"), "StrSub");
+    Expect(StrFind("a.b.c", '.', 2) == 3 && StrFind("abc", '.', 0) == 3, "StrFind");
+    Expect(StrHash("") == 14695981039346656037 && StrHash("a") == 12638187200555641996, "StrHash (FNV-1a)");
+    u64 n;
+    unsafe {
+        Expect(StrToU64("18446744073709551615", &n) && n == 18446744073709551615, "StrToU64 max");
+        Expect(!StrToU64("18446744073709551616", &n), "StrToU64 overflow");
+        Expect(!StrToU64("", &n) && !StrToU64("1x", &n), "StrToU64 invalid");
+    }
+}
+
+void SelfTestVec() {
+    Vec v = VecNew(8, 0);
+    unsafe {
+        for (u64 i = 0; i < 10000; i++) VecPushU64(&v, i * 3);
+        Expect(VecLen(&v) == 10000, "Vec length");
+        u64 sum = 0;
+        for (usize i = 0; i < 10000; i++) sum += VecGetU64(&v, i);
+        Expect(sum == 149985000, "Vec contents");
+        VecPop(&v);
+        Expect(VecLen(&v) == 9999, "VecPop");
+    }
+}
+
+void SelfTestMap() {
+    Map m = MapNew(0);
+    Buf keys = BufNew(0);
+    unsafe {
+        for (u64 i = 0; i < 5000; i++) {
+            BufClear(&keys);
+            BufStr(&keys, "key");
+            BufU64(&keys, i);
+            MapPut(&m, BufCopy(&keys), i * i);
+        }
+        Expect(MapLen(&m) == 5000, "Map length");
+        u64 v;
+        Expect(MapGet(&m, "key4999", &v) && v == 4999 * 4999, "Map lookup");
+        Expect(!MapHas(&m, "key5000") && !MapHas(&m, ""), "Map missing keys");
+        MapPut(&m, "key7", 1);
+        Expect(MapGet(&m, "key7", &v) && v == 1 && MapLen(&m) == 5000, "Map overwrite");
+    }
+}
+
+void SelfTestDiag() {
+    u32 line;
+    u32 col;
+    unsafe {
+        SrcPos("ab\ncd\u{e9}f", 8, &line, &col);
+    }
+    Expect(line == 2 && col == 5, "SrcPos counts characters");
+    u32 f = SrcAdd("bom.envo", "\u{feff}x");
+    Expect(StrEq(SrcGet(f).Text, "x"), "SrcAdd drops a byte order mark");
+}
+
+void SelfTest() {
+    SelfTestBuf();
+    SelfTestText();
+    SelfTestVec();
+    SelfTestMap();
+    SelfTestDiag();
+    OutLine("selftest: ok");
+}
+
+// `envoc1 selftest-image <out> <linux|windows>`: writes a minimal executable that exits
+// with code 42, to check the encoder and the image writers end to end.
+void SelfTestImage(str path, str os) {
+    Asm a;
+    unsafe {
+        AsmInit(&a);
+        WinImports imports;
+        u32 target = TARGET_LINUX;
+        if (StrEq(os, "windows")) {
+            target = TARGET_WINDOWS;
+            imports = EmitImports(&a);
+            AluImm(&a, 5, RSP, 40);             // sub rsp, 40: shadow space, 16-byte alignment
+            MovRI(&a, RCX, 42);
+            // call [rip + IAT entry 9] (ExitProcess)
+            u32 exitLabel = NewLabel(&a);
+            u64 iat = VecGetU64(&a.Labels, imports.Iat as usize);
+            VecSetU64(&a.Labels, exitLabel as usize, iat + 9 * 8);
+            CallIndirectLabel(&a, exitLabel);
+        }
+        u32 data0 = 0;
+        u32 relocs = 0;
+        if (target == TARGET_LINUX) {
+            // position-independent: the relocation stub first (PLAN D68)
+            data0 = NewLabel(&a);
+            relocs = NewLabel(&a);
+            RelocStub(&a, data0, relocs);
+            MovRI(&a, RAX, 60);                 // exit
+            MovRI(&a, RDI, 42);
+            Syscall(&a);
+        }
+        Ud2(&a);
+        str image = WriteImage(&a, target, imports, data0, relocs);
+        if (!FileWrite(path, image, true)) ToolFail("cannot write the test image", EXIT_INTERNAL);
+    }
+}

@@ -1,0 +1,112 @@
+// Buf: a growable byte buffer. Used for output, string building and file contents.
+// Memory comes from the arena and is never freed, so growing leaves the old copy behind;
+// growth doubles, so the waste is bounded by the final size.
+
+struct Buf {
+    *u8 Ptr;
+    usize Len;
+    usize Cap;
+}
+
+Buf BufNew(usize cap) {
+    if (cap < 16) cap = 16;
+    return new Buf { Ptr = alloc(cap), Len = 0, Cap = cap };
+}
+
+// Makes room for at least extra more bytes.
+void BufReserve(*Buf b, usize extra) {
+    unsafe {
+        if (b.Cap == 0) {
+            *b = BufNew(extra);
+            return;
+        }
+        usize need = b.Len + extra;
+        if (need <= b.Cap) return;
+        usize cap = b.Cap * 2;
+        if (cap < need) cap = need;
+        *u8 p = alloc(cap);
+        MemCopy(p, b.Ptr, b.Len);
+        b.Ptr = p;
+        b.Cap = cap;
+    }
+}
+
+void BufClear(*Buf b) {
+    unsafe { b.Len = 0; }
+}
+
+usize BufLen(*Buf b) {
+    unsafe { return b.Len; }
+}
+
+void BufByte(*Buf b, u8 c) {
+    BufReserve(b, 1);
+    unsafe {
+        b.Ptr[b.Len] = c;
+        b.Len++;
+    }
+}
+
+void BufStr(*Buf b, str s) {
+    BufReserve(b, s.Len);
+    unsafe {
+        MemCopy(&b.Ptr[b.Len], s.Ptr, s.Len);
+        b.Len += s.Len;
+    }
+}
+
+void BufRepeat(*Buf b, u8 c, usize n) {
+    for (usize i = 0; i < n; i++) BufByte(b, c);
+}
+
+void BufU64(*Buf b, u64 v) {
+    u8[20] digits;
+    usize n = 0;
+    while (true) {
+        digits[n] = (48 + v % 10) as u8;
+        n++;
+        v /= 10;
+        if (v == 0) break;
+    }
+    while (n > 0) {
+        n--;
+        BufByte(b, digits[n]);
+    }
+}
+
+void BufI64(*Buf b, i64 v) {
+    if (v < 0) {
+        BufByte(b, '-');
+        BufU64(b, (0 -% v) as u64);
+    } else {
+        BufU64(b, v as u64);
+    }
+}
+
+// v in lower-case hexadecimal, at least width digits.
+void BufHex(*Buf b, u64 v, usize width) {
+    u8[16] digits;
+    usize n = 0;
+    while (v != 0 || n < width) {
+        u8 d = (v & 15) as u8;
+        if (d < 10) digits[n] = '0' + d;
+        else digits[n] = 'a' + d - 10;
+        n++;
+        v >>= 4;
+        if (n == 16) break;
+    }
+    while (n > 0) {
+        n--;
+        BufByte(b, digits[n]);
+    }
+}
+
+// The current contents. The view is valid until the buffer is next changed.
+str BufView(*Buf b) {
+    unsafe { return str_from(b.Ptr, b.Len); }
+}
+
+// A copy of the current contents that stays valid when the buffer changes.
+str BufCopy(*Buf b) {
+    return StrDup(BufView(b));
+}

@@ -1,0 +1,235 @@
+// The Envo-S1 prelude (docs/spec/envo-s1.md section 8). envoc1 compiles it with every
+// Envo-S1 program and imports it implicitly; a program's own items hide prelude items of
+// the same name, so every Envo-Core program means what it did ([s1.subset.2]). `Copy` is
+// built into the checker: it is implemented automatically ([type.copy.1]).
+//
+// M2.10 brought the interfaces ownership needs, M2.11 Option and Result, and M2.12 List
+// and string.
+
+// Runs when a value is dropped: at the end of its owner's scope, unless it was moved
+// ([own.drop.1], [s1.own.2]).
+interface IDrop {
+    void Drop(ref this);
+}
+
+interface IEquatable<T> {
+    bool Equals(in T other);
+}
+
+interface IHash {
+    u64 Hash();
+}
+
+// An explicit copy of a value that is not `Copy` ([own.move.3]).
+interface IClone<T> {
+    T Clone();
+}
+
+// An optional value ([type.opt.1]): `T?` is `Option<T>`, `null` is `None`, `a ?? b` is the
+// value or `b`, and a postfix `?` returns `None` early ([expr.q.1]).
+enum Option<T> {
+    None,
+    Some(T value),
+}
+
+impl<T> Option<T> {
+    bool IsSome() => match this { Some(_) => true, None => false };
+    bool IsNone() => match this { Some(_) => false, None => true };
+
+    // The value; panics on `None`.
+    T Unwrap(this) {
+        match this {
+            Some(v) => { return v; }
+            None => { panic("called `Unwrap` on `None`"); }
+        }
+    }
+
+    T UnwrapOr(this, T other) => match this { Some(v) => v, None => other };
+}
+
+// A value or an error (chapter 2, section 2.4); a postfix `?` returns the error early.
+enum Result<T, E> {
+    Ok(T value),
+    Err(E error),
+}
+
+impl<T, E> Result<T, E> {
+    bool IsOk() => match this { Ok(_) => true, Err(_) => false };
+    bool IsErr() => match this { Ok(_) => false, Err(_) => true };
+
+    // The value; panics on an error.
+    T Unwrap(this) {
+        match this {
+            Ok(v) => { return v; }
+            Err(_) => { panic("called `Unwrap` on an `Err`"); }
+        }
+    }
+
+    // The error; panics on a value.
+    E UnwrapErr(this) {
+        match this {
+            Ok(_) => { panic("called `UnwrapErr` on an `Ok`"); }
+            Err(e) => { return e; }
+        }
+    }
+}
+
+// A growable list on the heap (envo-s1.md section 8). It owns its items: dropping the
+// list drops them.
+struct List<T> {
+    *T Data;
+    usize Count;
+    usize Cap;
+
+    static List<T> New() {
+        unsafe { return new List<T> { Data = 0 as usize as *T, Count = 0, Cap = 0 }; }
+    }
+
+    usize Len() => this.Count;
+
+    void Push(ref this, T item) {
+        if (this.Count == this.Cap) this.Grow();
+        // writing through a raw pointer stores without dropping (the slot is empty)
+        unsafe { this.Data[this.Count] = item; }
+        this.Count++;
+    }
+
+    T? Pop(ref this) {
+        if (this.Count == 0) return null;
+        this.Count--;
+        unsafe {
+            // reading through a raw pointer takes the item
+            T item = this.Data[this.Count];
+            return Some(item);
+        }
+    }
+
+    // A copy of item i; panics if i is out of bounds. Borrow other items through AsSlice.
+    T Get(usize i) where T : Copy {
+        if (i >= this.Count) panic("index out of bounds");
+        unsafe { return this.Data[i]; }
+    }
+
+    void Set(ref this, usize i, T item) {
+        if (i >= this.Count) panic("index out of bounds");
+        unsafe {
+            T old = this.Data[i];       // dropped at the end of this block
+            this.Data[i] = item;
+        }
+    }
+
+    T[] AsSlice() {
+        unsafe { return slice_from(this.Data, this.Count); }
+    }
+
+    mut T[] AsMutSlice(ref this) {
+        unsafe { return slice_from_mut(this.Data, this.Count); }
+    }
+
+    void Grow(ref this) {
+        usize cap = this.Cap * 2;
+        if (cap == 0) cap = 4;
+        unsafe {
+            *T fresh = alloc(cap * sizeof(T)) as *T;
+            for (usize i = 0; i < this.Count; i++) fresh[i] = this.Data[i];
+            free(this.Data as *u8);
+            this.Data = fresh;
+        }
+        this.Cap = cap;
+    }
+}
+
+impl<T> IDrop for List<T> {
+    void Drop(ref this) {
+        unsafe {
+            for (usize i = 0; i < this.Count; i++) {
+                T item = this.Data[i];      // taken, then dropped at the end of the block
+            }
+            free(this.Data as *u8);
+        }
+    }
+}
+
+// Owned UTF-8 text (envo-s1.md section 8). A `string` converts to `str`, a shared borrow
+// of its bytes, wherever a `str` is expected.
+struct string {
+    *u8 Data;
+    usize Count;
+    usize Cap;
+
+    static string New() {
+        unsafe { return new string { Data = 0 as usize as *u8, Count = 0, Cap = 0 }; }
+    }
+
+    static string From(str s) {
+        string r = string.New();
+        r.Append(s);
+        return r;
+    }
+
+    usize Len() => this.Count;
+
+    void Append(ref this, str s) {
+        this.Reserve(s.Len);
+        unsafe { string.CopyBytes(&this.Data[this.Count], s.Ptr, s.Len); }
+        this.Count += s.Len;
+    }
+
+    void AppendByte(ref this, u8 b) {
+        this.Reserve(1);
+        unsafe { this.Data[this.Count] = b; }
+        this.Count++;
+    }
+
+    str AsStr() {
+        unsafe { return str_from(this.Data, this.Count); }
+    }
+
+    bool Equals(str other) {
+        if (other.Len != this.Count) return false;
+        unsafe {
+            for (usize i = 0; i < this.Count; i++) {
+                if (this.Data[i] != other[i]) return false;
+            }
+        }
+        return true;
+    }
+
+    // Room for n more bytes.
+    void Reserve(ref this, usize n) {
+        if (this.Count + n <= this.Cap) return;
+        usize cap = this.Cap * 2;
+        if (cap < this.Count + n) cap = this.Count + n;
+        if (cap < 16) cap = 16;
+        unsafe {
+            *u8 fresh = alloc(cap);
+            string.CopyBytes(fresh, this.Data, this.Count);
+            free(this.Data);
+            this.Data = fresh;
+        }
+        this.Cap = cap;
+    }
+
+    // Copies n bytes from src to dst (not overlapping): eight at a time, then the rest.
+    static void CopyBytes(*u8 dst, *u8 src, usize n) {
+        usize i = 0;
+        unsafe {
+            while (i + 8 <= n) {
+                *u64 d = &dst[i] as *u64;
+                *u64 r = &src[i] as *u64;
+                d[0] = r[0];
+                i += 8;
+            }
+            while (i < n) {
+                dst[i] = src[i];
+                i++;
+            }
+        }
+    }
+}
+
+impl IDrop for string {
+    void Drop(ref this) {
+        unsafe { free(this.Data); }
+    }
+}

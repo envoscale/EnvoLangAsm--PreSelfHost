@@ -1,0 +1,194 @@
+// Types and symbols for the checker (envo-core.md 5.2). Mirrors Stage 0's check.eas
+// tables: types are interned, so two types are equal exactly when their indices are.
+
+struct Type {
+    u8 Kind;        // TYK_*
+    bool Signed;
+    u32 Size;       // fixed-size kinds only; see SizeOf
+    u32 Align;
+    u32 Elem;       // element type (ptr, slice, array)
+    u32 Count;      // array length (saturated at 2^31)
+    u32 Sym;        // symbol (struct, enum, interface, type parameter)
+    str Name;
+    u32 Args;       // generic instance: first type argument in Checker.TypeArgs
+    u32 NArgs;      // generic instance: number of type arguments (0: not an instance)
+    u8 LState;      // generic instance with concrete arguments: 2 once Size/Align are set
+}
+
+const u8 TYK_VOID = 1;
+const u8 TYK_BOOL = 2;
+const u8 TYK_INT = 3;
+const u8 TYK_STR = 4;
+const u8 TYK_PTR = 5;
+const u8 TYK_SLICE = 6;
+const u8 TYK_ARRAY = 7;
+const u8 TYK_STRUCT = 8;
+const u8 TYK_ENUM = 9;
+const u8 TYK_PARAM = 10;    // a generic type parameter (Envo-S1)
+const u8 TYK_IFACE = 11;    // an interface, only as a bound or in `impl` (Envo-S1)
+const u8 TYK_FN = 12;       // a function type (Envo-S1, RFC 0003; check/closure.envo)
+const u8 TYK_UNION = 13;    // a tagged enum: payloads or type parameters (check/enums.envo)
+
+// Fixed type indices, in Stage 0's order. 0 means "no type".
+const u32 T_VOID = 1;
+const u32 T_BOOL = 2;
+const u32 T_STR = 3;
+const u32 T_I8 = 4;
+const u32 T_I16 = 5;
+const u32 T_I32 = 6;
+const u32 T_I64 = 7;
+const u32 T_ISIZE = 8;
+const u32 T_U8 = 9;
+const u32 T_U16 = 10;
+const u32 T_U32 = 11;
+const u32 T_U64 = 12;
+const u32 T_USIZE = 13;
+const u32 T_PTR_U8 = 14;
+const u32 T_PRIM_COUNT = 15;
+
+struct Sym {
+    u8 Kind;        // SK_*
+    u8 State;       // 0 new, 1 in progress, 2 done (const, enum, static value)
+    u8 LState;      // struct layout state
+    str Name;
+    u32 Node;       // declaring node
+    u32 Type;       // the type it names / its value type / return type
+    u64 Value;      // constant value
+    u32 Aux;        // struct size; enum representation type; parameter count
+    u32 Aux2;       // struct alignment; built-in id
+    u32 Params;     // index of the first parameter type in Checker.ParamTypes
+    // Envo-S1 (check/generic.envo)
+    u32 Flags;      // SF_*
+    u32 NEnv;       // generic environment size: the owner's parameters, then the item's own
+    u32 NOwn;       // how many of them come from the owner (struct, impl or interface)
+    u32 OwnerTP;    // the owner's type parameter list (first node), for name lookup
+    u32 OwnerType;  // a method's receiver type, in the owner's generic form
+    u32 Iface;      // an interface method's interface symbol
+    u32 Recv;       // a method's `this` local
+    u32 Bounds;     // first (parameter type, interface type) pair in Checker.Bounds
+    u32 NBounds;
+    u32 Calls;      // first call node of the body in Checker.Calls
+    u32 NCalls;
+    str Ns;         // an item's namespace ("" for the root)
+}
+
+const u8 SK_TYPE = 1;
+const u8 SK_STRUCT = 2;
+const u8 SK_ENUM = 3;
+const u8 SK_CONST = 4;
+const u8 SK_STATIC = 5;
+const u8 SK_FN = 6;
+const u8 SK_BUILTIN = 7;
+const u8 SK_LOCAL = 8;
+const u8 SK_TPARAM = 9;     // Value: index in the environment; Type: its TYK_PARAM type
+const u8 SK_IFACE = 10;
+
+// Symbol flags (Envo-S1).
+const u32 SF_METHOD = 1;
+const u32 SF_STATIC = 2;        // a method without a receiver
+const u32 SF_RECV_IN = 4;       // `in this` (also the default)
+const u32 SF_RECV_REF = 8;      // `ref this`
+const u32 SF_GENERIC = 16;      // has a generic environment (NEnv > 0)
+const u32 SF_BYREF = 32;        // a local reached through a pointer (`in`/`ref` parameter, receiver)
+const u32 SF_READONLY = 64;     // an `in` local
+const u32 SF_PRELUDE = 128;     // a prelude item: a program's own item of the same name hides it
+const u32 SF_PUBLIC = 256;      // `public` or `internal`: visible outside its namespace
+
+// Built-in ids (envo-core.md section 6), in Stage 0's order from 1.
+const u32 B_EXIT = 7;
+const u32 B_PANIC = 10;
+const u32 B_STR_FROM = 11;
+const u32 B_SYSCALL = 12;
+const u32 B_WINCALL = 13;
+const u32 B_FREE = 14;              // Envo-S1 built-ins (envo-s1.md section 7)
+const u32 B_SLICE_FROM = 15;
+const u32 B_SLICE_FROM_MUT = 16;
+const u32 B_WINCALLP = 17;         // wincall through a function pointer (D46)
+const u32 B_HOSTCALL = 18;         // a call to the WebAssembly host (D49)
+
+const u64 MAX_TYPE_SIZE = 0x7FFFFFFF;
+
+// Checker error codes (envo-core.md 5.2, 5.3).
+const u32 E_DUPLICATE = 201;
+const u32 E_UNKNOWN_TYPE = 202;
+const u32 E_UNKNOWN_NAME = 203;
+const u32 E_REDECLARED = 204;
+const u32 E_NOT_IN_LOOP = 205;
+const u32 E_NO_MEMBER = 206;
+const u32 E_FIELD_TWICE = 207;
+const u32 E_NOT_A_TYPE = 208;
+const u32 E_NOT_A_VALUE = 209;
+const u32 E_NAMESPACE_FIRST = 211;
+const u32 E_PRIVATE = 212;
+const u32 E_UNKNOWN_NAMESPACE = 213;
+const u32 E_MISMATCH = 301;
+const u32 E_BAD_OPERAND = 302;
+const u32 E_RECURSIVE = 303;
+const u32 E_DOES_NOT_FIT = 304;
+const u32 E_BAD_CAST = 305;
+const u32 E_NEEDS_UNSAFE = 306;
+const u32 E_ARG_COUNT = 307;
+const u32 E_NOT_EXHAUSTIVE = 308;
+const u32 E_CONST_CYCLE = 309;
+const u32 E_CONST_FAILED = 310;
+const u32 E_NOT_CONSTANT = 311;
+const u32 E_TOO_LARGE = 312;
+const u32 E_NOT_CALLABLE = 314;
+const u32 E_NOT_ASSIGNABLE = 315;
+const u32 E_NOT_ADDRESSABLE = 316;
+const u32 E_BAD_RETURN = 317;
+const u32 E_DUPLICATE_PATTERN = 319;
+const u32 E_MISSING_RETURN = 320;
+const u32 E_NO_EFFECT = 321;
+const u32 E_VOID_VALUE = 322;
+const u32 E_DUPLICATE_VALUE = 323;
+const u32 E_BAD_REPR = 324;
+const u32 E_VOID_TYPE = 327;
+const u32 E_CANNOT_SLICE = 328;
+const u32 E_SLICE_TEMP = 329;
+const u32 E_LAMBDA_INFER = 330;
+const u32 E_LAMBDA_KIND = 331;
+const u32 E_MUT_FN_SHARED = 332;
+const u32 E_NOT_IMPLEMENTED = 334;
+const u32 E_CANNOT_INFER = 335;
+const u32 E_NOT_AN_IFACE = 336;
+const u32 E_MISSING_METHOD = 337;
+const u32 E_TYPE_ARG_COUNT = 338;
+const u32 E_METHOD_MISMATCH = 339;
+const u32 E_NOT_IN_IFACE = 340;
+const u32 E_BAD_THIS = 341;
+const u32 E_ARG_MODE = 342;
+const u32 E_STATIC_CALL = 343;
+const u32 E_INST_TOO_DEEP = 350;
+const u32 E_USE_AFTER_MOVE = 501;
+const u32 E_MOVE_OUT_OF_BORROW = 502;
+const u32 E_BORROW_CONFLICT = 503;
+const u32 E_MOVED_WHILE_BORROWED = 504;
+const u32 E_BORROW_NOT_DECLARED = 507;
+const u32 E_BAD_FROM = 508;
+
+// The fixed message of an error that has no arguments.
+str CheckMessage(u32 code) {
+    match code {
+        E_NOT_IN_LOOP => { return "`break` or `continue` outside a loop"; }
+        E_NEEDS_UNSAFE => { return "this needs an `unsafe` block"; }
+        E_NOT_EXHAUSTIVE => { return "`match` is not exhaustive; add `_` or the missing values"; }
+        E_CONST_FAILED => { return "constant evaluation failed (overflow, division by zero, or shift too large)"; }
+        E_NOT_CONSTANT => { return "expected a constant expression"; }
+        E_TOO_LARGE => { return "type is too large (Stage 1 limit: 2^31 - 1 bytes)"; }
+        E_NOT_CALLABLE => { return "this cannot be called"; }
+        E_NOT_ASSIGNABLE => { return "cannot assign to this"; }
+        E_NOT_ADDRESSABLE => { return "cannot take the address of this"; }
+        E_DUPLICATE_PATTERN => { return "this value is already matched"; }
+        E_MISSING_RETURN => { return "not all code paths return a value"; }
+        E_NO_EFFECT => { return "only calls can be used as statements"; }
+        E_VOID_VALUE => { return "a `void` value cannot be used here"; }
+        E_DUPLICATE_VALUE => { return "duplicate enum value"; }
+        E_BAD_REPR => { return "enum representation must be an integer type"; }
+        E_VOID_TYPE => { return "`void` is only allowed as a return type"; }
+        E_BAD_THIS => { return "`this` is only allowed as the first parameter of a method"; }
+        E_SLICE_TEMP => { return "cannot slice a temporary array; store it in a variable first"; }
+        E_INST_TOO_DEEP => { return "generic instantiation too deep"; }
+        _ => { return "?"; }
+    }
+}

@@ -1,0 +1,2095 @@
+; =============================================================================
+; src/parser.eas - the Envo-Core parser (docs/spec/envo-core.md section 5.1)
+;
+; Recursive descent over the token array from lex, one routine per grammar rule.
+; The tree is a flat array of 32-byte nodes (src/nodes.eas) addressed by index,
+; so it never moves and child links are 32-bit.
+;
+; Conventions:
+;   - parse_* routines return eax = node index and report errors themselves
+;     (diagnostics never return, so there is no error propagation).
+;   - Parser state lives in p_* globals: one parse at a time, like the lexer.
+;   - Speculation ([core.decl.1]) saves p_pos and n_count, tries try_type, and
+;     restores both to backtrack. try_type never reports errors.
+;   - Nesting depth is counted by p_enter ([core.syntax.4]); each routine that
+;     enters levels saves p_depth on entry and restores it on exit.
+;   - Lists are built with list_add on a (head, tail) pair of u32 on the stack.
+; =============================================================================
+
+MAX_DEPTH       equ 256
+
+; parse - build the syntax tree for one file.
+;   in:  rdi = token array, rsi = token count (the last token is TK_EOF)
+;   out: eax = program node
+parse:
+        lea     rdx, [p_single_start]
+        mov     ecx, 1
+        jmp     near parse_files
+
+; parse_files - parse each file's tokens on its own (so no statement runs across
+; a file boundary) and join their items into one program ([item.mod.3]:
+; top-level statements only in the entry file, E0210).
+;   in:  rdi = token array, rsi = total tokens, rdx = u32 first-token index of
+;        each file, ecx = number of files.  out: eax = program node
+; ebx = program, r12 = file starts, r13d = file count, r14 = total, r15d = file
+parse_files:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     [p_toks], rdi
+        mov     r12, rdx
+        mov     r13d, ecx
+        mov     r14, rsi
+        ; Every node consumes at least one token except a handful of wrappers,
+        ; so 4 nodes per token is a generous bound; node_new checks it anyway.
+        lea     rdi, [rsi*4 + 64]
+        mov     [n_cap], rdi
+        shl     rdi, 5                  ; * N_SIZE
+        call    arena_alloc
+        mov     [n_base], rax
+        mov     qword [n_count], 1      ; node 0 means "none"
+        xor     r15d, r15d
+.file:
+        cmp     r15d, r13d
+        jae     short .done
+        mov     eax, [r12 + r15*4]
+        mov     [p_pos], rax
+        mov     rax, r14                ; this file ends where the next begins
+        lea     ecx, [r15 + 1]
+        cmp     ecx, r13d
+        jae     short .end_known
+        mov     eax, [r12 + rcx*4]
+.end_known:
+        mov     [p_ntoks], rax
+        mov     qword [p_depth], 0
+        call    parse_program
+        test    r15d, r15d
+        jnz     short .join
+        mov     ebx, eax
+        jmp     short .next
+.join:
+        mov     edi, ebx
+        mov     esi, eax
+        call    join_programs
+.next:
+        inc     r15d
+        jmp     short .file
+.done:
+        mov     eax, ebx
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; join_programs - append program esi's items to program edi (E0210 for a
+; top-level statement outside the entry file).
+join_programs:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     edi, esi
+        call    node_ptr
+        mov     r12d, [rax + N_A]       ; the later file's items
+        mov     r13d, r12d
+.check:
+        test    r13d, r13d
+        jz      short .append
+        mov     edi, r13d
+        call    g_is_item
+        test    eax, eax
+        jz      short .statement
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .check
+.append:
+        test    r12d, r12d
+        jz      short .out
+        mov     edi, ebx                ; find the entry list's tail
+        call    node_ptr
+        lea     rcx, [rax + N_A]
+.tail:
+        mov     edx, [rcx]
+        test    edx, edx
+        jz      short .link
+        mov     edi, edx
+        call    node_ptr
+        lea     rcx, [rax + N_NEXT]
+        jmp     short .tail
+.link:
+        mov     [rcx], r12d
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.statement:
+        mov     edi, r13d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_ENTRY_ONLY
+        jmp     near p_error_at
+
+; =============================================================================
+; Token access
+; =============================================================================
+
+; p_kind - kind of the current token.  out: eax.  clobbers: rdx
+p_kind:
+        mov     rax, [p_pos]
+        shl     rax, 4
+        add     rax, [p_toks]
+        movzx   eax, word [rax + TOK_KIND]
+        ret
+
+; p_kind_at - kind of the token edi places ahead (clamped to the EOF token).
+;   out: eax.  clobbers: rdx
+p_kind_at:
+        mov     eax, edi
+        add     rax, [p_pos]
+        mov     rdx, [p_ntoks]
+        dec     rdx
+        cmp     rax, rdx
+        jbe     short .ok
+        mov     rax, rdx
+.ok:
+        shl     rax, 4
+        add     rax, [p_toks]
+        movzx   eax, word [rax + TOK_KIND]
+        ret
+
+; p_advance - consume the current token. The EOF token is never consumed, so
+; the parser can always look at "the current token".
+;   out: eax = index of the token.  clobbers: rdx
+p_advance:
+        mov     rax, [p_pos]
+        mov     rdx, rax
+        shl     rdx, 4
+        add     rdx, [p_toks]
+        cmp     word [rdx + TOK_KIND], TK_EOF
+        je      short .done
+        lea     rdx, [rax + 1]
+        mov     [p_pos], rdx
+.done:
+        ret
+
+; p_accept - consume the current token if its kind is edi.
+;   out: eax = 1 if consumed, else 0.  clobbers: rdx
+p_accept:
+        call    p_kind
+        cmp     eax, edi
+        jne     short .no
+        call    p_advance
+        mov     eax, 1
+        ret
+.no:
+        xor     eax, eax
+        ret
+
+; p_expect - consume a token of kind edi, or report E0101.
+;   out: eax = index of the token.  clobbers: rdx
+p_expect:
+        call    p_kind
+        cmp     eax, edi
+        jne     short .error
+        jmp     short p_advance
+.error:
+        cmp     edi, TK_IDENT
+        jne     near p_error_expected_kind
+        lea     rdi, [s_an_identifier]
+        jmp     near p_error_expected
+
+; p_end - End = ';' | before '}' | before EOF  ([core.syntax.1] otherwise)
+p_end:
+        sub     rsp, 8
+        call    p_kind
+        cmp     eax, TK_SEMI
+        je      short .semi
+        cmp     eax, TK_RBRACE
+        je      short .ok
+        cmp     eax, TK_EOF
+        je      short .ok
+        mov     edi, TK_SEMI
+        jmp     near p_error_expected_kind
+.semi:
+        call    p_advance
+.ok:
+        add     rsp, 8
+        ret
+
+; p_enter - one more nesting level ([core.syntax.4]); E0104 past MAX_DEPTH.
+;   clobbers: rax
+p_enter:
+        mov     rax, [p_depth]
+        inc     rax
+        mov     [p_depth], rax
+        cmp     rax, MAX_DEPTH
+        ja      short .deep
+        ret
+.deep:
+        mov     edi, E_TOO_DEEP
+        mov     rsi, [p_pos]
+        jmp     near p_error_at
+
+; tok_addr - address of token edi.  out: rax
+tok_addr:
+        mov     eax, edi
+        shl     rax, 4
+        add     rax, [p_toks]
+        ret
+
+; =============================================================================
+; Nodes
+; =============================================================================
+
+; node_new - allocate a zeroed node.
+;   in:  edi = kind, esi = token index
+;   out: eax = node index, rdx = node address.  clobbers: rcx
+node_new:
+        mov     rax, [n_count]
+        cmp     rax, [n_cap]
+        jae     short .full
+        lea     rcx, [rax + 1]
+        mov     [n_count], rcx
+        mov     rdx, rax
+        shl     rdx, 5
+        add     rdx, [n_base]
+        xor     ecx, ecx                ; the slot may be reused after backtracking
+        mov     [rdx], rcx
+        mov     [rdx + 8], rcx
+        mov     [rdx + 16], rcx
+        mov     [rdx + 24], rcx
+        mov     [rdx + N_KIND], di
+        mov     [rdx + N_TOK], esi
+        ret
+.full:
+        lea     rdi, [msg_tree_full]
+        mov     esi, msg_tree_full_len
+        jmp     near fatal
+
+; node_ptr - address of node edi.  out: rax
+node_ptr:
+        mov     eax, edi
+        shl     rax, 5
+        add     rax, [n_base]
+        ret
+
+; list_add - append node esi to the list whose (head, tail) u32 pair is at rdi.
+;   clobbers: rax
+list_add:
+        mov     eax, [rdi + 4]
+        test    eax, eax
+        jnz     short .link
+        mov     [rdi], esi
+        jmp     short .tail
+.link:
+        shl     rax, 5
+        add     rax, [n_base]
+        mov     [rax + N_NEXT], esi
+.tail:
+        mov     [rdi + 4], esi
+        ret
+
+; is_place - may this expression be assigned to? ([core.syntax.3])
+;   in:  edi = node.  out: eax = 1 or 0.  clobbers: rcx
+is_place:
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        cmp     ecx, NK_NAME
+        je      short .yes
+        cmp     ecx, NK_MEMBER
+        je      short .yes
+        cmp     ecx, NK_INDEX
+        je      short .yes
+        cmp     ecx, NK_UNARY
+        jne     short .no
+        cmp     word [rax + N_OP], TK_STAR
+        je      short .yes
+.no:
+        xor     eax, eax
+        ret
+.yes:
+        mov     eax, 1
+        ret
+
+; =============================================================================
+; Items
+; =============================================================================
+
+; Program = ( Item | Statement )* EOF
+parse_program:
+        push    rbx
+        sub     rsp, 16                 ; [rsp] = list pair
+        mov     qword [rsp], 0
+        mov     edi, NK_PROGRAM
+        xor     esi, esi
+        call    node_new
+        mov     ebx, eax
+.loop:
+        call    p_kind
+        cmp     eax, TK_EOF
+        je      short .done
+        call    parse_toplevel
+        mov     rdi, rsp
+        mov     esi, eax
+        call    list_add
+        jmp     short .loop
+.done:
+        mov     edi, ebx
+        call    node_ptr
+        mov     ecx, [rsp]
+        mov     [rax + N_A], ecx
+        mov     eax, ebx
+        add     rsp, 16
+        pop     rbx
+        ret
+
+; parse_toplevel - one Item or Statement.
+parse_toplevel:
+        sub     rsp, 8
+        call    p_kind
+        cmp     eax, TK_KW_PUBLIC
+        je      short .visibility
+        cmp     eax, TK_KW_PRIVATE
+        jne     short .item
+.visibility:
+        call    p_advance               ; no effect in Core: one program, one scope
+        call    p_kind
+        cmp     eax, TK_KW_STRUCT
+        je      short .struct
+        cmp     eax, TK_KW_ENUM
+        je      short .enum
+        cmp     eax, TK_KW_CONST
+        je      short .const
+        cmp     eax, TK_KW_STATIC
+        je      short .static
+        call    is_fn_start
+        test    eax, eax
+        jnz     short .fn
+        lea     rdi, [s_an_item]
+        jmp     near p_error_expected
+.item:
+        cmp     eax, TK_KW_STRUCT
+        je      short .struct
+        cmp     eax, TK_KW_ENUM
+        je      short .enum
+        cmp     eax, TK_KW_CONST
+        je      short .const
+        cmp     eax, TK_KW_STATIC
+        je      short .static
+        call    is_fn_start
+        test    eax, eax
+        jnz     short .fn
+        call    parse_statement
+        jmp     short .out
+.struct:
+        call    parse_struct
+        jmp     short .out
+.enum:
+        call    parse_enum
+        jmp     short .out
+.const:
+        mov     edi, NK_CONST
+        call    parse_binding
+        jmp     short .out
+.static:
+        mov     edi, NK_STATIC
+        call    parse_binding
+        jmp     short .out
+.fn:
+        call    parse_function
+.out:
+        add     rsp, 8
+        ret
+
+; is_fn_start - does "Type IDENT (" start here? Looks ahead only.
+;   out: eax = 1 or 0. Reports E0905 for "Type IDENT <" (a generic function).
+is_fn_start:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     rbx, [p_pos]
+        mov     r12, [n_count]
+        call    try_type
+        test    eax, eax
+        jz      short .no
+        call    p_kind
+        cmp     eax, TK_IDENT
+        jne     short .no
+        mov     edi, 1
+        call    p_kind_at
+        cmp     eax, TK_LPAREN
+        je      short .yes
+        cmp     eax, TK_LT
+        jne     short .no
+        lea     rdi, [s_generic_functions]
+        mov     rsi, [p_pos]
+        inc     rsi                     ; the '<'
+        jmp     near p_error_not_core
+.yes:
+        mov     eax, 1
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        mov     [p_pos], rbx
+        mov     [n_count], r12
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; Function = Type IDENT '(' Params? ')' ( Block | '=>' Expr End )
+; ebx = fn node, r12d = type, r13d = param node; [rsp] = parameter list pair
+parse_function:
+        push    rbx
+        push    r12
+        push    r13
+        sub     rsp, 16
+        mov     qword [rsp], 0
+        call    parse_decl_type
+        mov     r12d, eax
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_FN
+        mov     esi, eax
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     ebx, eax
+        mov     edi, TK_LPAREN
+        call    p_expect
+.param:
+        call    p_kind
+        cmp     eax, TK_RPAREN
+        je      short .params_done
+        cmp     eax, TK_KW_IN           ; parameter modes and receivers are full Envo
+        je      near .not_core_keyword
+        cmp     eax, TK_KW_REF
+        je      near .not_core_keyword
+        cmp     eax, TK_KW_OUT
+        je      near .not_core_keyword
+        cmp     eax, TK_KW_THIS
+        je      near .not_core_keyword
+        call    parse_decl_type
+        mov     r12d, eax
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_PARAM
+        mov     esi, eax
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     r13d, eax
+        call    p_kind
+        cmp     eax, TK_EQ
+        je      near .default_value
+        mov     rdi, rsp
+        mov     esi, r13d
+        call    list_add
+        mov     edi, TK_COMMA
+        call    p_accept
+        test    eax, eax
+        jnz     short .param
+.params_done:
+        mov     edi, TK_RPAREN
+        call    p_expect
+        call    p_kind
+        cmp     eax, TK_LBRACE
+        jne     short .arrow
+        call    parse_block
+        jmp     short .body
+.arrow:
+        cmp     eax, TK_FAT_ARROW
+        jne     short .bad_body
+        call    p_advance
+        call    parse_expr
+        mov     r13d, eax
+        call    p_end
+        mov     eax, r13d
+.body:
+        mov     r13d, eax
+        mov     edi, ebx
+        call    node_ptr
+        mov     ecx, [rsp]
+        mov     [rax + N_B], ecx
+        mov     [rax + N_C], r13d
+        mov     eax, ebx
+        add     rsp, 16
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.bad_body:
+        lea     rdi, [s_fn_body]
+        jmp     near p_error_expected
+.not_core_keyword:
+        xor     edi, edi
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+.default_value:
+        lea     rdi, [s_default_params]
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+
+; Struct = 'struct' IDENT '{' Field* '}'    Field = Visibility? Type IDENT End
+; ebx = struct node, r12d = field type, r13d = field node; [rsp] = field list pair
+parse_struct:
+        push    rbx
+        push    r12
+        push    r13
+        sub     rsp, 16
+        mov     qword [rsp], 0
+        call    p_advance
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_STRUCT
+        mov     esi, eax
+        call    node_new
+        mov     ebx, eax
+        call    p_kind
+        cmp     eax, TK_COLON
+        je      near .bases
+        cmp     eax, TK_LT
+        je      near .generic
+        mov     edi, TK_LBRACE
+        call    p_expect
+.field:
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .done
+        cmp     eax, TK_KW_PUBLIC
+        je      short .visibility
+        cmp     eax, TK_KW_PRIVATE
+        jne     short .type
+.visibility:
+        call    p_advance
+.type:
+        call    parse_decl_type
+        mov     r12d, eax
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_FIELD
+        mov     esi, eax
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     r13d, eax
+        call    p_kind
+        cmp     eax, TK_LPAREN
+        je      short .method
+        cmp     eax, TK_LBRACE
+        je      short .property
+        cmp     eax, TK_FAT_ARROW
+        je      short .property
+        cmp     eax, TK_EQ
+        je      short .field_init
+        call    p_end
+        mov     rdi, rsp
+        mov     esi, r13d
+        call    list_add
+        jmp     short .field
+.done:
+        call    p_advance
+        mov     edi, ebx
+        call    node_ptr
+        mov     ecx, [rsp]
+        mov     [rax + N_A], ecx
+        mov     eax, ebx
+        add     rsp, 16
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.bases:
+        lea     rdi, [s_struct_bases]
+        jmp     short .not_core
+.generic:
+        lea     rdi, [s_generic_types]
+        jmp     short .not_core
+.method:
+        lea     rdi, [s_methods]
+        jmp     short .not_core
+.property:
+        lea     rdi, [s_properties]
+        jmp     short .not_core
+.field_init:
+        lea     rdi, [s_field_inits]
+.not_core:
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+
+; Enum = 'enum' IDENT ( ':' Type )? '{' ( Variant ( ',' Variant )* ','? )? '}'
+; Variant = IDENT ( '=' Expr )?
+; ebx = enum node, r12d = scratch, r13d = variant node; [rsp] = variant list pair
+parse_enum:
+        push    rbx
+        push    r12
+        push    r13
+        sub     rsp, 16
+        mov     qword [rsp], 0
+        call    p_advance
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_ENUM
+        mov     esi, eax
+        call    node_new
+        mov     ebx, eax
+        mov     edi, TK_COLON
+        call    p_accept
+        test    eax, eax
+        jz      short .body
+        call    parse_decl_type
+        mov     r12d, eax
+        mov     edi, ebx
+        call    node_ptr
+        mov     [rax + N_A], r12d
+.body:
+        mov     edi, TK_LBRACE
+        call    p_expect
+.variant:
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .done
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_VARIANT
+        mov     esi, eax
+        call    node_new
+        mov     r13d, eax
+        call    p_kind
+        cmp     eax, TK_LPAREN
+        je      short .payload
+        mov     edi, TK_EQ
+        call    p_accept
+        test    eax, eax
+        jz      short .add
+        call    parse_expr
+        mov     r12d, eax
+        mov     edi, r13d
+        call    node_ptr
+        mov     [rax + N_A], r12d
+.add:
+        mov     rdi, rsp
+        mov     esi, r13d
+        call    list_add
+        mov     edi, TK_COMMA
+        call    p_accept
+        test    eax, eax
+        jnz     short .variant
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .done
+        lea     rdi, [s_comma_or_brace]
+        jmp     near p_error_expected
+.done:
+        call    p_advance
+        mov     edi, ebx
+        call    node_ptr
+        mov     ecx, [rsp]
+        mov     [rax + N_B], ecx
+        mov     eax, ebx
+        add     rsp, 16
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.payload:
+        lea     rdi, [s_enum_payloads]
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+
+; parse_binding - Const = 'const' Type IDENT '=' Expr End
+;                 Static = 'static' Type IDENT ( '=' Expr )? End
+;   in: edi = NK_CONST or NK_STATIC
+parse_binding:
+        push    rbx
+        push    r12
+        push    r13
+        sub     rsp, 16
+        mov     r13d, edi
+        call    p_advance
+        call    parse_decl_type
+        mov     r12d, eax
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, r13d
+        mov     esi, eax
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     ebx, eax
+        cmp     r13d, NK_CONST
+        je      short .value                  ; a const must have a value
+        call    p_kind
+        cmp     eax, TK_EQ
+        jne     short .end
+.value:
+        mov     edi, TK_EQ
+        call    p_expect
+        call    parse_expr
+        mov     r12d, eax
+        mov     edi, ebx
+        call    node_ptr
+        mov     [rax + N_B], r12d
+.end:
+        call    p_end
+        mov     eax, ebx
+        add     rsp, 16
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Types
+; =============================================================================
+
+; try_type - Type = '*' Type | IDENT TypeSuffix*, if one starts here.
+; Never reports errors: on failure it returns 0 and the caller backtracks
+; (restoring p_pos and n_count). Iterative, so "****...T" cannot exhaust the
+; stack; more than MAX_DEPTH '*'s or suffixes simply fails.
+;   out: eax = type node or 0
+; ebx = type so far, r12d = '*' count, r13 = index of the first '*',
+; r14d = suffix count; [rsp] = scratch
+try_type:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        xor     r12d, r12d
+        mov     r13, [p_pos]
+.stars:
+        call    p_kind
+        cmp     eax, TK_STAR
+        jne     short .base
+        call    p_advance
+        inc     r12d
+        cmp     r12d, MAX_DEPTH
+        ja      near .fail
+        jmp     short .stars
+.base:
+        cmp     eax, TK_IDENT
+        jne     near .fail
+        call    p_advance
+        mov     edi, NK_TNAME
+        mov     esi, eax
+        call    node_new
+        mov     ebx, eax
+        xor     r14d, r14d
+.suffix:
+        call    p_kind
+        cmp     eax, TK_LBRACKET
+        jne     near .wrap
+        mov     edi, 1
+        call    p_kind_at
+        cmp     eax, TK_RBRACKET
+        je      near .slice
+        mov     edi, NK_INT
+        cmp     eax, TK_INT
+        je      short .array
+        mov     edi, NK_NAME
+        cmp     eax, TK_IDENT
+        jne     near .wrap                   ; '[' starts something else, e.g. an index
+.array:
+        mov     [rsp], edi              ; kind of the size node
+        mov     edi, 2
+        call    p_kind_at
+        cmp     eax, TK_RBRACKET
+        jne     near .wrap
+        inc     r14d
+        cmp     r14d, MAX_DEPTH
+        ja      near .fail
+        call    p_advance               ; '['
+        mov     [rsp + 4], eax
+        call    p_advance               ; the size
+        mov     edi, [rsp]
+        mov     esi, eax
+        call    node_new
+        mov     [rsp], eax              ; size node
+        call    p_advance               ; ']'
+        mov     edi, NK_TARRAY
+        mov     esi, [rsp + 4]
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     ecx, [rsp]
+        mov     [rdx + N_B], ecx
+        mov     ebx, eax
+        jmp     near .suffix
+.slice:
+        inc     r14d
+        cmp     r14d, MAX_DEPTH
+        ja      short .fail
+        call    p_advance               ; '['
+        mov     [rsp + 4], eax
+        call    p_advance               ; ']'
+        mov     edi, NK_TSLICE
+        mov     esi, [rsp + 4]
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     ebx, eax
+        jmp     near .suffix
+.wrap:
+        ; Apply the leading '*'s: the last one written is the innermost.
+        test    r12d, r12d
+        jz      short .done
+        dec     r12d
+        lea     rsi, [r13 + r12]
+        mov     edi, NK_TPTR
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     ebx, eax
+        jmp     short .wrap
+.done:
+        mov     eax, ebx
+        jmp     short .out
+.fail:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; parse_type - a Type is required here (E0101 otherwise).  out: eax
+parse_type:
+        sub     rsp, 8
+        call    try_type
+        test    eax, eax
+        jz      short .missing
+        add     rsp, 8
+        ret
+.missing:
+        lea     rdi, [s_a_type]
+        jmp     near p_error_expected
+
+; parse_decl_type - a Type in a declaration, where full Envo could continue
+; with '?' (optional) or '<' (generic arguments): both are E0905 in Core.
+parse_decl_type:
+        push    rbx
+        call    parse_type
+        mov     ebx, eax
+        call    p_kind
+        cmp     eax, TK_QUESTION
+        je      short .optional
+        cmp     eax, TK_LT
+        je      short .generic
+        mov     eax, ebx
+        pop     rbx
+        ret
+.optional:
+        lea     rdi, [s_optional_types]
+        jmp     short .not_core
+.generic:
+        lea     rdi, [s_generic_types]
+.not_core:
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+
+; =============================================================================
+; Statements
+; =============================================================================
+
+; parse_statement - Statement (see the grammar).
+; ebx, r12d, r13d, r14d = parts of the statement; r15 = saved depth; [rsp] = scratch
+parse_statement:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     r15, [p_depth]
+        call    p_enter
+        call    p_kind
+        cmp     eax, TK_LBRACE
+        je      near .block
+        cmp     eax, TK_KW_UNSAFE
+        je      near .unsafe
+        cmp     eax, TK_KW_IF
+        je      near .if
+        cmp     eax, TK_KW_WHILE
+        je      near .while
+        cmp     eax, TK_KW_FOR
+        je      near .for
+        cmp     eax, TK_KW_MATCH
+        je      near .match
+        cmp     eax, TK_KW_BREAK
+        je      near .break
+        cmp     eax, TK_KW_CONTINUE
+        je      near .continue
+        cmp     eax, TK_KW_RETURN
+        je      near .return
+        cmp     eax, TK_KW_STRUCT
+        je      near .local_item
+        cmp     eax, TK_KW_ENUM
+        je      near .local_item
+        cmp     eax, TK_KW_CONST
+        je      near .local_item
+        cmp     eax, TK_KW_STATIC
+        je      near .local_item
+        call    parse_simple
+        mov     ebx, eax
+        call    p_end
+        mov     eax, ebx
+        jmp     near .out
+
+.block:
+        call    parse_block
+        jmp     near .out
+
+.unsafe:
+        call    p_advance
+        mov     ebx, eax
+        call    parse_block
+        mov     r12d, eax
+        mov     edi, NK_UNSAFE
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        jmp     near .out
+
+.if:
+        call    p_advance
+        mov     ebx, eax
+        call    paren_condition
+        mov     r12d, eax
+        call    parse_statement
+        mov     r13d, eax
+        xor     r14d, r14d
+        mov     edi, TK_KW_ELSE
+        call    p_accept
+        test    eax, eax
+        jz      short .if_node
+        call    parse_statement
+        mov     r14d, eax
+.if_node:
+        mov     edi, NK_IF
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     [rdx + N_B], r13d
+        mov     [rdx + N_C], r14d
+        jmp     near .out
+
+.while:
+        call    p_advance
+        mov     ebx, eax
+        call    paren_condition
+        mov     r12d, eax
+        call    parse_statement
+        mov     r13d, eax
+        mov     edi, NK_WHILE
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     [rdx + N_B], r13d
+        jmp     near .out
+
+.for:                                   ; 'for' '(' Simple? ';' Expr? ';' Simple? ')' Statement
+        call    p_advance
+        mov     ebx, eax
+        mov     edi, TK_LPAREN
+        call    p_expect
+        xor     r12d, r12d
+        xor     r13d, r13d
+        xor     r14d, r14d
+        call    p_kind
+        cmp     eax, TK_SEMI
+        je      short .for_condition
+        call    parse_simple
+        mov     r12d, eax
+.for_condition:
+        mov     edi, TK_SEMI
+        call    p_expect
+        call    p_kind
+        cmp     eax, TK_SEMI
+        je      short .for_step
+        call    parse_expr
+        mov     r13d, eax
+.for_step:
+        mov     edi, TK_SEMI
+        call    p_expect
+        call    p_kind
+        cmp     eax, TK_RPAREN
+        je      short .for_body
+        call    parse_simple
+        mov     r14d, eax
+.for_body:
+        mov     edi, TK_RPAREN
+        call    p_expect
+        call    parse_statement
+        mov     [rsp], eax
+        mov     edi, NK_FOR
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     [rdx + N_B], r13d
+        mov     [rdx + N_C], r14d
+        mov     ecx, [rsp]
+        mov     [rdx + N_D], ecx
+        jmp     near .out
+
+.match:
+        call    parse_match
+        jmp     short .out
+
+.break:
+        mov     r12d, NK_BREAK
+        jmp     short .jump
+.continue:
+        mov     r12d, NK_CONTINUE
+.jump:
+        call    p_advance
+        mov     edi, r12d
+        mov     esi, eax
+        call    node_new
+        mov     ebx, eax
+        call    p_end
+        mov     eax, ebx
+        jmp     short .out
+
+.return:
+        call    p_advance
+        mov     ebx, eax
+        xor     r12d, r12d
+        call    p_kind
+        cmp     eax, TK_SEMI
+        je      short .return_node
+        cmp     eax, TK_RBRACE
+        je      short .return_node
+        cmp     eax, TK_EOF
+        je      short .return_node
+        call    parse_expr
+        mov     r12d, eax
+.return_node:
+        mov     edi, NK_RETURN
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     ebx, eax
+        call    p_end
+        mov     eax, ebx
+        jmp     short .out
+
+.local_item:
+        lea     rdi, [s_local_items]
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+
+.out:
+        mov     [p_depth], r15
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; paren_condition - '(' Expr ')'.  out: eax = the expression
+paren_condition:
+        push    rbx
+        mov     edi, TK_LPAREN
+        call    p_expect
+        call    parse_expr
+        mov     ebx, eax
+        mov     edi, TK_RPAREN
+        call    p_expect
+        mov     eax, ebx
+        pop     rbx
+        ret
+
+; Block = '{' Statement* '}'
+parse_block:
+        push    rbx
+        sub     rsp, 16                 ; [rsp] = statement list pair
+        mov     qword [rsp], 0
+        mov     edi, TK_LBRACE
+        call    p_expect
+        mov     edi, NK_BLOCK
+        mov     esi, eax
+        call    node_new
+        mov     ebx, eax
+.loop:
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .done
+        cmp     eax, TK_EOF
+        je      short .eof
+        call    parse_statement
+        mov     rdi, rsp
+        mov     esi, eax
+        call    list_add
+        jmp     short .loop
+.done:
+        call    p_advance
+        mov     edi, ebx
+        call    node_ptr
+        mov     ecx, [rsp]
+        mov     [rax + N_A], ecx
+        mov     eax, ebx
+        add     rsp, 16
+        pop     rbx
+        ret
+.eof:
+        mov     edi, TK_RBRACE
+        jmp     near p_error_expected_kind
+
+; Simple = 'var' IDENT '=' Expr
+;        | Type IDENT ( '=' Expr )?             ([core.decl.1])
+;        | Expr ( AssignOp Expr | '++' | '--' )?
+; ebx = expression, r12d = type or operator token, r13 = start / scratch,
+; r14 = saved n_count
+parse_simple:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        call    p_kind
+        cmp     eax, TK_KW_VAR
+        je      near .var
+        mov     r13, [p_pos]
+        mov     r14, [n_count]
+        call    try_type
+        test    eax, eax
+        jz      short .expression
+        mov     r12d, eax
+        call    p_kind
+        cmp     eax, TK_IDENT
+        jne     short .expression
+        mov     edi, 1
+        call    p_kind_at
+        cmp     eax, TK_EQ
+        je      near .declaration
+        cmp     eax, TK_SEMI
+        je      near .declaration
+        cmp     eax, TK_RBRACE
+        je      near .declaration
+        cmp     eax, TK_EOF
+        je      near .declaration
+.expression:
+        mov     [p_pos], r13            ; backtrack
+        mov     [n_count], r14
+        call    parse_expr
+        mov     ebx, eax
+        call    p_kind
+        lea     rdx, [tok_class]
+        test    byte [rdx + rax], TC_ASSIGN
+        jnz     short .assign
+        cmp     eax, TK_PLUS_PLUS
+        je      short .increment
+        cmp     eax, TK_MINUS_MINUS
+        je      short .decrement
+        mov     edi, NK_EXPR
+        mov     esi, r13d               ; positioned at the statement's first token
+        call    node_new
+        mov     [rdx + N_A], ebx
+        jmp     near .out
+.assign:
+        call    p_advance
+        mov     r12d, eax
+        mov     edi, ebx
+        call    is_place
+        test    eax, eax
+        jz      short .bad_target
+        call    parse_expr
+        mov     r13d, eax
+        mov     edi, NK_ASSIGN
+        mov     esi, r12d
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     [rdx + N_B], r13d
+        jmp     near .out
+.increment:
+        mov     r13d, NK_INC
+        jmp     short .step
+.decrement:
+        mov     r13d, NK_DEC
+.step:
+        call    p_advance
+        mov     r12d, eax
+        mov     edi, ebx
+        call    is_place
+        test    eax, eax
+        jz      short .bad_target
+        mov     edi, r13d
+        mov     esi, r12d
+        call    node_new
+        mov     [rdx + N_A], ebx
+        jmp     short .out
+.bad_target:
+        mov     edi, E_BAD_ASSIGN_TARGET
+        mov     esi, r12d
+        jmp     near p_error_at
+.var:
+        call    p_advance
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     r12d, eax
+        mov     edi, TK_EQ
+        call    p_expect
+        call    parse_expr
+        mov     ebx, eax
+        mov     edi, NK_VAR
+        mov     esi, r12d
+        call    node_new
+        mov     [rdx + N_B], ebx
+        jmp     short .out
+.declaration:
+        call    p_advance               ; the name
+        mov     r13d, eax
+        xor     ebx, ebx
+        mov     edi, TK_EQ
+        call    p_accept
+        test    eax, eax
+        jz      short .declaration_node
+        call    parse_expr
+        mov     ebx, eax
+.declaration_node:
+        mov     edi, NK_VAR
+        mov     esi, r13d
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     [rdx + N_B], ebx
+.out:
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; 'match' Expr '{' Arm* '}'
+; Arm = Pattern ( '|' Pattern )* '=>' ( Block ','? | Simple ( ',' | before '}' ) )
+; ebx = match node, r12d = '=>' token, r13d = arm body;
+; [rsp] = arm list pair, [rsp + 8] = pattern list pair
+parse_match:
+        push    rbx
+        push    r12
+        push    r13
+        sub     rsp, 16
+        mov     qword [rsp], 0
+        call    p_advance
+        mov     ebx, eax
+        call    parse_expr
+        mov     r12d, eax
+        mov     edi, NK_MATCH
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     ebx, eax
+        mov     edi, TK_LBRACE
+        call    p_expect
+.arm:
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      near .done
+        cmp     eax, TK_EOF
+        je      near .eof
+        mov     qword [rsp + 8], 0
+.pattern:
+        call    p_kind
+        cmp     eax, TK_KW_UNDERSCORE
+        jne     short .pattern_expression
+        call    p_advance
+        mov     edi, NK_WILD
+        mov     esi, eax
+        call    node_new
+        jmp     short .pattern_add
+.pattern_expression:
+        call    parse_prefix            ; not parse_expr: '|' separates patterns
+.pattern_add:
+        lea     rdi, [rsp + 8]
+        mov     esi, eax
+        call    list_add
+        mov     edi, TK_PIPE
+        call    p_accept
+        test    eax, eax
+        jnz     short .pattern
+        mov     edi, TK_FAT_ARROW
+        call    p_expect
+        mov     r12d, eax
+        call    p_kind
+        cmp     eax, TK_LBRACE
+        jne     short .simple_body
+        call    parse_block
+        mov     r13d, eax
+        mov     edi, TK_COMMA
+        call    p_accept
+        jmp     short .arm_node
+.simple_body:
+        call    parse_simple
+        mov     r13d, eax
+        mov     edi, TK_COMMA
+        call    p_accept
+        test    eax, eax
+        jnz     short .arm_node
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .arm_node
+        lea     rdi, [s_comma_or_brace]
+        jmp     near p_error_expected
+.arm_node:
+        mov     edi, NK_ARM
+        mov     esi, r12d
+        call    node_new
+        mov     ecx, [rsp + 8]
+        mov     [rdx + N_A], ecx
+        mov     [rdx + N_B], r13d
+        mov     rdi, rsp
+        mov     esi, eax
+        call    list_add
+        jmp     near .arm
+.done:
+        call    p_advance
+        mov     edi, ebx
+        call    node_ptr
+        mov     ecx, [rsp]
+        mov     [rax + N_B], ecx
+        mov     eax, ebx
+        add     rsp, 16
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.eof:
+        mov     edi, TK_RBRACE
+        jmp     near p_error_expected_kind
+
+; =============================================================================
+; Expressions
+; =============================================================================
+
+; Expr = Binary(1)
+parse_expr:
+        push    rbx
+        sub     rsp, 16
+        mov     rbx, [p_depth]
+        call    p_enter
+        mov     edi, 1
+        call    parse_binary
+        mov     [p_depth], rbx
+        add     rsp, 16
+        pop     rbx
+        ret
+
+; Binary(p) = Cast ( BinOp(q) Binary(q + 1) )*  for operators with level q >= p.
+; Each operator in a chain counts as a nesting level, because the tree is
+; left-deep and later passes walk it recursively.
+;   in: edi = minimum level p
+; ebx = left operand, r12d = p, r13d = level / right operand, r14d = operator
+; kind, r15 = saved depth; [rsp] = operator token
+parse_binary:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     r12d, edi
+        mov     r15, [p_depth]
+        call    parse_cast
+        mov     ebx, eax
+.loop:
+        call    p_kind
+        mov     r14d, eax
+        lea     rdx, [tok_class]
+        movzx   ecx, byte [rdx + rax]
+        test    ecx, TC_NOT_CORE
+        jnz     near .not_core
+        and     ecx, TC_PREC
+        jz      near .done
+        cmp     ecx, r12d
+        jb      near .done
+        mov     r13d, ecx
+        cmp     ecx, PREC_COMPARE
+        jne     short .take
+        ; [core.syntax.2] a comparison may not take an unparenthesized comparison
+        ; as its left operand
+        mov     edi, ebx
+        call    node_ptr
+        cmp     word [rax + N_KIND], NK_BINARY
+        jne     short .take
+        test    dword [rax + N_FLAGS], NF_PAREN
+        jnz     short .take
+        movzx   edx, word [rax + N_OP]
+        lea     rax, [tok_class]
+        movzx   edx, byte [rax + rdx]
+        and     edx, TC_PREC
+        cmp     edx, PREC_COMPARE
+        jne     short .take
+        mov     edi, E_CHAINED_COMPARISON
+        mov     rsi, [p_pos]
+        jmp     near p_error_at
+.take:
+        call    p_enter
+        call    p_advance
+        mov     [rsp], eax
+        lea     edi, [r13 + 1]
+        call    parse_binary
+        mov     r13d, eax
+        mov     edi, NK_BINARY
+        mov     esi, [rsp]
+        call    node_new
+        mov     [rdx + N_OP], r14w
+        mov     [rdx + N_A], ebx
+        mov     [rdx + N_B], r13d
+        mov     ebx, eax
+        jmp     near .loop
+.not_core:
+        xor     edi, edi
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+.done:
+        mov     [p_depth], r15
+        mov     eax, ebx
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; Cast = Prefix ( 'as' Type )*
+; ebx = expression, r12d = 'as' token / type, r13 = saved depth
+parse_cast:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r13, [p_depth]
+        call    parse_prefix
+        mov     ebx, eax
+.loop:
+        call    p_kind
+        cmp     eax, TK_KW_AS
+        jne     short .done
+        call    p_enter
+        call    p_advance
+        mov     r12d, eax
+        call    parse_type
+        mov     esi, r12d
+        mov     r12d, eax
+        mov     edi, NK_CAST
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     [rdx + N_B], r12d
+        mov     ebx, eax
+        jmp     short .loop
+.done:
+        mov     [p_depth], r13
+        mov     eax, ebx
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; Prefix = ( '-' | '!' | '~' | '*' | '&' ) Prefix | Postfix
+; ebx = operator token, r12d = operator kind, r13 = saved depth, r14d = operand
+parse_prefix:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        mov     r13, [p_depth]
+        call    p_enter
+        call    p_kind
+        mov     r12d, eax
+        cmp     eax, TK_MINUS
+        je      short .unary
+        cmp     eax, TK_BANG
+        je      short .unary
+        cmp     eax, TK_TILDE
+        je      short .unary
+        cmp     eax, TK_STAR
+        je      short .unary
+        cmp     eax, TK_AMP
+        je      short .unary
+        call    parse_postfix
+        jmp     short .out
+.unary:
+        call    p_advance
+        mov     ebx, eax
+        call    parse_prefix
+        mov     r14d, eax
+        mov     edi, NK_UNARY
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_OP], r12w
+        mov     [rdx + N_A], r14d
+.out:
+        mov     [p_depth], r13
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; Postfix = Primary ( '(' Args? ')' | '[' Expr ']' | '.' IDENT )*
+; ebx = expression, r12d = token, r13 = saved depth, r14d = scratch;
+; [rsp] = argument list pair
+parse_postfix:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        mov     r13, [p_depth]
+        call    parse_primary
+        mov     ebx, eax
+.loop:
+        call    p_kind
+        cmp     eax, TK_LPAREN
+        je      short .call
+        cmp     eax, TK_LBRACKET
+        je      near .index
+        cmp     eax, TK_DOT
+        je      near .member
+        jmp     near .done
+.call:
+        call    p_enter
+        call    p_advance
+        mov     r12d, eax
+        mov     qword [rsp], 0
+.argument:
+        call    p_kind
+        cmp     eax, TK_RPAREN
+        je      short .arguments_done
+        call    parse_expr
+        mov     r14d, eax
+        call    p_kind
+        cmp     eax, TK_COLON
+        je      short .named_argument
+        mov     rdi, rsp
+        mov     esi, r14d
+        call    list_add
+        mov     edi, TK_COMMA
+        call    p_accept
+        test    eax, eax
+        jnz     short .argument
+.arguments_done:
+        mov     edi, TK_RPAREN
+        call    p_expect
+        mov     edi, NK_CALL
+        mov     esi, r12d
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     ecx, [rsp]
+        mov     [rdx + N_B], ecx
+        mov     ebx, eax
+        jmp     near .loop
+.named_argument:
+        lea     rdi, [s_named_args]
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+.index:
+        call    p_enter
+        call    p_advance
+        mov     r12d, eax
+        call    parse_expr
+        mov     r14d, eax
+        mov     edi, TK_RBRACKET
+        call    p_expect
+        mov     edi, NK_INDEX
+        mov     esi, r12d
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     [rdx + N_B], r14d
+        mov     ebx, eax
+        jmp     near .loop
+.member:
+        call    p_enter
+        call    p_advance
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     edi, NK_MEMBER
+        mov     esi, eax
+        call    node_new
+        mov     [rdx + N_A], ebx
+        mov     ebx, eax
+        jmp     near .loop
+.done:
+        mov     [p_depth], r13
+        mov     eax, ebx
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; Primary = INT | CHAR | STRING | 'true' | 'false' | IDENT | '(' Expr ')'
+;         | 'sizeof' '(' Type ')' | 'alignof' '(' Type ')'
+;         | 'new' Type '{' ( Init ( ',' Init )* ','? )? '}'     Init = IDENT '=' Expr
+; ebx = token, r12d = kind / type, r13d = scratch;
+; [rsp] = initializer list pair, [rsp + 8] = scratch
+parse_primary:
+        push    rbx
+        push    r12
+        push    r13
+        sub     rsp, 16
+        call    p_kind
+        mov     r12d, NK_INT
+        cmp     eax, TK_INT
+        je      near .leaf
+        mov     r12d, NK_CHAR
+        cmp     eax, TK_CHAR
+        je      near .leaf
+        mov     r12d, NK_STRING
+        cmp     eax, TK_STRING
+        je      near .leaf
+        mov     r12d, NK_NAME
+        cmp     eax, TK_IDENT
+        je      near .leaf
+        mov     r12d, NK_BOOL
+        cmp     eax, TK_KW_TRUE
+        je      short .leaf
+        cmp     eax, TK_KW_FALSE
+        je      short .leaf
+        cmp     eax, TK_LPAREN
+        je      near .paren
+        mov     r12d, NK_SIZEOF
+        cmp     eax, TK_KW_SIZEOF
+        je      near .type_query
+        mov     r12d, NK_ALIGNOF
+        cmp     eax, TK_KW_ALIGNOF
+        je      near .type_query
+        cmp     eax, TK_KW_NEW
+        je      near .new
+        cmp     eax, TK_FLOAT
+        je      near .float
+        cmp     eax, TK_LBRACKET
+        je      near .array_literal
+        ; [core.syntax.5] a keyword only full Envo has
+        cmp     eax, TK_KW_FIRST
+        jb      short .expected
+        cmp     eax, TK_KW_LAST
+        ja      short .expected
+        lea     rdx, [tok_class]
+        test    byte [rdx + rax], TC_CORE_KW
+        jnz     short .expected
+        xor     edi, edi
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+.expected:
+        lea     rdi, [s_an_expression]
+        jmp     near p_error_expected
+
+.leaf:
+        call    p_advance
+        mov     edi, r12d
+        mov     esi, eax
+        call    node_new
+        jmp     near .out
+
+.paren:
+        call    p_advance
+        call    parse_expr
+        mov     ebx, eax
+        call    p_kind
+        cmp     eax, TK_COMMA
+        je      near .tuple
+        mov     edi, TK_RPAREN
+        call    p_expect
+        mov     edi, ebx
+        call    node_ptr
+        or      dword [rax + N_FLAGS], NF_PAREN
+        mov     eax, ebx
+        jmp     near .out
+
+.type_query:                            ; sizeof(T), alignof(T)
+        call    p_advance
+        mov     ebx, eax
+        mov     edi, TK_LPAREN
+        call    p_expect
+        call    parse_decl_type
+        mov     r13d, eax
+        mov     edi, TK_RPAREN
+        call    p_expect
+        mov     edi, r12d
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r13d
+        jmp     near .out
+
+.new:
+        call    p_advance
+        mov     ebx, eax
+        call    parse_decl_type
+        mov     r12d, eax
+        call    p_kind
+        cmp     eax, TK_LPAREN
+        je      near .constructor
+        mov     edi, TK_LBRACE
+        call    p_expect
+        mov     qword [rsp], 0
+.init:
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .inits_done
+        mov     edi, TK_IDENT
+        call    p_expect
+        mov     r13d, eax
+        mov     edi, TK_EQ
+        call    p_expect
+        call    parse_expr
+        mov     [rsp + 8], eax
+        mov     edi, NK_INIT
+        mov     esi, r13d
+        call    node_new
+        mov     ecx, [rsp + 8]
+        mov     [rdx + N_A], ecx
+        mov     rdi, rsp
+        mov     esi, eax
+        call    list_add
+        mov     edi, TK_COMMA
+        call    p_accept
+        test    eax, eax
+        jnz     short .init
+        call    p_kind
+        cmp     eax, TK_RBRACE
+        je      short .inits_done
+        lea     rdi, [s_comma_or_brace]
+        jmp     short p_error_expected
+.inits_done:
+        call    p_advance
+        mov     edi, NK_NEW
+        mov     esi, ebx
+        call    node_new
+        mov     [rdx + N_A], r12d
+        mov     ecx, [rsp]
+        mov     [rdx + N_B], ecx
+        jmp     short .out
+
+.tuple:
+        lea     rdi, [s_tuples]
+        jmp     short .not_core
+.constructor:
+        lea     rdi, [s_constructors]
+        jmp     short .not_core
+.float:
+        lea     rdi, [s_floats]
+        jmp     short .not_core
+.array_literal:
+        lea     rdi, [s_array_literals]
+.not_core:
+        mov     rsi, [p_pos]
+        jmp     near p_error_not_core
+
+.out:
+        add     rsp, 16
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Errors. None of these return.
+; =============================================================================
+
+; p_error_expected - E0101 at the current token: "expected <rdi>, found <token>".
+;   in: rdi = NUL-terminated description
+p_error_expected:
+        and     rsp, -16
+        mov     rbx, rdi
+        mov     r12d, -1
+        jmp     short p_error_expected_common
+
+; p_error_expected_kind - E0101: "expected `<spelling of kind edi>`, found <token>".
+p_error_expected_kind:
+        and     rsp, -16
+        xor     ebx, ebx
+        mov     r12d, edi
+p_error_expected_common:
+        mov     rdi, [p_pos]
+        call    tok_addr
+        mov     esi, [rax + TOK_START]
+        mov     edi, E_EXPECTED
+        call    diag_header
+        lea     rdi, [w_err]
+        lea     rsi, [s_expected]
+        mov     edx, s_expected_len
+        call    w_bytes
+        test    rbx, rbx
+        jz      short .kind
+        lea     rdi, [w_err]
+        mov     rsi, rbx
+        call    w_cstr
+        jmp     short .found
+.kind:
+        mov     edi, r12d
+        call    w_err_spelling
+.found:
+        lea     rdi, [w_err]
+        lea     rsi, [s_found]
+        mov     edx, s_found_len
+        call    w_bytes
+        mov     rdi, [p_pos]
+        call    w_err_token
+        jmp     near diag_finish
+
+; p_error_not_core - E0905: "not part of Envo-Core: <rdi>", or the token's text
+; when rdi is 0.
+;   in: rdi = description or 0, esi = token index
+p_error_not_core:
+        and     rsp, -16
+        mov     rbx, rdi
+        mov     r12d, esi
+        mov     edi, esi
+        call    tok_addr
+        mov     esi, [rax + TOK_START]
+        mov     edi, E_CORE_CONSTRUCT
+        call    diag_header
+        lea     rdi, [w_err]
+        lea     rsi, [s_not_core]
+        mov     edx, s_not_core_len
+        call    w_bytes
+        test    rbx, rbx
+        jz      short .token
+        lea     rdi, [w_err]
+        mov     rsi, rbx
+        call    w_cstr
+        jmp     near diag_finish
+.token:
+        mov     edi, r12d
+        call    w_err_token
+        jmp     near diag_finish
+
+; p_error_at - report a fixed-message error at a token.
+;   in: edi = error code, esi = token index
+p_error_at:
+        and     rsp, -16
+        mov     ebx, edi
+        mov     edi, esi
+        call    tok_addr
+        mov     esi, [rax + TOK_START]
+        mov     edi, ebx
+        jmp     near diag_error
+
+; w_err_spelling - write "`<spelling>`" for token kind edi to stderr.
+w_err_spelling:
+        push    rbx
+        mov     ebx, edi
+        lea     rdi, [w_err]
+        mov     esi, '`'
+        call    w_byte
+        mov     eax, ebx
+        shl     eax, 4
+        lea     rsi, [tok_table]
+        add     rsi, rax
+        movzx   edx, byte [rsi]
+        inc     rsi
+        lea     rdi, [w_err]
+        call    w_bytes
+        lea     rdi, [w_err]
+        mov     esi, '`'
+        call    w_byte
+        pop     rbx
+        ret
+
+; w_err_token - describe token edi on stderr: "`text`", or "end of file".
+w_err_token:
+        push    rbx
+        mov     ebx, edi
+        call    tok_addr
+        cmp     word [rax + TOK_KIND], TK_EOF
+        je      short .eof
+        lea     rdi, [w_err]
+        mov     esi, '`'
+        call    w_byte
+        lea     rdi, [w_err]
+        mov     esi, ebx
+        call    w_token_text
+        lea     rdi, [w_err]
+        mov     esi, '`'
+        call    w_byte
+        pop     rbx
+        ret
+.eof:
+        lea     rdi, [w_err]
+        lea     rsi, [s_end_of_file]
+        mov     edx, s_end_of_file_len
+        call    w_bytes
+        pop     rbx
+        ret
+
+; w_token_text - write the source text of token esi to writer rdi.
+w_token_text:
+        mov     eax, esi
+        shl     rax, 4
+        add     rax, [p_toks]
+        mov     esi, [rax + TOK_START]
+        add     rsi, [diag_src]
+        mov     edx, [rax + TOK_LEN]
+        jmp     near w_bytes
+
+; =============================================================================
+; ast_dump - print a list of nodes with their subtrees, one node per line:
+;   <2 spaces per level><name>[ <token text>] @<line>:<col>
+; Child slots print in order (node_table gives how many); an empty slot prints
+; "-" so slot positions stay unambiguous. Format: tests/golden/README.md.
+;   in: edi = first node of the list, esi = depth
+; ebx = node, r12d = depth, r13 = node address, r14 = node_table entry,
+; r15d = child slot
+; =============================================================================
+ast_dump:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        mov     r12d, esi
+.node:
+        test    ebx, ebx
+        jz      near .done
+        mov     edi, r12d
+        call    dump_indent
+        mov     edi, ebx
+        call    node_ptr
+        mov     r13, rax
+        movzx   eax, word [r13 + N_KIND]
+        shl     eax, 4
+        lea     r14, [node_table]
+        add     r14, rax
+        lea     rdi, [w_out]
+        lea     rsi, [r14 + 1]
+        movzx   edx, byte [r14]
+        call    w_bytes
+        cmp     byte [r14 + NT_TEXT], 0
+        je      short .position
+        lea     rdi, [w_out]
+        mov     esi, ' '
+        call    w_byte
+        lea     rdi, [w_out]
+        mov     esi, [r13 + N_TOK]
+        call    w_token_text
+.position:
+        lea     rdi, [w_out]
+        lea     rsi, [s_at]
+        mov     edx, s_at_len
+        call    w_bytes
+        mov     edi, [r13 + N_TOK]
+        call    tok_addr
+        mov     esi, [rax + TOK_LINE]
+        mov     r15d, [rax + TOK_START] ; r15 is free until the child loop
+        lea     rdi, [w_out]
+        call    w_u64
+        lea     rdi, [w_out]
+        mov     esi, ':'
+        call    w_byte
+        mov     edi, r15d
+        call    src_col
+        lea     rdi, [w_out]
+        mov     rsi, rax
+        call    w_u64
+        cmp     byte [c_dump], 0        ; `envoc0 check` adds types and layouts
+        je      short .line_end
+        mov     edi, ebx
+        call    c_dump_extra
+.line_end:
+        lea     rdi, [w_out]
+        mov     esi, 10
+        call    w_byte
+        xor     r15d, r15d
+.child:
+        movzx   eax, byte [r14 + NT_SLOTS]
+        cmp     r15d, eax
+        jae     short .next
+        mov     edi, [r13 + r15*4 + N_A]
+        lea     esi, [r12 + 1]
+        test    edi, edi
+        jz      short .empty
+        call    ast_dump
+        jmp     short .child_next
+.empty:
+        mov     edi, esi
+        call    dump_indent
+        lea     rdi, [w_out]
+        mov     esi, '-'
+        call    w_byte
+        lea     rdi, [w_out]
+        mov     esi, 10
+        call    w_byte
+.child_next:
+        inc     r15d
+        jmp     short .child
+.next:
+        mov     ebx, [r13 + N_NEXT]
+        jmp     near .node
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; dump_indent - write 2 * edi spaces to stdout.
+dump_indent:
+        push    rbx
+        lea     ebx, [rdi + rdi]
+.loop:
+        test    ebx, ebx
+        jz      short .done
+        lea     rdi, [w_out]
+        mov     esi, ' '
+        call    w_byte
+        dec     ebx
+        jmp     short .loop
+.done:
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------- strings
+s_an_identifier:        db 'an identifier', 0
+s_a_type:               db 'a type', 0
+s_an_expression:        db 'an expression', 0
+s_an_item:              db 'a function, `struct`, `enum`, `const` or `static`', 0
+s_fn_body:              db '`{` or `=>`', 0
+s_comma_or_brace:       db '`,` or `}`', 0
+s_optional_types:       db 'optional types (`T?`)', 0
+s_generic_types:        db 'generic types', 0
+s_generic_functions:    db 'generic functions', 0
+s_default_params:       db 'default parameter values', 0
+s_struct_bases:         db 'interface lists on structs', 0
+s_methods:              db 'methods', 0
+s_properties:           db 'properties', 0
+s_field_inits:          db 'field initializers', 0
+s_enum_payloads:        db 'enum payloads', 0
+s_local_items:          db 'local items (`struct`, `enum`, `const` and `static` inside a block)', 0
+s_named_args:           db 'named arguments', 0
+s_tuples:               db 'tuples', 0
+s_constructors:         db 'constructors', 0
+s_floats:               db 'floating-point literals', 0
+s_array_literals:       db 'array literals', 0
+s_expected:             db 'expected '
+s_expected_len          equ $ - s_expected
+s_found:                db ', found '
+s_found_len             equ $ - s_found
+s_end_of_file:          db 'end of file'
+s_end_of_file_len       equ $ - s_end_of_file
+s_not_core:             db 'not part of Envo-Core: '
+s_not_core_len          equ $ - s_not_core
+s_at:                   db ' @'
+s_at_len                equ $ - s_at
+msg_tree_full:          db 'syntax tree capacity exceeded'
+msg_tree_full_len       equ $ - msg_tree_full
+
+        align   8, db 0
+p_toks:         dq 0                    ; token array
+p_ntoks:        dq 0                    ; token count
+p_pos:          dq 0                    ; index of the current token
+p_depth:        dq 0                    ; nesting depth ([core.syntax.4])
+n_base:         dq 0                    ; node array
+n_count:        dq 0                    ; nodes in use, including node 0
+n_cap:          dq 0                    ; node array capacity
+p_single_start: dd 0                    ; parse: one file, starting at token 0

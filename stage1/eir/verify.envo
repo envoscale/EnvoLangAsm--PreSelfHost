@@ -1,0 +1,408 @@
+// The EIR verifier (eir.md section 6). For EIR text, a failure is an E06xx diagnostic at
+// the offending instruction; for EIR the compiler built itself it is an internal error.
+
+void VFail(*Module m, u32 pos, u32 code, str msg) {
+    bool text;
+    u32 file;
+    unsafe {
+        text = m.FromText;
+        file = m.Text;
+    }
+    if (text) Fail(file, pos as usize, code, msg);
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "EIR verifier: ");
+        BufStr(&b, msg);
+        Bug(BufView(&b));
+    }
+}
+
+u32 VType(*Module m, u32 v) {
+    return EValGet(m, v).Type;
+}
+
+// The type of value operand o (E0605 if it is not a value).
+u32 VOpType(*Module m, u32 o) {
+    EOp op = EOpGet(m, o);
+    if (op.Kind != OK_VALUE) VFail(m, op.Pos, 605, "expected a value operand");
+    return VType(m, op.Ref);
+}
+
+void VExpect(*Module m, u32 o, u32 t, str what) {
+    if (VOpType(m, o) != t) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "mismatched types: ");
+            BufStr(&b, what);
+            VFail(m, EOpGet(m, o).Pos, 605, BufView(&b));
+        }
+    }
+}
+
+// Does constant v fit type t ([eir.verify.3])?
+bool VFits(*Module m, u64 v, u32 t) {
+    u8 k = ETyGet(m, t).Kind;
+    if (k == EK_BOOL) return v <= 1;
+    if (k == EK_PTR || k == EK_F64 || k == EK_I64 || k == EK_U64) return true;
+    if (k == EK_F32) return v >> 32 == 0;
+    u64 bits = EBits(m, t) as u64;
+    if (EIsSigned(m, t)) {
+        u64 shift = 64 - bits;
+        return ((v << shift) as i64 >> shift) as u64 == v;
+    }
+    return v >> bits == 0;
+}
+
+// Branch target o: the block exists and gets one argument of the right type per
+// parameter ([eir.verify.2]).
+void VTarget(*Module m, u32 o, u32 func) {
+    EOp op = EOpGet(m, o);
+    if (op.Kind != OK_TARGET) VFail(m, op.Pos, 605, "expected a block");
+    EBlock target = EBlockGet(m, op.Ref);
+    if (target.Func != func) VFail(m, op.Pos, 603, "branch to a block of another function");
+    if (op.Ref == EFuncGet(m, func).FirstBlock) VFail(m, op.Pos, 607, "a branch cannot target the entry block");
+    if (op.NArgs != target.NParams) VFail(m, op.Pos, 607, "wrong number of branch arguments");
+    for (u32 i = 0; i < op.NArgs; i++) {
+        if (VType(m, EArg(m, op.Args + i)) != VType(m, target.FirstParam + i)) VFail(m, op.Pos, 607, "branch argument type does not match the block parameter");
+    }
+}
+
+// The per-instruction rules ([eir.verify.3], [eir.verify.6], [eir.verify.7]).
+void VInst(*Module m, u32 i, u32 func) {
+    EInst inst = EInstGet(m, i);
+    OpInfo info = OpTable(inst.Op);
+    u8 sh = info.Shape;
+    u32 f = inst.FirstOp;
+    u32 n = inst.NOps;
+    u32 pos = inst.Pos;
+    u32 t = inst.Ty;
+    if (sh == SH_CONST) {
+        if (!EIsScalar(m, t)) VFail(m, pos, 605, "`const` needs a scalar type");
+        if (!VFits(m, inst.Imm, t)) VFail(m, pos, 613, "constant does not fit its type");
+    } else if (sh == SH_ADDR) {
+        // resolved by name when read; nothing more to check
+    } else if (sh == SH_SLOT) {
+        if (t == ET_VOID) VFail(m, pos, 605, "`slot` needs a sized type");
+    } else if (sh == SH_UNARY_V) {
+        VExpect(m, f, ET_PTR, "`slot.end` needs a `ptr`");
+    } else if (sh == SH_BIN || sh == SH_UN || sh == SH_CMP) {
+        bool ok = EIsInt(m, t);
+        if (info.FloatOnly) ok = EIsFloat(m, t);
+        else if (!info.IntOnly) ok = EIsScalar(m, t);
+        // the bitwise operations also apply to bool
+        if ((inst.Op == 14 || inst.Op == 15 || inst.Op == 16 || inst.Op == 17) && t == ET_BOOL) ok = true;
+        if (!ok) VFail(m, pos, 605, "this instruction cannot operate on this type");
+        for (u32 k = 0; k < n; k++) VExpect(m, f + k, t, "operand type differs from the instruction's type");
+    } else if (sh == SH_SELECT) {
+        if (!EIsScalar(m, t)) VFail(m, pos, 605, "`select` needs a scalar type");
+        VExpect(m, f, ET_BOOL, "the condition must be `bool`");
+        VExpect(m, f + 1, t, "operand type differs from the instruction's type");
+        VExpect(m, f + 2, t, "operand type differs from the instruction's type");
+    } else if (sh == SH_CONV) {
+        u32 t2 = inst.Ty2;
+        VExpect(m, f, t, "operand type differs from the conversion's source type");
+        bool ok = false;
+        u16 op = inst.Op;
+        if (op == 32) ok = EIsInt(m, t) && EIsInt(m, t2) && EBits(m, t2) < EBits(m, t);
+        if (op == 33 || op == 34) ok = EIsInt(m, t) && EIsInt(m, t2) && EBits(m, t2) > EBits(m, t);
+        if (op == 35) ok = EIsInt(m, t) && EIsFloat(m, t2);
+        if (op == 36) ok = EIsFloat(m, t) && EIsInt(m, t2);
+        if (op == 37) ok = ETyGet(m, t).Kind == EK_F32 && ETyGet(m, t2).Kind == EK_F64;
+        if (op == 38) ok = ETyGet(m, t).Kind == EK_F64 && ETyGet(m, t2).Kind == EK_F32;
+        if (op == 39) ok = t == ET_PTR && EIsInt(m, t2) && EBits(m, t2) == 64;
+        if (op == 40) ok = EIsInt(m, t) && EBits(m, t) == 64 && t2 == ET_PTR;
+        if (op == 41) ok = EIsScalar(m, t) && EIsScalar(m, t2) && ETyGet(m, t).Size == ETyGet(m, t2).Size;
+        if (!ok) VFail(m, pos, 605, "invalid conversion between these types");
+    } else if (sh == SH_LOAD) {
+        if (!EIsScalar(m, t)) VFail(m, pos, 605, "`load` reads a scalar type");
+        VExpect(m, f, ET_PTR, "the address must be a `ptr`");
+    } else if (sh == SH_STORE) {
+        if (!EIsScalar(m, t)) VFail(m, pos, 605, "`store` writes a scalar type");
+        VExpect(m, f, t, "the stored value differs from the instruction's type");
+        VExpect(m, f + 1, ET_PTR, "the address must be a `ptr`");
+    } else if (sh == SH_FIELD) {
+        ETy st = ETyGet(m, t);
+        if (st.Kind != EK_STRUCT) VFail(m, pos, 605, "`fieldaddr` needs a struct type");
+        if (inst.Imm >= st.NFields as u64) VFail(m, pos, 611, "no such field");
+        VExpect(m, f, ET_PTR, "the address must be a `ptr`");
+    } else if (sh == SH_ELEM) {
+        if (t == ET_VOID) VFail(m, pos, 605, "`elemaddr` needs a sized type");
+        VExpect(m, f, ET_PTR, "the address must be a `ptr`");
+        if (!EIsInt(m, VOpType(m, f + 1))) VFail(m, EOpGet(m, f + 1).Pos, 605, "the index must be an integer");
+    } else if (sh == SH_PTRADD) {
+        VExpect(m, f, ET_PTR, "the address must be a `ptr`");
+        VExpect(m, f + 1, ET_I64, "the offset must be an `i64`");
+    } else if (sh == SH_VALUES) {
+        u16 op = inst.Op;
+        if (op == 47 || op == 48) {
+            for (u32 k = 0; k + 1 < n; k++) VExpect(m, f + k, ET_PTR, "the address must be a `ptr`");
+            EOp size = EOpGet(m, f + n - 1);
+            if (size.Kind != OK_INT) VExpect(m, f + n - 1, ET_U64, "the size must be a `u64`");
+        } else if (op == 50) {
+            for (u32 k = 0; k < 3; k++) VExpect(m, f + k, ET_U64, "`bounds.range` takes `u64` operands");
+        } else {
+            VExpect(m, f, ET_PTR, "the address must be a `ptr`");
+            VExpect(m, f + 1, ET_U64, "the length must be a `u64`");
+            VExpect(m, f + 2, ET_U64, "the offset must be a `u64`");
+        }
+    } else if (sh == SH_BOUNDS) {
+        if (!EIsInt(m, t)) VFail(m, pos, 605, "`bounds` needs an integer type");
+        VExpect(m, f, t, "operand type differs from the instruction's type");
+        VExpect(m, f + 1, t, "operand type differs from the instruction's type");
+    } else if (sh == SH_CALL) {
+        // [eir.verify.6]
+        EFunc callee = EFuncGet(m, EOpGet(m, f).Ref);
+        if (n - 1 != callee.NParams) VFail(m, pos, 610, "wrong number of arguments");
+        for (u32 k = 1; k < n; k++) VExpect(m, f + k, VType(m, callee.FirstValue + k - 1), "argument type differs from the parameter");
+    } else if (sh == SH_CALLIND) {
+        if (t != ET_VOID && !EIsScalar(m, t)) VFail(m, pos, 605, "a call returns a scalar or `void`");
+        if (inst.Result != 0 && t == ET_VOID) VFail(m, pos, 610, "this call returns nothing");
+        VExpect(m, f + n - 1, ET_PTR, "the callee must be a `ptr`");
+        for (u32 k = 0; k + 1 < n; k++) VOpType(m, f + k);
+    } else if (sh == SH_INTRINSIC) {
+        Intrinsic x = IntrinsicNamed(inst.Str);
+        // wincall takes the slot and 10 arguments, or 12 (`__wincall12`)
+        if (n != x.N && !(x.AllI64 && x.N == 11 && n == 13)) VFail(m, pos, 610, "wrong number of arguments");
+        if (x.AllI64) {
+            for (u32 k = 0; k < n; k++) VExpect(m, f + k, ET_I64, "the target intrinsics take `i64` arguments");
+        } else {
+            if (n > 0) VExpect(m, f, x.P0, "argument type differs from the intrinsic's parameter");
+            if (n > 1) VExpect(m, f + 1, x.P1, "argument type differs from the intrinsic's parameter");
+            if (n > 2) VExpect(m, f + 2, x.P2, "argument type differs from the intrinsic's parameter");
+        }
+    } else if (sh == SH_BR) {
+        VTarget(m, f, func);
+    } else if (sh == SH_CONDBR) {
+        VExpect(m, f, ET_BOOL, "the condition must be `bool`");
+        VTarget(m, f + 1, func);
+        VTarget(m, f + 2, func);
+    } else if (sh == SH_SWITCH) {
+        if (!EIsInt(m, t)) VFail(m, pos, 605, "`switch` needs an integer type");
+        VExpect(m, f, t, "the value differs from the switch type");
+        u32 k = 1;
+        while (k + 1 < n) {
+            EOp key = EOpGet(m, f + k);
+            if (!VFits(m, key.Int, t)) VFail(m, key.Pos, 613, "constant does not fit its type");
+            for (u32 j = 1; j < k; j += 2) {
+                if (EOpGet(m, f + j).Int == key.Int) VFail(m, key.Pos, 611, "duplicate `switch` key");
+            }
+            VTarget(m, f + k + 1, func);
+            k += 2;
+        }
+        VTarget(m, f + n - 1, func);
+    } else if (sh == SH_RET) {
+        u32 ret = EFuncGet(m, func).Ret;
+        if (ret == ET_VOID && n != 0) VFail(m, pos, 610, "this function returns nothing");
+        if (ret != ET_VOID) {
+            if (n != 1) VFail(m, pos, 610, "`ret` needs a value");
+            VExpect(m, f, ret, "the returned value differs from the function's result type");
+        }
+    } else if (sh == SH_PANIC) {
+        if (inst.Imm >= PANIC_COUNT) VFail(m, pos, 611, "unknown panic reason");
+    }
+    if (inst.Result != 0 && !EIsScalar(m, VType(m, inst.Result))) VFail(m, pos, 605, "a result must have a scalar type");
+}
+
+// ------------------------------------------------------------------ dominance
+
+struct Doms {
+    usize Words;    // u64 words per block bit set
+    Vec Bits;       // u64: block i's dominators at [i * Words, (i + 1) * Words)
+    Vec Reach;      // u8: reachable from the entry
+}
+
+bool DomHas(*Doms d, u32 b, u32 x) {
+    unsafe {
+        u64 w = VecGetU64(&d.Bits, (b as usize) * d.Words + (x / 64) as usize);
+        return (w >> (x % 64) as u64) & 1 != 0;
+    }
+}
+
+// The successors of block b (its terminator's targets), as block offsets in the function.
+void Successors(*Module m, u32 b, u32 first, *Vec into) {
+    VecClear(into);
+    EBlock blk = EBlockGet(m, b);
+    if (blk.NInsts == 0) return;
+    EInst term = EInstGet(m, blk.FirstInst + blk.NInsts - 1);
+    for (u32 k = 0; k < term.NOps; k++) {
+        EOp op = EOpGet(m, term.FirstOp + k);
+        if (op.Kind == OK_TARGET) VecPushU64(into, (op.Ref - first) as u64);
+    }
+}
+
+// Dominator sets by iterative data flow (blocks are few; bit sets are simple and exact).
+Doms ComputeDoms(*Module m, u32 func) {
+    EFunc f = EFuncGet(m, func);
+    u32 nb = f.NBlocks;
+    Doms d;
+    d.Words = ((nb + 63) / 64) as usize;
+    d.Bits = SideTable(8, (nb as usize) * d.Words);
+    d.Reach = SideTable(1, nb as usize);
+    Vec succ = VecNew(8, 8);
+    unsafe {
+        // reachability from the entry
+        Vec stack = VecNew(8, 16);
+        VecPushU64(&stack, 0);
+        *VecAt(&d.Reach, 0) = 1;
+        while (VecLen(&stack) > 0) {
+            u64 b = VecGetU64(&stack, VecLen(&stack) - 1);
+            VecPop(&stack);
+            Successors(m, f.FirstBlock + b as u32, f.FirstBlock, &succ);
+            for (usize i = 0; i < VecLen(&succ); i++) {
+                u64 s = VecGetU64(&succ, i);
+                if (*VecAt(&d.Reach, s as usize) == 0) {
+                    *VecAt(&d.Reach, s as usize) = 1;
+                    VecPushU64(&stack, s);
+                }
+            }
+        }
+        // entry: {entry}; others: everything
+        for (u32 b = 0; b < nb; b++) {
+            for (usize w = 0; w < d.Words; w++) {
+                u64 all = 18446744073709551615;
+                if (b == 0) all = 0;
+                VecSetU64(&d.Bits, (b as usize) * d.Words + w, all);
+            }
+        }
+        VecSetU64(&d.Bits, 0, 1);
+        // the reachable predecessors of each block, found once (they used to be recomputed
+        // from the successors for every pair of blocks on every pass; the sets are the same)
+        Vec start = SideTable(8, nb as usize + 1);
+        for (u32 p = 0; p < nb; p++) {
+            if (*VecAt(&d.Reach, p as usize) == 0) continue;
+            Successors(m, f.FirstBlock + p, f.FirstBlock, &succ);
+            for (usize i = 0; i < VecLen(&succ); i++) {
+                usize at = VecGetU64(&succ, i) as usize + 1;
+                VecSetU64(&start, at, VecGetU64(&start, at) + 1);
+            }
+        }
+        for (u32 b = 0; b < nb; b++) VecSetU64(&start, b as usize + 1, VecGetU64(&start, b as usize + 1) + VecGetU64(&start, b as usize));
+        Vec preds = SideTable(8, VecGetU64(&start, nb as usize) as usize);
+        Vec fill = SideTable(8, nb as usize);
+        for (u32 b = 0; b < nb; b++) VecSetU64(&fill, b as usize, VecGetU64(&start, b as usize));
+        for (u32 p = 0; p < nb; p++) {
+            if (*VecAt(&d.Reach, p as usize) == 0) continue;
+            Successors(m, f.FirstBlock + p, f.FirstBlock, &succ);
+            for (usize i = 0; i < VecLen(&succ); i++) {
+                usize sb = VecGetU64(&succ, i) as usize;
+                u64 at = VecGetU64(&fill, sb);
+                VecSetU64(&preds, at as usize, p as u64);
+                VecSetU64(&fill, sb, at + 1);
+            }
+        }
+        bool changed = true;
+        Vec fresh = SideTable(8, d.Words);
+        while (changed) {
+            changed = false;
+            for (u32 b = 1; b < nb; b++) {
+                if (*VecAt(&d.Reach, b as usize) == 0) continue;
+                for (usize w = 0; w < d.Words; w++) VecSetU64(&fresh, w, 18446744073709551615);
+                for (u64 pi = VecGetU64(&start, b as usize); pi < VecGetU64(&start, b as usize + 1); pi++) {
+                    u32 p = VecGetU64(&preds, pi as usize) as u32;
+                    for (usize w = 0; w < d.Words; w++) {
+                        VecSetU64(&fresh, w, VecGetU64(&fresh, w) & VecGetU64(&d.Bits, (p as usize) * d.Words + w));
+                    }
+                }
+                usize bw = (b / 64) as usize;
+                VecSetU64(&fresh, bw, VecGetU64(&fresh, bw) | (1 << (b % 64) as u64));
+                for (usize w = 0; w < d.Words; w++) {
+                    usize at = (b as usize) * d.Words + w;
+                    if (VecGetU64(&d.Bits, at) != VecGetU64(&fresh, w)) {
+                        VecSetU64(&d.Bits, at, VecGetU64(&fresh, w));
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    return d;
+}
+
+// [eir.verify.4] value v, used in block `at` by instruction `user` (its position among
+// the block's instructions), must be defined at a point that dominates the use.
+void VDominates(*Module m, *Doms d, u32 v, u32 first, u32 at, u32 user, u32 pos) {
+    EVal val = EValGet(m, v);
+    if (val.Inst == 0) {
+        // a parameter: function parameters live in the entry block
+        if (DomHas(d, at - first, val.Block - first)) return;
+    } else if (val.Block == at) {
+        if (val.Inst < user) return;
+    } else if (DomHas(d, at - first, val.Block - first)) {
+        return;
+    }
+    VFail(m, pos, 608, "this value is used where its definition does not dominate");
+}
+
+// ------------------------------------------------------------------ module
+
+void VerifyFunc(*Module m, u32 fi) {
+    EFunc f = EFuncGet(m, fi);
+    for (u32 k = 0; k < f.NParams; k++) {
+        if (!EIsScalar(m, VType(m, f.FirstValue + k))) VFail(m, f.Pos, 605, "parameters must have scalar types");
+    }
+    if (f.Ret != ET_VOID && !EIsScalar(m, f.Ret)) VFail(m, f.Pos, 605, "the result must be a scalar type or `void`");
+    if (f.Extern) return;
+    // [eir.verify.2] terminators, [eir.verify.5] slots
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        EBlock blk = EBlockGet(m, b);
+        if (blk.NInsts == 0) VFail(m, blk.Pos, 606, "a block must end with exactly one terminator");
+        bool leading = b == f.FirstBlock;
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = EInstGet(m, i);
+            OpInfo info = OpTable(inst.Op);
+            bool last = i == blk.FirstInst + blk.NInsts - 1;
+            if (info.Term != last) VFail(m, inst.Pos, 606, "a block must end with exactly one terminator");
+            if (inst.Op == OP_SLOT && !leading) VFail(m, inst.Pos, 609, "`slot` only at the start of the entry block");
+            if (inst.Op != OP_SLOT) leading = false;
+            VInst(m, i, fi);
+        }
+        for (u32 k = 0; k < blk.NParams; k++) {
+            if (!EIsScalar(m, VType(m, blk.FirstParam + k))) VFail(m, blk.Pos, 605, "block parameters must have scalar types");
+        }
+    }
+    // [eir.verify.4]
+    Doms d = ComputeDoms(m, fi);
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        bool reachable;
+        unsafe { reachable = *VecAt(&d.Reach, (b - f.FirstBlock) as usize) != 0; }
+        if (!reachable) continue;
+        EBlock blk = EBlockGet(m, b);
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) {
+            EInst inst = EInstGet(m, i);
+            for (u32 k = 0; k < inst.NOps; k++) {
+                EOp op = EOpGet(m, inst.FirstOp + k);
+                unsafe {
+                    if (op.Kind == OK_VALUE) VDominates(m, &d, op.Ref, f.FirstBlock, b, i, op.Pos);
+                    if (op.Kind == OK_TARGET) {
+                        for (u32 a = 0; a < op.NArgs; a++) VDominates(m, &d, EArg(m, op.Args + a), f.FirstBlock, b, i, op.Pos);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Verifies module m ([eir.verify.1]-[eir.verify.7]). Returns only if it is valid.
+void VerifyModule(*Module m) {
+    unsafe {
+        // [eir.verify.1] struct types are defined and not recursive
+        for (u32 t = ET_PTR + 1; t < ECount(&m.Types); t++) {
+            ETy ty = ETyGet(m, t);
+            if (ty.Kind == EK_STRUCT && !ty.Defined) VFail(m, 0, 603, "unknown struct type");
+            if (!ELayout(m, t)) VFail(m, 0, 612, "struct type contains itself");
+        }
+        for (u32 g = 1; g < ECount(&m.Globals); g++) {
+            EGlobal gl = EGlobalGet(m, g);
+            if (gl.Type == ET_VOID) VFail(m, gl.Pos, 605, "a global needs a sized type");
+            EInit init = EInitGet(m, gl.Init);
+            if (init.Kind == EI_BYTES) {
+                ETy gt = ETyGet(m, gl.Type);
+                if (gt.Kind != EK_ARRAY || gt.Elem != ET_U8 || gt.Count as usize != init.Bytes.Len) VFail(m, gl.Pos, 605, "`bytes` needs a `[N x u8]` of the same length");
+            }
+            if (init.Kind == EI_INT && !(EIsInt(m, gl.Type) || gl.Type == ET_BOOL)) VFail(m, gl.Pos, 605, "an integer initializer needs an integer type");
+            if (init.Kind == EI_ADDR && gl.Type != ET_PTR) VFail(m, gl.Pos, 605, "an address initializer needs `ptr`");
+            if (init.Kind == EI_ADDR && !MapHas(&m.Names, init.Bytes)) VFail(m, gl.Pos, 603, "unknown global or function");
+        }
+        for (u32 f = 1; f < ECount(&m.Funcs); f++) VerifyFunc(m, f);
+    }
+}

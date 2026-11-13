@@ -1,0 +1,460 @@
+; =============================================================================
+; seed/src/lines.eas - statements: labels, directives, data, and the dispatch
+; to instructions (src/encode.eas)
+; =============================================================================
+
+; asm_line - assembles one line.
+;   in: rdi = line, rsi = length
+asm_line:
+        push    rbx
+        push    r12
+        push    r13
+        call    tokenize
+        cmp     qword [g_ntok], 0
+        je      near .out
+        inc     qword [g_stmt]
+        mov     rax, [g_addr]
+        mov     [g_here], rax
+        xor     ebx, ebx                ; the token being looked at
+        ; `name:` defines a label
+        mov     edi, 1
+        mov     esi, ':'
+        call    is_punct
+        test    eax, eax
+        jz      short .no_label
+        xor     edi, edi
+        call    tok
+        cmp     qword [rax], T_IDENT
+        jne     near .syntax
+        mov     r12, rax
+        mov     rdi, [r12 + 8]
+        mov     rsi, [r12 + 16]
+        mov     rdx, [g_addr]
+        mov     ecx, S_LABEL
+        call    sym_define
+        ; a non-local label starts a new scope for `.local` names
+        mov     rsi, [r12 + 8]
+        cmp     byte [rsi], '.'
+        je      short .local
+        mov     rcx, [r12 + 16]
+        cmp     rcx, NAME_MAX
+        jae     near .syntax
+        mov     [g_global_len], rcx
+        mov     rdi, [g_global]
+        rep movsb
+.local:
+        mov     ebx, 2
+        mov     rdi, rbx
+        call    tok
+        cmp     qword [rax], T_END
+        je      near .out
+.no_label:
+        ; `name equ expr`
+        lea     rdi, [rbx + 1]
+        lea     rsi, [s_equ]
+        mov     edx, 3
+        call    tok_is
+        test    eax, eax
+        jz      short .not_equ
+        mov     rdi, rbx
+        call    tok
+        cmp     qword [rax], T_IDENT
+        jne     near .syntax
+        mov     r12, rax
+        mov     qword [g_known], 1
+        lea     rdi, [rbx + 2]
+        call    expr
+        mov     rdi, rdx
+        mov     r13, rax
+        call    expect_end
+        mov     rdi, [r12 + 8]
+        mov     rsi, [r12 + 16]
+        mov     rdx, r13
+        mov     ecx, S_EQU
+        call    sym_define
+        jmp     near .out
+.not_equ:
+        mov     rdi, rbx
+        call    tok
+        cmp     qword [rax], T_IDENT
+        je      short .word
+        cmp     qword [rax], T_PUNCT
+        jne     near .syntax
+        cmp     qword [rax + 8], '%'
+        jne     near .syntax
+        ; %include "path"
+        lea     rdi, [rbx + 1]
+        lea     rsi, [s_include]
+        mov     edx, 7
+        call    tok_is
+        test    eax, eax
+        jz      near .syntax
+        lea     rdi, [rbx + 2]
+        call    tok
+        cmp     qword [rax], T_STR
+        jne     near .syntax
+        mov     r12, rax
+        lea     rdi, [rbx + 3]
+        call    expect_end
+        mov     rdi, [r12 + 8]
+        mov     rsi, [r12 + 16]
+        call    include_file
+        jmp     near .out
+.word:
+        mov     r12, rax                ; the statement's first word
+        mov     rdi, [r12 + 8]
+        mov     rsi, [r12 + 16]
+        lea     rdx, [rbx + 1]          ; the operands start here
+        call    directive
+        test    eax, eax
+        jnz     short .out
+        mov     rdi, [r12 + 8]
+        mov     rsi, [r12 + 16]
+        lea     rdx, [rbx + 1]
+        call    instruction
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.syntax:
+        lea     rdi, [msg_syntax]
+        mov     esi, msg_syntax_len
+        call    asm_error
+
+; expect_end - token rdi must be the end of the line.
+expect_end:
+        sub     rsp, 8
+        call    tok
+        cmp     qword [rax], T_END
+        jne     short .extra
+        add     rsp, 8
+        ret
+.extra:
+        lea     rdi, [msg_extra]
+        mov     esi, msg_extra_len
+        call    asm_error
+
+; include_file - %include: the path is relative to the top-level file's folder.
+;   in: rdi = path, rsi = length
+include_file:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdi
+        mov     r13, rsi
+        mov     rbx, [g_dir_len]
+        lea     rdi, [rbx + r13 + 1]
+        call    arena_alloc
+        mov     rdi, rax
+        push    rax
+        mov     rsi, [g_top]
+        mov     rcx, rbx
+        rep movsb
+        mov     rsi, r12
+        mov     rcx, r13
+        rep movsb
+        pop     rdi
+        lea     rsi, [rbx + r13]
+        sub     rsp, 8
+        call    asm_file
+        add     rsp, 8
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------- output
+; put_bytes - the bytes of a statement at the current address (written in pass 2).
+;   in: rdi = bytes, rsi = count
+put_bytes:
+        mov     rcx, rsi
+        mov     rsi, rdi
+        cmp     qword [g_pass], 2
+        jne     short .count
+        mov     rdi, [g_addr]
+        sub     rdi, [g_org]
+        lea     rax, [rdi + rcx]
+        cmp     rax, OUT_MAX
+        ja      short .full
+        add     rdi, [g_out]
+        add     [g_addr], rcx
+        rep movsb
+        mov     qword [g_seen_out], 1
+        ret
+.count:
+        add     [g_addr], rcx
+        mov     qword [g_seen_out], 1
+        ret
+.full:
+        lea     rdi, [msg_full]
+        mov     esi, msg_full_len
+        call    asm_error
+
+; put_value - n little-endian bytes of a value.  in: rdi = value, rsi = n
+put_value:
+        sub     rsp, 24
+        mov     [rsp], rdi
+        mov     rdi, rsp
+        call    put_bytes
+        add     rsp, 24
+        ret
+
+; ---------------------------------------------------------------- directives
+; directive - handles a directive statement.
+;   in:  rdi = word, rsi = length, rdx = the token after it
+;   out: eax = 1 if it was a directive
+directive:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     r12, rdi
+        mov     r13, rsi
+        mov     r14, rdx
+        ; bits 64 / default rel: accepted as they are
+        lea     rsi, [s_bits]
+        mov     edx, 4
+        call    word_is
+        test    eax, eax
+        jnz     near .ignore
+        lea     rsi, [s_default]
+        mov     edx, 7
+        call    word_is
+        test    eax, eax
+        jnz     near .ignore
+        lea     rsi, [s_org]
+        mov     edx, 3
+        call    word_is
+        test    eax, eax
+        jnz     near .org
+        lea     rsi, [s_align]
+        mov     edx, 5
+        call    word_is
+        test    eax, eax
+        jnz     near .align
+        lea     rsi, [s_times]
+        mov     edx, 5
+        call    word_is
+        test    eax, eax
+        jnz     near .times
+        mov     rdi, r12
+        mov     rsi, r13
+        call    data_size
+        test    eax, eax
+        jz      near .no
+        mov     rdi, rax
+        mov     rsi, r14
+        call    data_items
+        jmp     near .yes
+.ignore:
+        jmp     near .yes
+.org:
+        cmp     qword [g_seen_out], 0
+        jne     near .late_org
+        mov     qword [g_known], 1
+        mov     rdi, r14
+        call    expr
+        mov     rbx, rax
+        mov     rdi, rdx
+        call    expect_end
+        mov     [g_org], rbx
+        mov     [g_addr], rbx
+        mov     [g_here], rbx
+        jmp     near .yes
+.align:
+        ; align n, db 0
+        mov     qword [g_known], 1
+        mov     rdi, r14
+        call    expr
+        mov     rbx, rax
+        mov     r15, rdx
+        mov     rdi, rdx
+        mov     esi, ','
+        call    is_punct
+        test    eax, eax
+        jz      near .bad_align
+        test    rbx, rbx
+        jz      near .bad_align
+.pad:
+        mov     rax, [g_addr]
+        sub     rax, [g_org]
+        xor     edx, edx
+        div     rbx
+        test    rdx, rdx
+        jz      near .yes
+        xor     edi, edi
+        mov     esi, 1
+        call    put_value
+        jmp     short .pad
+.times:
+        ; times n <data directive>
+        mov     qword [g_known], 1
+        mov     rdi, r14
+        call    expr
+        mov     rbx, rax
+        mov     r15, rdx
+        cmp     qword [g_known], 0
+        je      near .bad_times
+        mov     rdi, r15
+        call    tok
+        cmp     qword [rax], T_IDENT
+        jne     near .bad_times
+        mov     rdi, [rax + 8]
+        mov     rsi, [rax + 16]
+        call    data_size
+        test    eax, eax
+        jz      near .bad_times
+        mov     r12, rax
+.repeat:
+        test    rbx, rbx
+        jz      near .yes
+        mov     rdi, r12
+        lea     rsi, [r15 + 1]
+        call    data_items
+        dec     rbx
+        jmp     short .repeat
+.yes:
+        mov     eax, 1
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.late_org:
+        lea     rdi, [msg_org]
+        mov     esi, msg_org_len
+        call    asm_error
+.bad_align:
+        lea     rdi, [msg_align]
+        mov     esi, msg_align_len
+        call    asm_error
+.bad_times:
+        lea     rdi, [msg_times]
+        mov     esi, msg_times_len
+        call    asm_error
+
+; word_is - is the word (r12, r13) the lowercase rsi of length rdx?
+word_is:
+        xor     eax, eax
+        cmp     r13, rdx
+        jne     short .no
+        mov     rdi, r12
+        jmp     near lower_eq
+.no:
+        ret
+
+; data_size - db, dw, dd, dq: 1, 2, 4, 8; anything else 0.
+;   in: rdi = word, rsi = length; out: eax
+data_size:
+        xor     eax, eax
+        cmp     rsi, 2
+        jne     short .out
+        movzx   ecx, byte [rdi]
+        or      cl, 0x20
+        cmp     cl, 'd'
+        jne     short .out
+        movzx   ecx, byte [rdi + 1]
+        or      cl, 0x20
+        mov     eax, 1
+        cmp     cl, 'b'
+        je      short .out
+        mov     eax, 2
+        cmp     cl, 'w'
+        je      short .out
+        mov     eax, 4
+        cmp     cl, 'd'
+        je      short .out
+        mov     eax, 8
+        cmp     cl, 'q'
+        je      short .out
+        xor     eax, eax
+.out:
+        ret
+
+; data_items - the comma-separated values of a data directive.
+;   in: rdi = item size, rsi = first token
+data_items:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdi
+        mov     rbx, rsi
+.item:
+        mov     rdi, rbx
+        call    tok
+        mov     r13, rax
+        ; a string on its own is its bytes (db), or padded to the item size
+        cmp     qword [r13], T_STR
+        jne     short .value
+        lea     rdi, [rbx + 1]
+        call    tok
+        cmp     qword [rax], T_PUNCT
+        jne     short .text
+        cmp     qword [rax + 8], ','
+        jne     short .value
+.text:
+        cmp     qword [rax], T_END
+        je      short .text_ok
+        cmp     qword [rax], T_PUNCT
+        jne     short .value
+.text_ok:
+        mov     rdi, [r13 + 8]
+        mov     rsi, [r13 + 16]
+        call    put_bytes
+        ; pad to a whole item
+        mov     rax, [r13 + 16]
+        xor     edx, edx
+        div     r12
+        test    rdx, rdx
+        jz      short .text_done
+        mov     rcx, r12
+        sub     rcx, rdx
+.text_pad:
+        push    rcx
+        push    rcx
+        xor     edi, edi
+        mov     esi, 1
+        call    put_value
+        pop     rcx
+        pop     rcx
+        dec     rcx
+        jnz     short .text_pad
+.text_done:
+        inc     rbx
+        jmp     short .sep
+.value:
+        mov     qword [g_known], 1
+        mov     rdi, rbx
+        call    expr
+        mov     rbx, rdx
+        mov     rdi, rax
+        mov     rsi, r12
+        call    put_value
+.sep:
+        mov     rdi, rbx
+        call    tok
+        cmp     qword [rax], T_END
+        je      short .out
+        mov     rdi, rbx
+        mov     esi, ','
+        call    is_punct
+        test    eax, eax
+        jz      short .bad
+        inc     rbx
+        jmp     near .item
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.bad:
+        lea     rdi, [msg_syntax]
+        mov     esi, msg_syntax_len
+        call    asm_error

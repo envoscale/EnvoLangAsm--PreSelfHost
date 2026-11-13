@@ -1,0 +1,555 @@
+// Envo-S1 enums with payloads and `match` with payload patterns ([item.enum.1]–[item.enum.3],
+// [s1.expr.1]; docs/architecture/stage1.md, "Enums"). An enum with a payload on any variant,
+// or with type parameters, is a tagged value (TYK_UNION): a u32 tag (the variant's index),
+// then the payload of the variant it holds, laid out like a struct of its fields. Fieldless
+// enums stay integers, exactly as in Envo-Core.
+
+// Is enum node n a tagged one (generic, or a variant has a payload)?
+bool IsTaggedEnumNode(*Checker c, u32 n) {
+    Node en = CNode(c, n);
+    if (en.E != 0) return true;
+    u32 v = en.B;
+    while (v != 0) {
+        if (CNode(c, v).E != 0) return true;
+        v = CNode(c, v).Next;
+    }
+    return false;
+}
+
+bool IsTagged(*Checker c, u32 t) {
+    return TyKind(c, t) == TYK_UNION;
+}
+
+// Pass 1 for a tagged enum: its type parameters and its type.
+void DefineTaggedEnum(*Checker c, u32 s, u32 n) {
+    u32 tps = CNode(c, n).E;
+    u32 count = DeclareTParams(c, tps, 0);
+    u32 t = 0;
+    if (count == 0) t = TypeNamed(c, TYK_UNION, s);
+    else t = SelfInstance(c, TYK_UNION, s, tps, count);
+    unsafe {
+        *Sym sym = SymPtr(c, s);
+        sym.Type = t;
+        sym.NEnv = count;
+        if (count > 0) sym.Flags = sym.Flags | SF_GENERIC;
+    }
+}
+
+// The variants of a tagged enum: index values in order, payload field types resolved
+// with the enum's type parameters in scope ([item.enum.1]).
+void TaggedEnumDeclare(*Checker c, u32 s) {
+    Sym sym = SymGet(c, s);
+    if (sym.State != 0) return;
+    unsafe { SymPtr(c, s).State = 1; }
+    Node en = CNode(c, sym.Node);
+    if (en.A != 0) CFail(c, NTok(c, en.A), E_BAD_REPR, "only an enum without payloads may declare a representation ([item.enum.2])");
+    u32 s1;
+    u32 s2;
+    unsafe {
+        s1 = c.Scope1;
+        s2 = c.Scope2;
+        c.Scope1 = en.E;
+        c.Scope2 = 0;
+    }
+    u32 v = en.B;
+    u64 i = 0;
+    while (v != 0) {
+        CheckDuplicateInList(c, en.B, v);
+        Node vn = CNode(c, v);
+        if (vn.A != 0) CFail(c, NTok(c, vn.A), E_BAD_REPR, "only an enum without payloads may give its variants values ([item.enum.2])");
+        u32 f = vn.E;
+        while (f != 0) {
+            CheckDuplicateInList(c, vn.E, f);
+            SetNType(c, f, ResolveType(c, CNode(c, f).A, false));
+            f = CNode(c, f).Next;
+        }
+        SetNValue(c, v, i);
+        SetNType(c, v, sym.Type);
+        i++;
+        v = vn.Next;
+    }
+    unsafe {
+        SymPtr(c, s).State = 2;
+        c.Scope1 = s1;
+        c.Scope2 = s2;
+    }
+}
+
+// The type of payload field f in tagged enum type t.
+u32 PayloadType(*Checker c, u32 t, u32 f) {
+    Type ty = TypeGet(c, t);
+    return Subst(c, NType(c, f), ty.Args, ty.NArgs);
+}
+
+// The variant of tagged enum type t named by token tok, or 0.
+u32 VariantNamed(*Checker c, u32 t, u32 tok) {
+    u32 v = CNode(c, SymGet(c, TypeGet(c, t).Sym).Node).B;
+    while (v != 0) {
+        if (SameName(c, NTok(c, v), tok)) return v;
+        v = CNode(c, v).Next;
+    }
+    return 0;
+}
+
+// Size and alignment of tagged enum type t: the tag (u32), then the largest payload, in
+// words of the largest payload alignment. Type.Count keeps that word size and Type.Elem
+// the word count, for lowering. Payloads that still name type parameters lay out per
+// instance.
+u64 TaggedLayout(*Checker c, u32 t, u32 blame, *u64 align) {
+    Type ty = TypeGet(c, t);
+    TaggedEnumDeclare(c, ty.Sym);
+    unsafe {
+        if (HasParams(c, t)) {
+            *align = 1;
+            return 0;
+        }
+        if (ty.LState == 2) {
+            *align = ty.Align as u64;
+            return ty.Size as u64;
+        }
+        if (ty.LState == 1) CFailName(c, blame, E_RECURSIVE, "enum `", NTok(c, SymGet(c, ty.Sym).Node), "` contains itself");
+        TypePtr(c, t).LState = 1;
+    }
+    u64 word = 1;
+    u64 biggest = 0;
+    u32 v = CNode(c, SymGet(c, ty.Sym).Node).B;
+    while (v != 0) {
+        u64 off = 0;
+        u64 pa = 1;
+        u32 f = CNode(c, v).E;
+        while (f != 0) {
+            u64 fa;
+            u64 size;
+            unsafe { size = SizeOf(c, PayloadType(c, t, f), blame, &fa); }
+            off = (off + fa - 1) & ~(fa - 1);
+            off += size;
+            if (pa < fa) pa = fa;
+            f = CNode(c, f).Next;
+        }
+        off = (off + pa - 1) & ~(pa - 1);
+        if (biggest < off) biggest = off;
+        if (word < pa) word = pa;
+        v = CNode(c, v).Next;
+    }
+    u64 words = (biggest + word - 1) / word;
+    if (words == 0) words = 1;
+    u64 at = (4 + word - 1) & ~(word - 1);
+    u64 a = word;
+    if (a < 4) a = 4;
+    u64 size = (at + words * word + a - 1) & ~(a - 1);
+    if (size > MAX_TYPE_SIZE) CError(c, E_TOO_LARGE, blame);
+    unsafe {
+        *Type p = TypePtr(c, t);
+        p.Size = size as u32;
+        p.Align = a as u32;
+        p.Count = word as u32;
+        p.Elem = words as u32;
+        p.LState = 2;
+        *align = a;
+    }
+    return size;
+}
+
+// ------------------------------------------------------------------ values
+
+// A variant value ([item.enum.3]): node n (a call with arguments args, or a bare name or
+// member when hasCall is false) builds variant v of tagged enum symbol s. t is the enum
+// type when it is known (an instance, or the expected type), or 0 to infer the type
+// arguments from the payload. Records the enum (NSym) and the variant (NValue) on n.
+u32 CheckVariantValue(*Checker c, u32 n, u32 s, u32 v, u32 t, u32 args, bool hasCall, u32 tok) {
+    Sym sym = SymGet(c, s);
+    TaggedEnumDeclare(c, s);
+    u32 count = ListCount(c, CNode(c, v).E);
+    u32 have = ListCount(c, args);
+    if (count != have || (count > 0 && !hasCall)) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "wrong number of arguments: expected ");
+            BufU64(&b, count as u64);
+            BufStr(&b, ", found ");
+            BufU64(&b, have as u64);
+            CFail(c, tok, E_ARG_COUNT, BufView(&b));
+        }
+    }
+    u32 ne = sym.NEnv;
+    u32 env = EnvNew(c, ne);
+    if (t != 0 && TypeGet(c, t).Sym == s) {
+        for (u32 i = 0; i < ne; i++) EnvSet(c, env, i, EnvGet(c, TypeGet(c, t).Args, i));
+    }
+    // the payload, like the arguments of a call (check/expr.envo, CheckCallTo)
+    u32 a = args;
+    u32 f = CNode(c, v).E;
+    while (a != 0) {
+        u32 pt = NType(c, f);
+        if (Unbound(c, pt, env, ne) && !IsUntyped(c, a) && NKind(c, a) != NK_LAMBDA) Unify(c, pt, CheckValue(c, a, 0), env, ne);
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+    }
+    a = args;
+    f = CNode(c, v).E;
+    while (a != 0) {
+        u32 pt = NType(c, f);
+        if (NType(c, a) == 0 && Unbound(c, pt, env, ne)) Unify(c, pt, CheckValue(c, a, 0), env, ne);
+        u32 want = Subst(c, pt, env, ne);
+        if (NType(c, a) != 0) {
+            if (!Coerce(c, a, NType(c, a), want)) Mismatch(c, want, NTok(c, a), NType(c, a));
+        } else {
+            ExpectType(c, a, want);
+        }
+        CheckArgMode(c, a, false);
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+    }
+    u32 tp = CNode(c, sym.Node).E;
+    for (u32 i = 0; i < ne; i++) {
+        if (EnvGet(c, env, i) == 0) CFailName(c, tok, E_CANNOT_INFER, "cannot infer type argument `", NTok(c, tp), "`; write it explicitly");
+        tp = CNode(c, tp).Next;
+    }
+    SetNSym(c, n, s);
+    SetNValue(c, n, v as u64);
+    if (ne == 0) return sym.Type;
+    return TypeInstance(c, TYK_UNION, s, env, ne);
+}
+
+// An unqualified variant ([item.enum.3]): the expected type is an enum with a variant of
+// that name. Returns the variant or 0.
+u32 ExpectedVariant(*Checker c, u32 expected, u32 tok) {
+    if (expected == 0) return 0;
+    u8 k = TyKind(c, expected);
+    if (k == TYK_UNION) {
+        TaggedEnumDeclare(c, TypeGet(c, expected).Sym);
+        return VariantNamed(c, expected, tok);
+    }
+    if (k == TYK_ENUM) {
+        EnumDeclare(c, TypeGet(c, expected).Sym);
+        u32 v = CNode(c, SymGet(c, TypeGet(c, expected).Sym).Node).B;
+        while (v != 0) {
+            if (SameName(c, NTok(c, v), tok)) return v;
+            v = CNode(c, v).Next;
+        }
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------ Option and Result
+
+// `T?`: the prelude's Option<T> ([type.opt.1]).
+u32 OptionOf(*Checker c, u32 inner, u32 tok) {
+    u32 s;
+    unsafe { s = c.OptionSym; }
+    if (s == 0) Bug("checker: `T?` without the prelude");
+    u32 env = EnvNew(c, 1);
+    EnvSet(c, env, 0, inner);
+    return TypeInstance(c, TYK_UNION, s, env, 1);
+}
+
+bool IsOptionType(*Checker c, u32 t) {
+    u32 s;
+    unsafe { s = c.OptionSym; }
+    return s != 0 && TyKind(c, t) == TYK_UNION && TypeGet(c, t).Sym == s;
+}
+
+bool IsResultType(*Checker c, u32 t) {
+    u32 s;
+    unsafe { s = c.ResultSym; }
+    return s != 0 && TyKind(c, t) == TYK_UNION && TypeGet(c, t).Sym == s;
+}
+
+// Type argument i of generic instance t.
+u32 TypeArg(*Checker c, u32 t, u32 i) {
+    return EnvGet(c, TypeGet(c, t).Args, i);
+}
+
+// The variant of enum symbol s named name.
+u32 VariantByName(*Checker c, u32 s, str name) {
+    u32 v = CNode(c, SymGet(c, s).Node).B;
+    while (v != 0) {
+        if (StrEq(TokText(c, NTok(c, v)), name)) return v;
+        v = CNode(c, v).Next;
+    }
+    return 0;
+}
+
+// `null`: `None` of the expected `T?` ([type.opt.1]).
+u32 CheckNull(*Checker c, u32 n, u32 expected) {
+    if (!IsOptionType(c, expected)) CFail(c, NTok(c, n), E_CANNOT_INFER, "the type of `null` is not known here: it needs an expected `T?`");
+    u32 s;
+    unsafe { s = c.OptionSym; }
+    return CheckVariantValue(c, n, s, VariantByName(c, s, "None"), expected, 0, false, NTok(c, n));
+}
+
+// `a ?? b`: a's value, or b when a is `None`.
+u32 CheckCoalesce(*Checker c, u32 n, u32 expected) {
+    Node node = CNode(c, n);
+    u32 want = 0;
+    if (expected != 0 && TyKind(c, expected) != TYK_VOID) want = OptionOf(c, expected, node.Tok);
+    u32 at = CheckValue(c, node.A, want);
+    if (!IsOptionType(c, at)) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "`??` needs an optional value (`T?`) on its left, found `");
+            BufType(&b, c, at);
+            BufByte(&b, '`');
+            CFail(c, node.Tok, E_BAD_OPERAND, BufView(&b));
+        }
+    }
+    u32 inner = TypeArg(c, at, 0);
+    ExpectType(c, node.B, inner);
+    return inner;
+}
+
+// `e?` ([expr.q.1]): e's value, or an early `return` of `None` or of e's error, in a
+// function whose result has the same kind.
+u32 CheckTry(*Checker c, u32 n) {
+    Node node = CNode(c, n);
+    u32 at = CheckValue(c, node.A, 0);
+    u32 ret;
+    bool top;
+    unsafe {
+        ret = c.Ret;
+        top = c.Top;
+    }
+    if (IsOptionType(c, at)) {
+        if (top || !IsOptionType(c, ret)) CFail(c, node.Tok, E_BAD_RETURN, "`?` on an optional value needs a function that returns an optional value (`T?`)");
+        return TypeArg(c, at, 0);
+    }
+    if (IsResultType(c, at)) {
+        if (top || !IsResultType(c, ret) || TypeArg(c, ret, 1) != TypeArg(c, at, 1)) {
+            Buf b = BufNew(64);
+            unsafe {
+                BufStr(&b, "`?` on a `");
+                BufType(&b, c, at);
+                BufStr(&b, "` needs a function that returns a `Result` with the error type `");
+                BufType(&b, c, TypeArg(c, at, 1));
+                BufByte(&b, '`');
+                CFail(c, node.Tok, E_BAD_RETURN, BufView(&b));
+            }
+        }
+        return TypeArg(c, at, 0);
+    }
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "`?` needs an optional value or a `Result`, found `");
+        BufType(&b, c, at);
+        BufByte(&b, '`');
+        CFail(c, node.Tok, E_BAD_OPERAND, BufView(&b));
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------ match
+
+const u32 MS_OWNED_LOCAL = 1;   // the scrutinee is a local this function owns
+const u32 MS_TEMP = 2;          // a temporary: the match takes it
+const u32 MS_BORROW = 3;        // anything else: the match only looks at it
+
+// How a match holds its scrutinee: bindings of non-`Copy` payloads take them from an owned
+// local or a temporary, and borrow them (`in`) from anything else.
+u32 ScrutineeKind(*Checker c, u32 e) {
+    u16 k = NKind(c, e);
+    if (k == NK_NAME || k == NK_THIS) {
+        u32 s = NSym(c, e);
+        if (s == 0 || SymGet(c, s).Kind != SK_LOCAL) return MS_BORROW;
+        if (SymGet(c, s).Flags & SF_BYREF != 0) return MS_BORROW;
+        // a lambda's capture belongs to the closure, not to this body
+        unsafe {
+            if (VecLen(&c.LamStack) >= 3) {
+                u32 start = MemLoadU32(VecAt(&c.LamStack, VecLen(&c.LamStack) - 2));
+                if (SymGet(c, s).Value < start as u64) return MS_BORROW;
+            }
+        }
+        return MS_OWNED_LOCAL;
+    }
+    if (k == NK_CALL || k == NK_NEW || k == NK_COND || k == NK_MATCH) return MS_TEMP;
+    return MS_BORROW;
+}
+
+// A `match` in Envo-S1 form: a tagged enum scrutinee, guards, or a `match` expression
+// ([s1.expr.1]). t is the scrutinee's type (already checked). For an expression, returns
+// its type; for a statement, 1 if it terminates, else 0.
+u32 CheckMatchS1(*Checker c, u32 n, u32 t, u32 expected, bool isExpr) {
+    Node m = CNode(c, n);
+    u8 tk = TyKind(c, t);
+    if (tk == TYK_UNION) TaggedEnumDeclare(c, TypeGet(c, t).Sym);
+    else if (tk == TYK_ENUM) EnumDeclare(c, TypeGet(c, t).Sym);
+    else if (tk != TYK_INT) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "`match` needs an integer or enum value, found `");
+            BufType(&b, c, t);
+            BufByte(&b, '`');
+            CFail(c, NTok(c, m.A), E_BAD_OPERAND, BufView(&b));
+        }
+    }
+    u32 kind = ScrutineeKind(c, m.A);
+    SetNValue(c, n, kind as u64);
+    if (tk == TYK_UNION && kind == MS_TEMP) {
+        // the temporary is held like a local for the match's duration (lowering drops it)
+        u32 tmp = SymNew(c, SK_LOCAL, 0);
+        unsafe {
+            SymPtr(c, tmp).Name = "match";
+            SymPtr(c, tmp).Type = t;
+        }
+        SetNSym(c, n, tmp);
+    }
+    bool wild = false;
+    bool open = false;
+    u32 result = 0;
+    if (isExpr) result = expected;
+    u32 arm = m.B;
+    while (arm != 0) {
+        Node a = CNode(c, arm);
+        usize saved;
+        unsafe { saved = c.LSP; }
+        bool guarded = a.E != 0;
+        u32 pat = a.A;
+        bool several = pat != 0 && CNode(c, pat).Next != 0;
+        bool moves = false;
+        while (pat != 0) {
+            u16 pk = NKind(c, pat);
+            if (pk == NK_WILD) {
+                if (!guarded) wild = true;
+            } else if (tk == TYK_UNION) {
+                if (CheckTaggedPattern(c, pat, t, kind, several)) moves = true;
+                if (!guarded) {
+                    if (MatchValueSeen(c, NValue(c, pat), pat, n)) CError(c, E_DUPLICATE_PATTERN, NTok(c, pat));
+                    SetNMatched(c, pat);
+                }
+            } else {
+                u64 value = 0;
+                u32 variant = 0;
+                if (pk == NK_NAME && tk == TYK_ENUM) variant = EnumVariantNamed(c, t, pat);
+                if (variant != 0) {
+                    value = NValue(c, variant);
+                    SetNType(c, pat, t);
+                } else {
+                    ExpectType(c, pat, t);
+                    value = ConstEval(c, pat);
+                }
+                SetNValue(c, pat, value);
+                if (!guarded) {
+                    if (MatchValueSeen(c, value, pat, n)) CError(c, E_DUPLICATE_PATTERN, NTok(c, pat));
+                    SetNMatched(c, pat);
+                }
+            }
+            pat = CNode(c, pat).Next;
+        }
+        SetNValue(c, arm, 0);
+        if (moves) SetNValue(c, arm, 1);
+        if (guarded) ExpectType(c, a.E, T_BOOL);
+        bool terminates = false;
+        if (NKind(c, a.B) == NK_BLOCK) {
+            terminates = CheckStmt(c, a.B);
+            if (isExpr && !terminates) CFail(c, a.Tok, E_MISSING_RETURN, "a block arm of a `match` expression gives no value; end it with `return`, `break` or a panic");
+        } else if (isExpr) {
+            if (result == 0) result = CheckValue(c, a.B, 0);
+            else ExpectType(c, a.B, result);
+            terminates = true;
+        } else {
+            terminates = CheckSimple(c, a.B);
+        }
+        if (!terminates) open = true;
+        unsafe { c.LSP = saved; }
+        arm = a.Next;
+    }
+    if (!wild) {
+        bool all = false;
+        if (tk == TYK_UNION) all = TaggedAllMatched(c, t, n);
+        if (tk == TYK_ENUM) all = EnumAllMatched(c, t, n);
+        if (!all) CError(c, E_NOT_EXHAUSTIVE, m.Tok);
+    }
+    if (isExpr) {
+        if (result == 0) CFail(c, m.Tok, E_MISSING_RETURN, "no arm of this `match` expression gives a value");
+        return result;
+    }
+    if (open) return 0;
+    return 1;
+}
+
+// One pattern on tagged enum type t: `V`, `E.V`, `V(a, _)` or `E.V(a, _)`. Declares the
+// bindings; returns true if one takes a payload value that is not `Copy`.
+bool CheckTaggedPattern(*Checker c, u32 pat, u32 t, u32 kind, bool several) {
+    Node p = CNode(c, pat);
+    u32 head = pat;
+    u32 args = 0;
+    bool call = p.Kind == NK_CALL;
+    if (call) {
+        head = p.A;
+        args = p.B;
+    }
+    u16 hk = NKind(c, head);
+    u32 nameTok = NTok(c, head);
+    if (hk == NK_MEMBER) {
+        TryQualified(c, CNode(c, head).A);
+        u32 owner = CNode(c, head).A;
+        if (NKind(c, owner) != NK_NAME || TypeNameSym(c, NTok(c, owner)) != TypeGet(c, t).Sym) {
+            CFail(c, NTok(c, owner), E_MISMATCH, "this pattern names another type than the one matched");
+        }
+    } else if (hk != NK_NAME) {
+        CFail(c, NTok(c, head), E_NOT_CONSTANT, "expected a variant pattern");
+    }
+    u32 v = VariantNamed(c, t, nameTok);
+    if (v == 0) NoMember(c, nameTok, t);
+    u32 count = ListCount(c, CNode(c, v).E);
+    u32 have = ListCount(c, args);
+    if (count != have || (count > 0 && !call)) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "wrong number of arguments: expected ");
+            BufU64(&b, count as u64);
+            BufStr(&b, ", found ");
+            BufU64(&b, have as u64);
+            CFail(c, NTok(c, pat), E_ARG_COUNT, BufView(&b));
+        }
+    }
+    SetNValue(c, pat, NValue(c, v));
+    SetNType(c, pat, t);
+    SetNSym(c, pat, v);
+    bool moves = false;
+    u32 a = args;
+    u32 f = CNode(c, v).E;
+    while (a != 0) {
+        u32 pt = PayloadType(c, t, f);
+        if (NKind(c, a) != NK_WILD) {
+            if (NKind(c, a) != NK_NAME) CFail(c, NTok(c, a), E_NOT_CONSTANT, "expected a name to bind or `_`");
+            if (several) CNotCore(c, "bindings in a pattern with `|`; write one arm for each variant", NTok(c, a));
+            DeclareLocal(c, a, pt);
+            SetNType(c, a, pt);
+            u32 s = NSym(c, a);
+            if (!IsCopy(c, pt)) {
+                if (kind == MS_BORROW) {
+                    // an `in` borrow of the payload, which stays in the scrutinee
+                    unsafe { SymPtr(c, s).Flags = SF_BYREF | SF_READONLY; }
+                } else {
+                    moves = true;
+                }
+            }
+        }
+        a = CNode(c, a).Next;
+        f = CNode(c, f).Next;
+    }
+    if (moves && HasDropImpl(c, t)) CFail(c, NTok(c, pat), E_MOVE_OUT_OF_BORROW, "cannot move a payload out of a value whose type implements `IDrop`; match on it by borrowing");
+    return moves;
+}
+
+// Does match m name every variant of tagged enum type t in an unguarded arm?
+bool TaggedAllMatched(*Checker c, u32 t, u32 m) {
+    u32 v = CNode(c, SymGet(c, TypeGet(c, t).Sym).Node).B;
+    while (v != 0) {
+        if (!MatchValueSeen(c, NValue(c, v), 0, m)) return false;
+        v = CNode(c, v).Next;
+    }
+    return true;
+}
+
+// Is match node n in the Envo-S1 form (CheckMatchS1)?
+bool MatchIsS1(*Checker c, u32 n, u32 t) {
+    if (CCore(c)) return false;
+    if (IsTagged(c, t)) return true;
+    u32 arm = CNode(c, n).B;
+    while (arm != 0) {
+        if (CNode(c, arm).E != 0) return true;
+        arm = CNode(c, arm).Next;
+    }
+    return false;
+}

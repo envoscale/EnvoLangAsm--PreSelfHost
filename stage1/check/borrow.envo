@@ -1,0 +1,589 @@
+// Basic borrow checking ([own.borrow.*], [s1.own.3], RFC 0004; docs/architecture/
+// stage1.md, "Ownership"). Stage 1 checks borrows that a call creates for its own duration,
+// and keeps borrowed closures from escaping:
+//
+// - In one call, a local passed `ref` (or captured by a lambda argument that changes it)
+//   may not be used any other way in that call (E0503); a local borrowed by the call may
+//   not be moved by it (E0504).
+// - A function-typed parameter may hold a lambda that borrows its caller's variables
+//   ([fn.pos.1]); it may only be called or passed to another function-typed parameter.
+//   Returning it, storing it, or giving it to anything else is E0507.
+// - `from` clauses name borrowed parameters or `this` (E0508); a function with one may
+//   return only borrows of what it names (E0507). Without one, origins are inferred
+//   ([life.infer.2], [life.infer.4]): nothing in an Envo-S1 program is exported.
+//
+// It may reject programs Stage 2 accepts (borrows held by locals across statements are
+// Stage 2's), but never accepts one that breaks chapter 5 ([s1.own.3]).
+
+const u8 BK_READ = 0;       // a plain read (a copy): not a borrow
+const u8 BK_IN = 1;         // a shared borrow for the call
+const u8 BK_REF = 2;        // an exclusive borrow for the call
+const u8 BK_MOVE = 3;       // the call takes it
+
+// ------------------------------------------------------------------ calls
+
+// Records every use of a local in expression n (not inside lambda bodies) as kind k, or as
+// a move where the move checker marked one.
+void CollectUses(*Checker c, *Vec uses, u32 n, u8 k) {
+    if (n == 0) return;
+    Node node = CNode(c, n);
+    if (node.Kind == NK_NAME || node.Kind == NK_THIS) {
+        u32 s = NSym(c, n);
+        if (s == 0 || SymGet(c, s).Kind != SK_LOCAL) return;
+        u8 kind = k;
+        unsafe {
+            if (*VecAt(&c.NMove, n as usize) == 1) kind = BK_MOVE;
+            MemStoreU32(VecPush(uses), s);
+            MemStoreU32(VecPush(uses), kind as u32);
+            MemStoreU32(VecPush(uses), node.Tok);
+        }
+        return;
+    }
+    if (node.Kind == NK_LAMBDA) {
+        // a lambda inside an argument holds its captures as values or borrows, read here
+        u64 cv = NValue(c, n);
+        u32 first = (cv & 0xFFFFFFFF) as u32;
+        u32 count = (cv >> 32) as u32;
+        for (u32 i = 0; i < count; i++) {
+            unsafe {
+                MemStoreU32(VecPush(uses), CaptureAt(c, first + i));
+                MemStoreU32(VecPush(uses), BK_READ as u32);
+                MemStoreU32(VecPush(uses), node.Tok);
+            }
+        }
+        return;
+    }
+    if (node.Kind == NK_MEMBER || node.Kind == NK_UNARY || node.Kind == NK_CAST) {
+        CollectUses(c, uses, node.A, k);
+        return;
+    }
+    if (node.Kind == NK_TRY) {
+        CollectUses(c, uses, node.A, k);
+        return;
+    }
+    if (node.Kind == NK_COND) {
+        CollectUses(c, uses, node.A, BK_READ);
+        CollectUses(c, uses, node.B, k);
+        CollectUses(c, uses, node.C, k);
+        return;
+    }
+    if (node.Kind == NK_INDEX || node.Kind == NK_BINARY) {
+        CollectUses(c, uses, node.A, k);
+        CollectUses(c, uses, node.B, BK_READ);
+        return;
+    }
+    if (node.Kind == NK_CALL) {
+        // an inner call's borrows end before the outer call: its uses are reads here
+        if (NKind(c, node.A) == NK_MEMBER) CollectUses(c, uses, CNode(c, node.A).A, BK_READ);
+        else if (TyKind(c, NType(c, node.A)) == TYK_FN) CollectUses(c, uses, node.A, BK_READ);
+        u32 a = node.B;
+        while (a != 0) {
+            CollectUses(c, uses, a, BK_READ);
+            a = CNode(c, a).Next;
+        }
+        return;
+    }
+    if (node.Kind == NK_NEW) {
+        u32 init = node.B;
+        while (init != 0) {
+            CollectUses(c, uses, CNode(c, init).A, BK_READ);
+            init = CNode(c, init).Next;
+        }
+    }
+}
+
+// A lambda argument for a function-typed parameter borrows its captures for the call:
+// exclusively if it changes one (a `mut fn`), shared otherwise.
+void CollectLambdaBorrows(*Checker c, *Vec uses, u32 a) {
+    Node lam = CNode(c, a);
+    if (NSym(c, a) != 1 || lam.Flags & NF_MOVE != 0) {
+        CollectUses(c, uses, a, BK_READ);
+        return;
+    }
+    u8 k = BK_IN;
+    if (TypeGet(c, NType(c, a)).Count != FK_FN) k = BK_REF;
+    u64 cv = NValue(c, a);
+    u32 first = (cv & 0xFFFFFFFF) as u32;
+    u32 count = (cv >> 32) as u32;
+    for (u32 i = 0; i < count; i++) {
+        unsafe {
+            MemStoreU32(VecPush(uses), CaptureAt(c, first + i));
+            MemStoreU32(VecPush(uses), k as u32);
+            MemStoreU32(VecPush(uses), lam.Tok);
+        }
+    }
+}
+
+// One argument (or the receiver) passed with mode k. Arguments are evaluated before the
+// call takes its borrows ([own.borrow.2]), so plain reads inside an argument whose value
+// holds no borrow (`list.Push(list.Len())`) do not conflict with the call; its moves and
+// its borrows of a place still do.
+void CollectArg(*Checker c, *Vec uses, u32 a, u8 k) {
+    if (NKind(c, a) == NK_LAMBDA) {
+        CollectLambdaBorrows(c, uses, a);
+        return;
+    }
+    usize start;
+    unsafe { start = VecLen(uses); }
+    CollectUses(c, uses, a, k);
+    if (HoldsBorrow(c, NType(c, a)) || IsConverted(c, a)) return;      // a view, or a `string` lent as `str`
+    unsafe {
+        usize keep = start;
+        for (usize i = start; i < VecLen(uses); i += 3) {
+            if (MemLoadU32(VecAt(uses, i + 1)) == BK_READ as u32) continue;
+            for (usize j = 0; j < 3; j++) MemStoreU32(VecAt(uses, keep + j), MemLoadU32(VecAt(uses, i + j)));
+            keep += 3;
+        }
+        VecTruncate(uses, keep);
+    }
+}
+
+// [own.borrow.1], [own.borrow.3] within call n.
+void CheckCallBorrows(*Checker c, u32 n) {
+    Node node = CNode(c, n);
+    Vec uses = VecNew(4, 24);
+    u32 cs = NSym(c, n);
+    u32 a = node.B;
+    unsafe {
+        if (cs != 0 && SymGet(c, cs).Kind == SK_FN) {
+            Sym fs = SymGet(c, cs);
+            if (fs.Flags & SF_METHOD != 0 && fs.Flags & SF_STATIC == 0 && NKind(c, node.A) == NK_MEMBER) {
+                u8 rk = BK_READ;
+                if (fs.Flags & SF_RECV_IN != 0) rk = BK_IN;
+                if (fs.Flags & SF_RECV_REF != 0) rk = BK_REF;
+                CollectArg(c, &uses, CNode(c, node.A).A, rk);
+            }
+            u32 p = FirstParam(c, cs);
+            while (a != 0) {
+                u8 k = BK_READ;
+                if (CNode(c, p).Flags & NF_IN != 0) k = BK_IN;
+                if (CNode(c, p).Flags & NF_REF != 0) k = BK_REF;
+                CollectArg(c, &uses, a, k);
+                a = CNode(c, a).Next;
+                p = CNode(c, p).Next;
+            }
+        } else if (TyKind(c, NType(c, node.A)) == TYK_FN) {
+            Type f = TypeGet(c, NType(c, node.A));
+            CollectUses(c, &uses, node.A, BK_READ);
+            u32 i = 0;
+            while (a != 0) {
+                u8 k = BK_READ;
+                u32 mode = EnvGet(c, f.Sym, i);
+                if (mode == NF_IN) k = BK_IN;
+                if (mode == NF_REF) k = BK_REF;
+                CollectArg(c, &uses, a, k);
+                a = CNode(c, a).Next;
+                i++;
+            }
+        } else {
+            return;
+        }
+        usize count = VecLen(&uses) / 3;
+        for (usize i = 0; i < count; i++) {
+            for (usize j = i + 1; j < count; j++) {
+                u32 si = MemLoadU32(VecAt(&uses, i * 3));
+                if (si != MemLoadU32(VecAt(&uses, j * 3))) continue;
+                u8 ki = MemLoadU32(VecAt(&uses, i * 3 + 1)) as u8;
+                u8 kj = MemLoadU32(VecAt(&uses, j * 3 + 1)) as u8;
+                u32 tok = MemLoadU32(VecAt(&uses, j * 3 + 2));
+                bool moved = ki == BK_MOVE || kj == BK_MOVE;
+                bool borrowed = ki == BK_REF || kj == BK_REF || ki == BK_IN || kj == BK_IN;
+                if (moved && borrowed) BorrowError(c, tok, si, E_MOVED_WHILE_BORROWED, "` is moved while this call borrows it");
+                if (ki == BK_REF || kj == BK_REF) BorrowError(c, tok, si, E_BORROW_CONFLICT, "` is borrowed `ref` by this call, so the call cannot use it another way");
+            }
+        }
+    }
+}
+
+void BorrowError(*Checker c, u32 tok, u32 s, u32 code, str rest) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufByte(&b, '`');
+        BufStr(&b, SymGet(c, s).Name);
+        BufStr(&b, rest);
+        CFail(c, tok, code, BufView(&b));
+    }
+}
+
+// ------------------------------------------------------------------ origins
+
+// May a value of type t hold a borrow ([life.origin.1])? `str`, views, function values,
+// type parameters, and anything containing them.
+bool HoldsBorrow(*Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    u8 k = ty.Kind;
+    if (k == TYK_STR || k == TYK_SLICE || k == TYK_FN || k == TYK_PARAM) return true;
+    if (k == TYK_ARRAY) return HoldsBorrow(c, ty.Elem);
+    if (k == TYK_UNION) {
+        u32 v = CNode(c, SymGet(c, ty.Sym).Node).B;
+        while (v != 0) {
+            u32 f = CNode(c, v).E;
+            while (f != 0) {
+                if (HoldsBorrow(c, PayloadType(c, t, f))) return true;
+                f = CNode(c, f).Next;
+            }
+            v = CNode(c, v).Next;
+        }
+        return false;
+    }
+    if (k != TYK_STRUCT) return false;
+    u32 f = CNode(c, SymGet(c, ty.Sym).Node).A;
+    while (f != 0) {
+        if (HoldsBorrow(c, FieldType(c, t, f))) return true;
+        f = CNode(c, f).Next;
+    }
+    return false;
+}
+
+struct OriginCx {
+    Vec Params;     // u32: the local symbol of each parameter, receiver first (a bit each)
+    u64 NoEscape;   // parameters that may hold borrowed closures
+    u64 From;       // the parameters a `from` clause names
+    bool HasFrom;
+    Vec Locals;     // u32 triples: local symbol, origins (low and high 32 bits)
+    bool Changed;
+    bool Report;    // the final pass reports errors
+}
+
+// Bit i for parameter local s, or 0.
+u64 ParamBit(*OriginCx x, u32 s) {
+    unsafe {
+        for (usize i = 0; i < VecLen(&x.Params) && i < 64; i++) {
+            if (MemLoadU32(VecAt(&x.Params, i)) == s) return (1 as u64) << i;
+        }
+    }
+    return 0;
+}
+
+u32 ParamOfBit(*OriginCx x, u64 bits) {
+    unsafe {
+        for (usize i = 0; i < VecLen(&x.Params) && i < 64; i++) {
+            if (bits & (1 as u64) << i != 0) return MemLoadU32(VecAt(&x.Params, i));
+        }
+    }
+    return 0;
+}
+
+u64 LocalOrigins(*OriginCx x, u32 s) {
+    unsafe {
+        for (usize i = 0; i < VecLen(&x.Locals); i += 3) {
+            if (MemLoadU32(VecAt(&x.Locals, i)) == s) return MemLoadU32(VecAt(&x.Locals, i + 1)) as u64 | (MemLoadU32(VecAt(&x.Locals, i + 2)) as u64) << 32;
+        }
+    }
+    return 0;
+}
+
+void AddLocalOrigins(*OriginCx x, u32 s, u64 o) {
+    if (o == 0) return;
+    unsafe {
+        for (usize i = 0; i < VecLen(&x.Locals); i += 3) {
+            if (MemLoadU32(VecAt(&x.Locals, i)) != s) continue;
+            u64 old = MemLoadU32(VecAt(&x.Locals, i + 1)) as u64 | (MemLoadU32(VecAt(&x.Locals, i + 2)) as u64) << 32;
+            if (old | o == old) return;
+            o = old | o;
+            MemStoreU32(VecAt(&x.Locals, i + 1), (o & 0xFFFFFFFF) as u32);
+            MemStoreU32(VecAt(&x.Locals, i + 2), (o >> 32) as u32);
+            x.Changed = true;
+            return;
+        }
+        MemStoreU32(VecPush(&x.Locals), s);
+        MemStoreU32(VecPush(&x.Locals), (o & 0xFFFFFFFF) as u32);
+        MemStoreU32(VecPush(&x.Locals), (o >> 32) as u32);
+        x.Changed = true;
+    }
+}
+
+// E0507 for a borrowed closure parameter that would escape at tok.
+void ClosureEscapes(*Checker c, *OriginCx x, u32 tok, u64 o) {
+    bool report;
+    u64 ne;
+    unsafe {
+        report = x.Report;
+        ne = x.NoEscape;
+    }
+    if (!report || o & ne == 0) return;
+    u32 s;
+    unsafe { s = ParamOfBit(x, o & ne); }
+    BorrowError(c, tok, s, E_BORROW_NOT_DECLARED, "` may borrow its caller's variables, so it can only be called or passed to a function-typed parameter");
+}
+
+// The parameters whose borrows the value of expression n may hold ([life.origin.1]).
+u64 OriginOf(*Checker c, *OriginCx x, u32 n) {
+    if (n == 0) return 0;
+    Node node = CNode(c, n);
+    u16 k = node.Kind;
+    u64 o = 0;
+    if (k == NK_LAMBDA) {
+        // a lambda holds its captures (copies or borrows): its value carries their
+        // origins, so where it may go is checked where it goes
+        u64 cv = NValue(c, n);
+        u32 first = (cv & 0xFFFFFFFF) as u32;
+        u32 count = (cv >> 32) as u32;
+        for (u32 i = 0; i < count; i++) {
+            u32 s = CaptureAt(c, first + i);
+            unsafe { o = o | ParamBit(x, s) | LocalOrigins(x, s); }
+        }
+        return o;
+    }
+    if (k == NK_CALL) {
+        // a call's result may hold borrows of anything it was given; a borrowed closure
+        // may go only to a function-typed parameter
+        u32 cs = NSym(c, n);
+        u32 a = node.B;
+        u32 p = 0;
+        Type ft = TypeGet(c, NType(c, node.A));
+        if (cs != 0 && SymGet(c, cs).Kind == SK_FN) {
+            p = FirstParam(c, cs);
+            if (NKind(c, node.A) == NK_MEMBER) unsafe { o = OriginOf(c, x, CNode(c, node.A).A); }
+        }
+        u32 i = 0;
+        while (a != 0) {
+            u64 ao;
+            unsafe { ao = OriginOf(c, x, a); }
+            bool fnParam = false;
+            if (p != 0) fnParam = TyKind(c, NType(c, p)) == TYK_FN;
+            else if (ft.Kind == TYK_FN) fnParam = TyKind(c, EnvGet(c, ft.Args, i)) == TYK_FN;
+            if (!fnParam) unsafe { ClosureEscapes(c, x, NTok(c, a), ao); }
+            o = o | ao;
+            a = CNode(c, a).Next;
+            if (p != 0) p = CNode(c, p).Next;
+            i++;
+        }
+        if (!HoldsBorrow(c, NType(c, n))) return 0;
+        return o;
+    }
+    if (k == NK_NEW) {
+        u32 init = node.B;
+        while (init != 0) {
+            unsafe { o = o | OriginOf(c, x, CNode(c, init).A); }
+            init = CNode(c, init).Next;
+        }
+        return o;
+    }
+    if (k == NK_COND) {
+        unsafe {
+            OriginOf(c, x, node.A);
+            return OriginOf(c, x, node.B) | OriginOf(c, x, node.C);
+        }
+    }
+    if (k == NK_MATCH) unsafe { return OriginMatch(c, x, n, true); }
+    if (k == NK_TRY) unsafe { return OriginOf(c, x, node.A); }
+    if (k == NK_BINARY && node.Op == TK_QQ) unsafe { return OriginOf(c, x, node.A) | OriginOf(c, x, node.B); }
+    if (!HoldsBorrow(c, NType(c, n))) return 0;
+    if (k == NK_NAME || k == NK_THIS) {
+        u32 s = NSym(c, n);
+        if (s == 0 || SymGet(c, s).Kind != SK_LOCAL) return 0;
+        unsafe { return ParamBit(x, s) | LocalOrigins(x, s); }
+    }
+    if (k == NK_MEMBER || k == NK_INDEX) unsafe { return OriginOf(c, x, node.A); }
+    return 0;
+}
+
+void OriginStmt(*Checker c, *OriginCx x, u32 n) {
+    if (n == 0) return;
+    Node node = CNode(c, n);
+    u16 k = node.Kind;
+    if (k == NK_BLOCK) {
+        u32 s = node.A;
+        while (s != 0) {
+            OriginStmt(c, x, s);
+            s = CNode(c, s).Next;
+        }
+        return;
+    }
+    if (k == NK_UNSAFE) {
+        OriginStmt(c, x, node.A);
+        return;
+    }
+    if (k == NK_IF || k == NK_WHILE) {
+        unsafe { OriginOf(c, x, node.A); }
+        OriginStmt(c, x, node.B);
+        if (k == NK_IF) OriginStmt(c, x, node.C);
+        return;
+    }
+    if (k == NK_FOR) {
+        OriginStmt(c, x, node.A);
+        unsafe { OriginOf(c, x, node.B); }
+        OriginStmt(c, x, node.C);
+        OriginStmt(c, x, node.D);
+        return;
+    }
+    if (k == NK_MATCH) {
+        unsafe { OriginMatch(c, x, n, false); }
+        return;
+    }
+    if (k == NK_RETURN) {
+        unsafe { OriginReturn(c, x, node.A); }
+        return;
+    }
+    if (k == NK_VAR) {
+        u64 o;
+        unsafe {
+            o = OriginOf(c, x, node.B);
+            AddLocalOrigins(x, NSym(c, n), o);
+        }
+        return;
+    }
+    if (k == NK_ASSIGN) {
+        u64 o;
+        unsafe { o = OriginOf(c, x, node.B); }
+        u32 t = node.A;
+        u16 tk = NKind(c, t);
+        if ((tk == NK_NAME || tk == NK_THIS) && NSym(c, t) != 0 && SymGet(c, NSym(c, t)).Kind == SK_LOCAL) {
+            unsafe { AddLocalOrigins(x, NSym(c, t), o); }
+            return;
+        }
+        // stored somewhere that outlives this call
+        unsafe { ClosureEscapes(c, x, node.Tok, o); }
+        return;
+    }
+    if (k == NK_EXPR) unsafe { OriginOf(c, x, node.A); }
+    if (k == NK_FOREACH) {
+        unsafe { AddLocalOrigins(x, NSym(c, node.A), OriginOf(c, x, node.B)); }
+        OriginStmt(c, x, node.C);
+    }
+}
+
+// A match: its bindings carry the scrutinee's origins; an expression match's value, those
+// of its arms.
+u64 OriginMatch(*Checker c, *OriginCx x, u32 n, bool isExpr) {
+    Node m = CNode(c, n);
+    u64 so;
+    unsafe { so = OriginOf(c, x, m.A); }
+    u64 o = 0;
+    u32 arm = m.B;
+    while (arm != 0) {
+        Node a = CNode(c, arm);
+        u32 pat = a.A;
+        while (pat != 0) {
+            if (NKind(c, pat) == NK_CALL) {
+                u32 b = CNode(c, pat).B;
+                while (b != 0) {
+                    if (NKind(c, b) == NK_NAME && NSym(c, b) != 0) unsafe { AddLocalOrigins(x, NSym(c, b), so); }
+                    b = CNode(c, b).Next;
+                }
+            }
+            pat = CNode(c, pat).Next;
+        }
+        unsafe { OriginOf(c, x, a.E); }
+        if (isExpr && NKind(c, a.B) != NK_BLOCK) unsafe { o = o | OriginOf(c, x, a.B); }
+        else OriginStmt(c, x, a.B);
+        arm = a.Next;
+    }
+    return o;
+}
+
+// `return e`: no borrowed closure leaves; with a `from` clause, only borrows of what it
+// names ([life.from.3]).
+void OriginReturn(*Checker c, *OriginCx x, u32 e) {
+    u64 o;
+    unsafe { o = OriginOf(c, x, e); }
+    if (e == 0) return;
+    unsafe {
+        ClosureEscapes(c, x, NTok(c, e), o);
+        if (!x.Report || !x.HasFrom) return;
+        u64 extra = o & ~x.From;
+        if (extra == 0) return;
+        u32 s = ParamOfBit(x, extra);
+        Buf b = BufNew(64);
+        BufStr(&b, "this returns (or stores) a borrow of `");
+        BufStr(&b, SymGet(c, s).Name);
+        BufStr(&b, "`, but the signature does not say `from ");
+        BufStr(&b, SymGet(c, s).Name);
+        BufStr(&b, "`");
+        CFail(c, NTok(c, e), E_BORROW_NOT_DECLARED, BufView(&b));
+    }
+}
+
+// The `from` names in list first must be borrowed parameters or `this` ([life.from.2]);
+// returns their bits.
+u64 CheckFromList(*Checker c, *OriginCx x, u32 first, u32 fs) {
+    u64 bits = 0;
+    u32 o = first;
+    while (o != 0) {
+        Node on = CNode(c, o);
+        u32 s = 0;
+        if (on.Kind == NK_THIS) {
+            unsafe { s = SymGet(c, fs).Recv; }
+        } else {
+            unsafe {
+                for (usize i = 0; i < VecLen(&x.Params); i++) {
+                    u32 ps = MemLoadU32(VecAt(&x.Params, i));
+                    if (StrEq(SymGet(c, ps).Name, TokText(c, on.Tok))) s = ps;
+                }
+            }
+        }
+        if (s == 0) CFail(c, on.Tok, E_BAD_FROM, "`from` can only name a borrowed parameter or `this`");
+        Sym ps = SymGet(c, s);
+        if (ps.Flags & SF_BYREF == 0 && !HoldsBorrow(c, ps.Type)) CFail(c, on.Tok, E_BAD_FROM, "`from` can only name a borrowed parameter or `this`");
+        if (TyKind(c, ps.Type) == TYK_FN) CNotCore(c, "`from` naming a function-typed parameter (a function value cannot be returned from its parameter)", on.Tok);
+        unsafe { bits = bits | ParamBit(x, s); }
+        o = on.Next;
+    }
+    return bits;
+}
+
+// Checks function symbol s's borrows ([s1.own.3]), after its body is checked.
+void OriginCheckFn(*Checker c, u32 s) {
+    Sym sym = SymGet(c, s);
+    Node fn = CNode(c, sym.Node);
+    OriginCx x;
+    x.Params = VecNew(4, 8);
+    x.Locals = VecNew(4, 12);
+    unsafe {
+        if (sym.Recv != 0) MemStoreU32(VecPush(&x.Params), sym.Recv);
+        u32 p = FirstParam(c, s);
+        while (p != 0) {
+            u32 ls = NSym(c, p);
+            MemStoreU32(VecPush(&x.Params), ls);
+            if (TyKind(c, NType(c, p)) == TYK_FN) x.NoEscape = x.NoEscape | ParamBit(&x, ls);
+            // `from` on a parameter: only a `ref` one may receive borrows ([life.from.4])
+            if (CNode(c, p).E != 0) {
+                if (CNode(c, p).Flags & NF_REF == 0) CFail(c, NTok(c, CNode(c, p).E), E_BAD_FROM, "`from` on a parameter needs a `ref` parameter");
+                CheckFromList(c, &x, CNode(c, p).E, s);
+            }
+            p = CNode(c, p).Next;
+        }
+        if (fn.G != 0) {
+            x.HasFrom = true;
+            x.From = CheckFromList(c, &x, fn.G, s);
+        }
+        OriginBody(c, &x, fn.C, sym.Type != T_VOID);
+    }
+}
+
+// The same for a lambda's body: its function-typed parameters may hold borrowed closures.
+void OriginCheckLambda(*Checker c, u32 n) {
+    Node lam = CNode(c, n);
+    OriginCx x;
+    x.Params = VecNew(4, 4);
+    x.Locals = VecNew(4, 12);
+    Type ft = TypeGet(c, NType(c, n));
+    unsafe {
+        u32 p = lam.A;
+        while (p != 0) {
+            u32 ls = NSym(c, p);
+            MemStoreU32(VecPush(&x.Params), ls);
+            if (TyKind(c, NType(c, p)) == TYK_FN) x.NoEscape = x.NoEscape | ParamBit(&x, ls);
+            p = CNode(c, p).Next;
+        }
+        OriginBody(c, &x, lam.B, ft.Elem != T_VOID);
+    }
+}
+
+// Origins of locals until stable, then a pass that reports. exprReturns: an expression
+// body is the result.
+void OriginBody(*Checker c, *OriginCx x, u32 body, bool exprReturns) {
+    unsafe {
+        if (x.NoEscape == 0 && !x.HasFrom) return;
+        for (u32 round = 0; round < 8; round++) {
+            x.Changed = false;
+            if (NKind(c, body) == NK_BLOCK) OriginStmt(c, x, body);
+            if (!x.Changed) break;
+        }
+        x.Report = true;
+        if (NKind(c, body) == NK_BLOCK) OriginStmt(c, x, body);
+        else if (exprReturns) OriginReturn(c, x, body);
+        else OriginOf(c, x, body);
+    }
+}

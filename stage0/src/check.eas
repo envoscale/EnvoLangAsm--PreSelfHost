@@ -1,0 +1,5272 @@
+; =============================================================================
+; src/check.eas - Envo-Core names and types (docs/spec/envo-core.md 5.2, 5.3)
+;
+; Three passes over the syntax tree from parse:
+;   1. collect: every item's name goes into program scope (items may be used
+;      before they are declared);
+;   2. declarations, in program order: struct layouts, enum values, constants,
+;      statics and function signatures, resolving each other lazily (a struct
+;      used by value is laid out on demand; a const is evaluated on first use),
+;      with in-progress states to detect cycles (E0303, E0309);
+;   3. bodies: functions, and the top-level statements as the body of main.
+;
+; Results live in tables parallel to the node array, indexed by node:
+;   c_ntype  u32  type of an expression, local, parameter or field
+;   c_nvalue u64  constant value (expressions, enum variants), field offset
+;   c_nsym   u32  symbol a name resolved to; the symbol of an item node
+;
+; Types are interned in a table of 32-byte entries, so two types are equal
+; exactly when their indices are equal. Symbols are 48-byte entries; program
+; scope is an open-addressing hash table of symbol indices, and locals are a
+; stack scanned from the top.
+;
+; Constant values are 64-bit, sign-extended for signed types and zero-extended
+; for unsigned ones, so u64 values above 2^63 are stored as their bit pattern.
+; =============================================================================
+
+; ---------------------------------------------------------------- types
+TY_KIND         equ 0                   ; u8  TYK_*
+TY_SIGNED       equ 1                   ; u8  1 for signed integers
+TY_NAMELEN      equ 2                   ; u16
+TY_SIZE         equ 4                   ; u32 (fixed-size kinds only; see size_of)
+TY_ALIGN        equ 8                   ; u32
+TY_ELEM         equ 12                  ; u32 element type (ptr, slice, array)
+TY_COUNT        equ 16                  ; u32 array length (saturated at 2^31)
+TY_SYM          equ 20                  ; u32 symbol (struct, enum)
+TY_NAME         equ 24                  ; u64 name pointer
+TY_ENTRY        equ 32
+
+TYK_VOID        equ 1
+TYK_BOOL        equ 2
+TYK_INT         equ 3
+TYK_STR         equ 4
+TYK_PTR         equ 5
+TYK_SLICE       equ 6
+TYK_ARRAY       equ 7
+TYK_STRUCT      equ 8
+TYK_ENUM        equ 9
+
+T_VOID          equ 1                   ; fixed type indices (prim_types order)
+T_BOOL          equ 2
+T_STR           equ 3
+T_I8            equ 4
+T_I16           equ 5
+T_I32           equ 6
+T_I64           equ 7
+T_ISIZE         equ 8
+T_U8            equ 9
+T_U16           equ 10
+T_U32           equ 11
+T_U64           equ 12
+T_USIZE         equ 13
+T_PTR_U8        equ 14
+T_PRIM_COUNT    equ 15                  ; including index 0, which means "no type"
+
+; ---------------------------------------------------------------- symbols
+S_KIND          equ 0                   ; u8  SK_*
+S_STATE         equ 1                   ; u8  0 new, 1 in progress, 2 done (const, enum, static value)
+S_LSTATE        equ 2                   ; u8  struct layout state
+S_NAMELEN       equ 4                   ; u32
+S_NAME          equ 8                   ; u64
+S_NODE          equ 16                  ; u32 declaring node
+S_TYPE          equ 20                  ; u32 the type it names / its value type / return type
+S_VALUE         equ 24                  ; u64 constant value
+S_AUX           equ 32                  ; u32 struct size; enum repr type; parameter count
+S_AUX2          equ 36                  ; u32 struct alignment; builtin id
+S_PARAMS        equ 40                  ; u64 pointer to u32 parameter types
+S_ENTRY         equ 48
+
+SK_TYPE         equ 1
+SK_STRUCT       equ 2
+SK_ENUM         equ 3
+SK_CONST        equ 4
+SK_STATIC       equ 5
+SK_FN           equ 6
+SK_BUILTIN      equ 7
+SK_LOCAL        equ 8
+
+B_EXIT          equ 7                   ; builtin ids that never return ([core.stmt.6])
+B_PANIC         equ 10
+B_STR_FROM      equ 11                  ; needs `unsafe`
+
+MAX_TYPE_SIZE   equ 0x7FFFFFFF
+NF_MATCHED      equ 2                   ; a match pattern whose value was recorded
+
+E_DUPLICATE     equ 201
+E_UNKNOWN_TYPE  equ 202
+E_UNKNOWN_NAME  equ 203
+E_REDECLARED    equ 204
+E_NOT_IN_LOOP   equ 205
+E_NO_MEMBER     equ 206
+E_FIELD_TWICE   equ 207
+E_NOT_A_TYPE    equ 208
+E_NOT_A_VALUE   equ 209
+E_MISMATCH      equ 301
+E_BAD_OPERAND   equ 302
+E_RECURSIVE     equ 303
+E_DOES_NOT_FIT  equ 304
+E_BAD_CAST      equ 305
+E_NEEDS_UNSAFE  equ 306
+E_ARG_COUNT     equ 307
+E_NOT_EXHAUSTIVE equ 308
+E_CONST_CYCLE   equ 309
+E_CONST_FAILED  equ 310
+E_NOT_CONSTANT  equ 311
+E_TOO_LARGE     equ 312
+E_NOT_CALLABLE  equ 314
+E_NOT_ASSIGNABLE equ 315
+E_NOT_ADDRESSABLE equ 316
+E_BAD_RETURN    equ 317
+E_DUPLICATE_PATTERN equ 319
+E_MISSING_RETURN equ 320
+E_NO_EFFECT     equ 321
+E_VOID_VALUE    equ 322
+E_DUPLICATE_VALUE equ 323
+E_BAD_REPR      equ 324
+E_VOID_TYPE     equ 327
+
+; =============================================================================
+; Entry
+; =============================================================================
+
+; check_program - check a parsed program.
+;   in: edi = program node. Reports the first error and exits; returns if the
+;   program is valid.
+; ebx = program node, r12d = current item, r13 = item list cursor
+check_program:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        mov     rdi, [n_cap]
+        shl     rdi, 2
+        call    arena_alloc
+        mov     [c_ntype], rax
+        mov     rdi, [n_cap]
+        shl     rdi, 3
+        call    arena_alloc
+        mov     [c_nvalue], rax
+        mov     rdi, [n_cap]
+        shl     rdi, 2
+        call    arena_alloc
+        mov     [c_nsym], rax
+        mov     rax, [n_cap]
+        add     rax, 64
+        mov     [c_tcap], rax
+        shl     rax, 5
+        mov     rdi, rax
+        call    arena_alloc
+        mov     [c_types], rax
+        mov     rax, [n_cap]
+        add     rax, 128
+        mov     [c_scap], rax
+        imul    rdi, rax, S_ENTRY
+        call    arena_alloc
+        mov     [c_syms], rax
+        mov     rdi, [c_scap]
+        shl     rdi, 2
+        call    arena_alloc
+        mov     [c_locals], rax
+        mov     rax, [c_scap]           ; hash capacity: a power of two >= 2 * symbols
+        shl     rax, 1
+        mov     ecx, 1
+.pow:
+        cmp     rcx, rax
+        jae     short .pow_done
+        shl     rcx, 1
+        jmp     short .pow
+.pow_done:
+        mov     [c_hcap], rcx
+        lea     rdi, [rcx*4]
+        call    arena_alloc
+        mov     [c_hash], rax
+        call    c_init_scope
+
+        ; ---- pass 1: collect item names
+        mov     edi, ebx
+        call    node_ptr
+        mov     r13d, [rax + N_A]
+.collect:
+        test    r13d, r13d
+        jz      short .collected
+        mov     edi, r13d
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        mov     edx, SK_FN
+        cmp     ecx, NK_FN
+        je      short .define
+        mov     edx, SK_STRUCT
+        cmp     ecx, NK_STRUCT
+        je      short .define
+        mov     edx, SK_ENUM
+        cmp     ecx, NK_ENUM
+        je      short .define
+        mov     edx, SK_CONST
+        cmp     ecx, NK_CONST
+        je      short .define
+        mov     edx, SK_STATIC
+        cmp     ecx, NK_STATIC
+        jne     short .collect_next
+.define:
+        mov     edi, r13d
+        mov     esi, edx
+        call    c_define_item
+.collect_next:
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .collect
+.collected:
+
+        ; ---- pass 2: declarations, in program order
+        mov     edi, ebx
+        call    node_ptr
+        mov     r13d, [rax + N_A]
+.declare:
+        test    r13d, r13d
+        jz      short .declared
+        mov     edi, r13d
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        mov     r12d, ecx
+        mov     edi, r13d
+        call    nsym_get
+        mov     edi, eax
+        cmp     r12d, NK_STRUCT
+        je      short .d_struct
+        cmp     r12d, NK_ENUM
+        je      short .d_enum
+        cmp     r12d, NK_CONST
+        je      short .d_const
+        cmp     r12d, NK_STATIC
+        je      short .d_static
+        cmp     r12d, NK_FN
+        jne     short .declare_next
+        call    fn_signature
+        jmp     short .declare_next
+.d_struct:
+        xor     esi, esi
+        call    struct_layout
+        jmp     short .declare_next
+.d_enum:
+        call    enum_declare
+        jmp     short .declare_next
+.d_const:
+        xor     esi, esi
+        call    const_resolve
+        jmp     short .declare_next
+.d_static:
+        call    static_declare
+.declare_next:
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .declare
+.declared:
+
+        ; ---- pass 3: bodies; top-level statements are the body of main
+        mov     qword [c_lsp], 0
+        mov     qword [c_lbase], 0
+        mov     edi, ebx
+        call    node_ptr
+        mov     r13d, [rax + N_A]
+.bodies:
+        test    r13d, r13d
+        jz      short .done
+        mov     edi, r13d
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        cmp     ecx, NK_FN
+        je      short .b_fn
+        cmp     ecx, NK_STRUCT
+        je      short .bodies_next
+        cmp     ecx, NK_ENUM
+        je      short .bodies_next
+        cmp     ecx, NK_CONST
+        je      short .bodies_next
+        cmp     ecx, NK_STATIC
+        je      short .bodies_next
+        mov     dword [c_ret], T_I32    ; a top-level statement
+        mov     byte [c_top], 1
+        mov     qword [c_unsafe], 0
+        mov     qword [c_loops], 0
+        mov     edi, r13d
+        call    check_stmt
+        jmp     short .bodies_next
+.b_fn:
+        mov     edi, r13d
+        call    nsym_get
+        mov     edi, eax
+        call    fn_body
+.bodies_next:
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .bodies
+.done:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; c_define_item - pass 1 for one item: create its symbol (E0201 if taken).
+;   in: edi = item node, esi = symbol kind
+c_define_item:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_ptr
+        mov     edi, [rax + N_TOK]
+        call    tok_text
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    g_find
+        test    eax, eax
+        jnz     short .duplicate
+        mov     edi, r12d
+        mov     esi, ebx
+        call    sym_new
+        mov     r13d, eax
+        mov     edi, ebx
+        mov     esi, r13d
+        call    nsym_set
+        cmp     r12d, SK_STRUCT
+        je      short .named_type
+        cmp     r12d, SK_ENUM
+        jne     short .add
+.named_type:
+        mov     edi, TYK_STRUCT
+        cmp     r12d, SK_STRUCT
+        je      short .kind_ok
+        mov     edi, TYK_ENUM
+.kind_ok:
+        mov     esi, r13d
+        call    type_named
+        mov     r12d, eax
+        mov     edi, r13d
+        call    sym_ptr
+        mov     [rax + S_TYPE], r12d
+.add:
+        mov     edi, r13d
+        call    g_add
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.duplicate:
+        mov     edi, ebx
+        call    node_ptr
+        mov     esi, [rax + N_TOK]
+        mov     edi, E_DUPLICATE
+        lea     rdx, [f_duplicate]
+        mov     ecx, esi
+        jmp     near c_fail
+
+; =============================================================================
+; Program scope: built-in names
+; =============================================================================
+
+; c_init_scope - primitive types, aliases and built-ins ([core.name.1]).
+c_init_scope:
+        push    rbx
+        push    r12
+        push    r13
+        mov     qword [c_ntypes], T_PRIM_COUNT
+        mov     qword [c_nsyms], 1      ; symbol 0 means "none"
+        ; copy prim_types into the type table, turning name offsets into pointers
+        mov     rdi, [c_types]
+        lea     rsi, [prim_types]
+        mov     ecx, T_PRIM_COUNT * TY_ENTRY
+        rep movsb
+        lea     rdx, [prim_names]
+        mov     rax, [c_types]
+        mov     ecx, T_PRIM_COUNT
+.names:
+        add     [rax + TY_NAME], rdx
+        add     rax, TY_ENTRY
+        dec     ecx
+        jnz     short .names
+        ; a type symbol for each named primitive (indices 1..13)
+        mov     ebx, 1
+.prims:
+        cmp     ebx, T_USIZE
+        ja      short .aliases
+        mov     edi, SK_TYPE
+        xor     esi, esi
+        call    sym_new
+        mov     r12d, eax
+        mov     [rdx + S_TYPE], ebx
+        mov     edi, ebx
+        call    ty_ptr
+        movzx   ecx, word [rax + TY_NAMELEN]
+        mov     r8, [rax + TY_NAME]
+        mov     edi, r12d
+        call    sym_ptr
+        mov     [rax + S_NAMELEN], ecx
+        mov     [rax + S_NAME], r8
+        mov     edi, r12d
+        call    g_add
+        inc     ebx
+        jmp     short .prims
+.aliases:
+        lea     rbx, [prim_aliases]
+.alias:
+        cmp     dword [rbx + 8], 0
+        je      short .builtins
+        mov     edi, SK_TYPE
+        xor     esi, esi
+        call    sym_new
+        mov     r12d, eax
+        mov     ecx, [rbx + 12]
+        mov     [rdx + S_TYPE], ecx
+        mov     ecx, [rbx + 8]
+        mov     [rdx + S_NAMELEN], ecx
+        mov     rcx, [rbx]
+        lea     r8, [prim_names]
+        add     rcx, r8
+        mov     [rdx + S_NAME], rcx
+        mov     edi, r12d
+        call    g_add
+        add     rbx, 16
+        jmp     short .alias
+.builtins:
+        lea     rbx, [builtin_table]
+        mov     r13d, 1                 ; builtin id
+.builtin:
+        cmp     dword [rbx + 8], 0
+        je      short .done
+        mov     edi, SK_BUILTIN
+        xor     esi, esi
+        call    sym_new
+        mov     r12d, eax
+        mov     ecx, [rbx + 12]
+        mov     [rdx + S_TYPE], ecx     ; return type
+        mov     ecx, [rbx + 16]
+        mov     [rdx + S_AUX], ecx      ; parameter count
+        mov     [rdx + S_AUX2], r13d
+        lea     rcx, [rbx + 20]
+        mov     [rdx + S_PARAMS], rcx
+        mov     ecx, [rbx + 8]
+        mov     [rdx + S_NAMELEN], ecx
+        mov     rcx, [rbx]
+        lea     r8, [prim_names]
+        add     rcx, r8
+        mov     [rdx + S_NAME], rcx
+        mov     edi, r12d
+        call    g_add
+        add     rbx, 32
+        inc     r13d
+        jmp     short .builtin
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Side tables, symbols, hash table, types
+; =============================================================================
+
+; ntype_get / ntype_set / nvalue_get / nvalue_set / nsym_get / nsym_set
+;   in: edi = node (and esi / rsi = value for set).  out: eax / rax.
+ntype_get:
+        mov     eax, edi
+        mov     rdx, [c_ntype]
+        mov     eax, [rdx + rax*4]
+        ret
+ntype_set:
+        mov     eax, edi
+        mov     rdx, [c_ntype]
+        mov     [rdx + rax*4], esi
+        ret
+nvalue_get:
+        mov     eax, edi
+        mov     rdx, [c_nvalue]
+        mov     rax, [rdx + rax*8]
+        ret
+nvalue_set:
+        mov     eax, edi
+        mov     rdx, [c_nvalue]
+        mov     [rdx + rax*8], rsi
+        ret
+nsym_get:
+        mov     eax, edi
+        mov     rdx, [c_nsym]
+        mov     eax, [rdx + rax*4]
+        ret
+nsym_set:
+        mov     eax, edi
+        mov     rdx, [c_nsym]
+        mov     [rdx + rax*4], esi
+        ret
+
+; node_slot - read a child slot.  in: edi = node, esi = slot offset.  out: eax
+node_slot:
+        call    node_ptr
+        mov     eax, [rax + rsi]
+        ret
+
+; node_kind / node_tok.  in: edi = node.  out: eax
+node_kind:
+        call    node_ptr
+        movzx   eax, word [rax + N_KIND]
+        ret
+node_tok:
+        call    node_ptr
+        mov     eax, [rax + N_TOK]
+        ret
+
+; tok_text - source text of a token.  in: edi = token.  out: rax = ptr, rdx = len
+tok_text:
+        call    tok_addr
+        mov     edx, [rax + TOK_LEN]
+        mov     eax, [rax + TOK_START]
+        add     rax, [diag_src]
+        ret
+
+; tok_is - does token edi spell the n-byte string rsi?  in: edx = n.  out: eax
+tok_is:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     rbx, rsi
+        mov     r12d, edx
+        call    tok_text
+        cmp     edx, r12d
+        jne     short .no
+        mov     rdi, rax
+        mov     rsi, rbx
+        call    mem_eq
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; same_name - do tokens edi and esi have the same text?  out: eax
+same_name:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, esi
+        call    tok_text
+        mov     r12, rax
+        mov     r13, rdx
+        mov     edi, ebx
+        call    tok_text
+        cmp     rdx, r13
+        jne     short .no
+        mov     rdi, rax
+        mov     rsi, r12
+        call    mem_eq
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; sym_new - allocate a zeroed symbol; its name is the token of node esi (if any).
+;   in: edi = kind, esi = node or 0.  out: eax = index, rdx = address
+sym_new:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        mov     rax, [c_nsyms]
+        cmp     rax, [c_scap]
+        jae     short .full
+        lea     rcx, [rax + 1]
+        mov     [c_nsyms], rcx
+        mov     r13d, eax
+        imul    rdx, rax, S_ENTRY
+        add     rdx, [c_syms]
+        xor     ecx, ecx
+        mov     [rdx], rcx
+        mov     [rdx + 8], rcx
+        mov     [rdx + 16], rcx
+        mov     [rdx + 24], rcx
+        mov     [rdx + 32], rcx
+        mov     [rdx + 40], rcx
+        mov     [rdx + S_KIND], bl
+        mov     [rdx + S_NODE], r12d
+        test    r12d, r12d
+        jz      short .out
+        mov     edi, r12d
+        call    node_tok
+        mov     edi, eax
+        call    tok_text
+        mov     rcx, rax
+        mov     edi, r13d
+        call    sym_ptr
+        mov     [rax + S_NAME], rcx
+        mov     [rax + S_NAMELEN], edx
+.out:
+        mov     eax, r13d
+        mov     edi, r13d
+        call    sym_ptr
+        mov     rdx, rax
+        mov     eax, r13d
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.full:
+        lea     rdi, [msg_symbols_full]
+        mov     esi, msg_symbols_full_len
+        jmp     near fatal
+
+; sym_ptr - address of symbol edi.  out: rax
+sym_ptr:
+        mov     eax, edi
+        imul    rax, rax, S_ENTRY
+        add     rax, [c_syms]
+        ret
+
+; name_hash - FNV-1a of a byte string.  in: rdi, rsi = len.  out: eax.  clobbers: rcx, rdx
+name_hash:
+        mov     eax, 2166136261
+        xor     ecx, ecx
+.loop:
+        cmp     rcx, rsi
+        jae     short .done
+        movzx   edx, byte [rdi + rcx]
+        xor     eax, edx
+        imul    eax, eax, 16777619
+        inc     rcx
+        jmp     short .loop
+.done:
+        ret
+
+; g_find - look a name up in program scope.  in: rdi = ptr, rsi = len.
+;   out: eax = symbol or 0
+; rbx = name, r12 = length, r13 = slot, r14d = symbol
+g_find:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        mov     rbx, rdi
+        mov     r12, rsi
+        call    name_hash
+        mov     r13, [c_hcap]
+        dec     r13
+        and     r13, rax
+.probe:
+        mov     rax, [c_hash]
+        mov     r14d, [rax + r13*4]
+        test    r14d, r14d
+        jz      short .missing
+        mov     edi, r14d
+        call    sym_ptr
+        mov     ecx, [rax + S_NAMELEN]
+        cmp     rcx, r12
+        jne     short .next
+        mov     rdi, [rax + S_NAME]
+        mov     rsi, rbx
+        mov     rdx, r12
+        call    mem_eq
+        test    eax, eax
+        jnz     short .found
+.next:
+        inc     r13                     ; linear probing, wrapping at the capacity
+        mov     rax, [c_hcap]
+        dec     rax
+        and     r13, rax
+        jmp     short .probe
+.found:
+        mov     eax, r14d
+        jmp     short .out
+.missing:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; g_add - insert symbol edi into program scope (its name must be new).
+g_add:
+        push    rbx
+        mov     ebx, edi
+        call    sym_ptr
+        mov     rdi, [rax + S_NAME]
+        mov     esi, [rax + S_NAMELEN]
+        call    name_hash
+        mov     rcx, [c_hcap]
+        dec     rcx
+        and     rax, rcx
+        mov     rdx, [c_hash]
+.probe:
+        cmp     dword [rdx + rax*4], 0
+        je      short .store
+        inc     rax
+        and     rax, rcx
+        jmp     short .probe
+.store:
+        mov     [rdx + rax*4], ebx
+        pop     rbx
+        ret
+
+; ty_ptr - address of type edi.  out: rax
+ty_ptr:
+        mov     eax, edi
+        shl     rax, 5
+        add     rax, [c_types]
+        ret
+
+; ty_kind - kind of type edi.  out: eax
+ty_kind:
+        call    ty_ptr
+        movzx   eax, byte [rax + TY_KIND]
+        ret
+
+; is_int_type - is type edi an integer type?  out: eax
+is_int_type:
+        call    ty_kind
+        cmp     eax, TYK_INT
+        sete    al
+        movzx   eax, al
+        ret
+
+; type_new - append a type.  in: edi = kind.  out: eax = index, rdx = address
+type_new:
+        mov     rax, [c_ntypes]
+        cmp     rax, [c_tcap]
+        jae     short .full
+        lea     rcx, [rax + 1]
+        mov     [c_ntypes], rcx
+        mov     rdx, rax
+        shl     rdx, 5
+        add     rdx, [c_types]
+        xor     ecx, ecx
+        mov     [rdx], rcx
+        mov     [rdx + 8], rcx
+        mov     [rdx + 16], rcx
+        mov     [rdx + 24], rcx
+        mov     [rdx + TY_KIND], dil
+        mov     dword [rdx + TY_ALIGN], 1
+        ret
+.full:
+        lea     rdi, [msg_types_full]
+        mov     esi, msg_types_full_len
+        jmp     near fatal
+
+; type_named - a new struct or enum type for symbol esi.  in: edi = kind
+type_named:
+        push    rbx
+        mov     ebx, esi
+        call    type_new
+        mov     [rdx + TY_SYM], ebx
+        push    rax
+        push    rdx
+        mov     edi, ebx
+        call    sym_ptr
+        pop     rdx
+        mov     rcx, [rax + S_NAME]
+        mov     [rdx + TY_NAME], rcx
+        mov     ecx, [rax + S_NAMELEN]
+        mov     [rdx + TY_NAMELEN], cx
+        pop     rax
+        pop     rbx
+        ret
+
+; type_derived - the interned pointer, slice or array type.
+;   in: edi = kind (TYK_PTR, TYK_SLICE, TYK_ARRAY), esi = element, edx = count
+;   out: eax
+type_derived:
+        mov     r8d, edx
+        mov     ecx, T_PTR_U8           ; the predefined *u8 must be found, not duplicated
+.search:
+        cmp     rcx, [c_ntypes]
+        jae     short .create
+        mov     rax, rcx
+        shl     rax, 5
+        add     rax, [c_types]
+        movzx   r9d, byte [rax + TY_KIND]
+        cmp     r9d, edi
+        jne     short .next
+        cmp     [rax + TY_ELEM], esi
+        jne     short .next
+        cmp     [rax + TY_COUNT], r8d
+        jne     short .next
+        mov     eax, ecx
+        ret
+.next:
+        inc     ecx
+        jmp     short .search
+.create:
+        push    rsi
+        push    r8
+        push    rdi
+        call    type_new
+        pop     rdi
+        pop     r8
+        pop     rsi
+        mov     [rdx + TY_ELEM], esi
+        mov     [rdx + TY_COUNT], r8d
+        cmp     edi, TYK_ARRAY
+        je      short .done                   ; size comes from size_of
+        mov     dword [rdx + TY_SIZE], 8
+        mov     dword [rdx + TY_ALIGN], 8
+        cmp     edi, TYK_SLICE
+        jne     short .done
+        mov     dword [rdx + TY_SIZE], 16
+.done:
+        ret
+
+; type_ptr_to - pointer to type edi.  out: eax
+type_ptr_to:
+        mov     esi, edi
+        mov     edi, TYK_PTR
+        xor     edx, edx
+        jmp     short type_derived
+
+; =============================================================================
+; Error reporting
+; =============================================================================
+
+; c_fail - report an error with a formatted message and exit.
+;   in: edi = code, esi = token, rdx = format, rcx, r8 = arguments
+; Format: plain text, with %n (text of token arg), %t (type name of type arg),
+; %d (decimal number arg), %s (NUL-terminated string arg); arguments in order.
+c_fail:
+        and     rsp, -16
+        mov     ebx, edi
+        mov     r12d, esi
+        mov     r13, rdx
+        mov     r14, rcx
+        mov     r15, r8
+        mov     edi, r12d
+        call    tok_addr
+        mov     esi, [rax + TOK_START]
+        mov     edi, ebx
+        call    diag_header
+.loop:
+        movzx   eax, byte [r13]
+        test    al, al
+        jz      short .done
+        inc     r13
+        cmp     al, '%'
+        je      short .directive
+        lea     rdi, [w_err]
+        mov     esi, eax
+        call    w_byte
+        jmp     short .loop
+.directive:
+        movzx   eax, byte [r13]
+        inc     r13
+        cmp     al, 'n'
+        je      short .token
+        cmp     al, 't'
+        je      short .type
+        cmp     al, 'd'
+        je      short .number
+        lea     rdi, [w_err]            ; %s
+        mov     rsi, r14
+        call    w_cstr
+        jmp     short .shift
+.token:
+        lea     rdi, [w_err]
+        mov     esi, r14d
+        call    w_token_text
+        jmp     short .shift
+.type:
+        lea     rdi, [w_err]
+        mov     esi, r14d
+        call    w_type_name
+        jmp     short .shift
+.number:
+        lea     rdi, [w_err]
+        mov     rsi, r14
+        call    w_u64
+.shift:
+        mov     r14, r15
+        jmp     short .loop
+.done:
+        jmp     near diag_finish
+
+; c_error - report a fixed-message error at a token.  in: edi = code, esi = token
+c_error:
+        jmp     near p_error_at
+
+; w_type_name - write the name of type esi to writer rdi:
+;   *T, T[], T[N], or the type's own name.
+w_type_name:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi
+        mov     r12d, esi
+        mov     edi, esi
+        call    ty_ptr
+        mov     r13, rax
+        movzx   eax, byte [r13 + TY_KIND]
+        cmp     eax, TYK_PTR
+        je      short .ptr
+        cmp     eax, TYK_SLICE
+        je      short .slice
+        cmp     eax, TYK_ARRAY
+        je      short .array
+        test    r12d, r12d
+        jz      short .unknown
+        mov     rdi, rbx
+        mov     rsi, [r13 + TY_NAME]
+        movzx   edx, word [r13 + TY_NAMELEN]
+        call    w_bytes
+        jmp     near .out
+.unknown:
+        mov     rdi, rbx
+        lea     rsi, [s_unknown_type]
+        call    w_cstr
+        jmp     short .out
+.ptr:
+        mov     rdi, rbx
+        mov     esi, '*'
+        call    w_byte
+        mov     rdi, rbx
+        mov     esi, [r13 + TY_ELEM]
+        call    w_type_name
+        jmp     short .out
+.slice:
+        mov     rdi, rbx
+        mov     esi, [r13 + TY_ELEM]
+        call    w_type_name
+        mov     rdi, rbx
+        mov     esi, '['
+        call    w_byte
+        mov     rdi, rbx
+        mov     esi, ']'
+        call    w_byte
+        jmp     short .out
+.array:
+        mov     rdi, rbx
+        mov     esi, [r13 + TY_ELEM]
+        call    w_type_name
+        mov     rdi, rbx
+        mov     esi, '['
+        call    w_byte
+        mov     rdi, rbx
+        mov     esi, [r13 + TY_COUNT]
+        call    w_u64
+        mov     rdi, rbx
+        mov     esi, ']'
+        call    w_byte
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; mismatch - E0301 "expected `T`, found `U`" at token esi.
+;   in: edi = expected type, esi = token, edx = found type
+mismatch:
+        mov     ecx, edi
+        mov     r8d, edx
+        mov     edi, E_MISMATCH
+        lea     rdx, [f_mismatch]
+        jmp     near c_fail
+
+; bad_operand - E0302 "operator `op` cannot be applied to `T`" at token esi.
+;   in: edi = type, esi = operator token
+bad_operand:
+        mov     r8d, edi
+        mov     ecx, esi
+        mov     edi, E_BAD_OPERAND
+        lea     rdx, [f_bad_operand]
+        jmp     near c_fail
+
+; =============================================================================
+; Types in declarations
+; =============================================================================
+
+; resolve_type - the type a type node denotes ([core.name.3], [core.type.1]).
+;   in: edi = type node, esi = 1 if void is allowed.  out: eax
+; ebx = node, r12d = void_ok, r13d = element / result, r14d = count node
+resolve_type:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        cmp     ecx, NK_TPTR
+        je      short .ptr
+        cmp     ecx, NK_TSLICE
+        je      short .slice
+        cmp     ecx, NK_TARRAY
+        je      near .array
+        ; a name
+        mov     edi, [rax + N_TOK]
+        call    tok_text
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    g_find
+        test    eax, eax
+        jz      near .unknown
+        mov     edi, eax
+        call    sym_ptr
+        movzx   ecx, byte [rax + S_KIND]
+        cmp     ecx, SK_TYPE
+        je      short .named
+        cmp     ecx, SK_STRUCT
+        je      short .named
+        cmp     ecx, SK_ENUM
+        jne     near .not_a_type
+.named:
+        mov     r13d, [rax + S_TYPE]
+        jmp     near .check_void
+.ptr:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     edi, eax
+        call    type_ptr_to
+        mov     r13d, eax
+        jmp     near .check_void
+.slice:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     esi, eax
+        mov     edi, TYK_SLICE
+        xor     edx, edx
+        call    type_derived
+        mov     r13d, eax
+        jmp     near .check_void
+.array:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r13d, eax               ; element
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r14d, eax               ; count node
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_INT
+        jne     short .count_name
+        mov     edi, r14d
+        call    node_tok
+        mov     edi, eax
+        call    literal_value
+        test    edx, edx
+        jnz     near .count_too_big
+        mov     r15, rax
+        mov     edi, r14d
+        mov     esi, T_USIZE
+        call    ntype_set
+        jmp     near .count_ready
+.count_name:
+        mov     edi, r14d
+        call    node_tok
+        mov     edi, eax
+        call    tok_text
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    g_find
+        test    eax, eax
+        jz      near .count_unknown
+        mov     r15d, eax               ; the const symbol
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_CONST
+        jne     near .count_not_constant
+        mov     edi, r14d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r15d
+        call    const_resolve
+        mov     edi, r15d
+        call    sym_ptr
+        mov     r15, rax
+        mov     edi, [r15 + S_TYPE]
+        call    is_int_type
+        test    eax, eax
+        jz      near .count_not_constant
+        mov     edi, r14d
+        mov     esi, [r15 + S_TYPE]
+        call    ntype_set
+        mov     edi, [r15 + S_TYPE]
+        call    ty_ptr
+        mov     r15, [r15 + S_VALUE]
+        cmp     byte [rax + TY_SIGNED], 0
+        je      short .count_ready
+        test    r15, r15
+        js      near .count_not_constant     ; a negative length
+.count_ready:
+        mov     edx, 0x80000000         ; saturate: size_of reports it as too large
+        cmp     r15, rdx
+        cmovb   edx, r15d
+        mov     esi, r13d
+        mov     edi, TYK_ARRAY
+        call    type_derived
+        mov     r13d, eax
+.check_void:
+        cmp     r13d, T_VOID
+        jne     short .done
+        test    r12d, r12d
+        jnz     short .done
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_VOID_TYPE
+        jmp     near c_error
+.done:
+        mov     eax, r13d
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.unknown:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, eax
+        mov     edi, E_UNKNOWN_TYPE
+        lea     rdx, [f_unknown_type]
+        jmp     near c_fail
+.not_a_type:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, eax
+        mov     edi, E_NOT_A_TYPE
+        lea     rdx, [f_not_a_type]
+        jmp     near c_fail
+.count_too_big:
+        mov     edi, r14d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_DOES_NOT_FIT
+        mov     ecx, T_USIZE
+        lea     rdx, [f_does_not_fit]
+        jmp     near c_fail
+.count_unknown:
+        mov     edi, r14d
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, eax
+        mov     edi, E_UNKNOWN_NAME
+        lea     rdx, [f_unknown_name]
+        jmp     near c_fail
+.count_not_constant:
+        mov     edi, r14d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NOT_CONSTANT
+        jmp     near c_error
+
+; size_of - size and alignment of a type, laying out structs on demand.
+;   in: edi = type, esi = token to blame for a struct cycle or a size overflow
+;   out: rax = size, rdx = alignment
+size_of:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        call    ty_ptr
+        movzx   ecx, byte [rax + TY_KIND]
+        cmp     ecx, TYK_STRUCT
+        je      short .struct
+        cmp     ecx, TYK_ENUM
+        je      short .enum
+        cmp     ecx, TYK_ARRAY
+        je      short .array
+        mov     edx, [rax + TY_ALIGN]
+        mov     eax, [rax + TY_SIZE]
+        jmp     short .out
+.struct:
+        mov     r13d, [rax + TY_SYM]
+        mov     edi, r13d
+        mov     esi, r12d
+        call    struct_layout
+        mov     edi, r13d
+        call    sym_ptr
+        mov     edx, [rax + S_AUX2]
+        mov     eax, [rax + S_AUX]
+        jmp     short .out
+.enum:
+        mov     r13d, [rax + TY_SYM]
+        mov     edi, r13d
+        call    enum_declare
+        mov     edi, r13d
+        call    sym_ptr
+        mov     edi, [rax + S_AUX]
+        call    ty_ptr
+        mov     edx, [rax + TY_ALIGN]
+        mov     eax, [rax + TY_SIZE]
+        jmp     short .out
+.array:
+        mov     r13d, [rax + TY_COUNT]
+        mov     edi, [rax + TY_ELEM]
+        mov     esi, r12d
+        call    size_of
+        imul    rax, r13
+        cmp     rax, MAX_TYPE_SIZE
+        ja      short .too_large
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.too_large:
+        mov     edi, E_TOO_LARGE
+        mov     esi, r12d
+        jmp     near c_error
+
+; struct_layout - lay out struct symbol edi ([core.type.2]).
+;   in: esi = token to blame if the struct is already being laid out (E0303)
+; ebx = symbol, r12d = current field, r13 = offset, r14 = alignment,
+; r15d = field type; [rsp] = field size
+struct_layout:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        call    sym_ptr
+        cmp     byte [rax + S_LSTATE], 2
+        je      near .out
+        cmp     byte [rax + S_LSTATE], 1
+        je      near .recursive
+        mov     byte [rax + S_LSTATE], 1
+        xor     r13d, r13d
+        mov     r14d, 1
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+.field:
+        test    r12d, r12d
+        jz      near .fields_done
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r12d
+        call    check_duplicate_in_list
+        mov     edi, r12d
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r15d, eax
+        mov     edi, r12d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r15d
+        call    size_of
+        mov     [rsp], rax
+        lea     rcx, [rdx - 1]          ; offset = align_up(offset, field alignment)
+        add     r13, rcx
+        not     rcx
+        and     r13, rcx
+        cmp     r14, rdx
+        cmovb   r14, rdx
+        mov     edi, r12d
+        mov     rsi, r13
+        call    nvalue_set
+        mov     edi, r12d
+        mov     esi, r15d
+        call    ntype_set
+        add     r13, [rsp]
+        cmp     r13, MAX_TYPE_SIZE
+        ja      short .too_large
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     near .field
+.fields_done:
+        lea     rcx, [r14 - 1]          ; size = align_up(offset, alignment)
+        add     r13, rcx
+        not     rcx
+        and     r13, rcx
+        cmp     r13, MAX_TYPE_SIZE
+        ja      short .too_large
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_AUX], r13d
+        mov     [rax + S_AUX2], r14d
+        mov     byte [rax + S_LSTATE], 2
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.recursive:
+        mov     r12d, esi
+        mov     edi, [rax + S_NODE]
+        call    node_tok
+        mov     ecx, eax
+        mov     esi, r12d
+        mov     edi, E_RECURSIVE
+        lea     rdx, [f_recursive]
+        jmp     near c_fail
+.too_large:
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_TOO_LARGE
+        jmp     near c_error
+
+; check_duplicate_in_list - E0201 if node esi's name matches an earlier node in
+; the list starting at edi ([core.name.4]).
+check_duplicate_in_list:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        mov     edi, esi
+        call    node_tok
+        mov     r13d, eax
+.loop:
+        cmp     ebx, r12d
+        je      short .done
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        mov     esi, r13d
+        call    same_name
+        test    eax, eax
+        jnz     short .duplicate
+        mov     edi, ebx
+        call    node_ptr
+        mov     ebx, [rax + N_NEXT]
+        jmp     short .loop
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.duplicate:
+        mov     esi, r13d
+        mov     ecx, r13d
+        mov     edi, E_DUPLICATE
+        lea     rdx, [f_duplicate]
+        jmp     near c_fail
+
+; enum_declare - representation and variant values of enum symbol edi
+; ([core.type.4]). Re-entry while in progress returns quietly: a value that
+; names a later variant of the same enum then reports E0206.
+; ebx = symbol, r12d = variant, r13 = previous value, r14d = repr type,
+; r15d = 1 once a variant was seen; [rsp] = value
+enum_declare:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        call    sym_ptr
+        cmp     byte [rax + S_STATE], 0
+        jne     near .out
+        mov     byte [rax + S_STATE], 1
+        mov     r14d, T_I32
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        test    eax, eax
+        jz      short .repr_done
+        mov     r12d, eax
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r14d, eax
+        mov     edi, eax
+        call    is_int_type
+        test    eax, eax
+        jz      near .bad_repr
+.repr_done:
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_AUX], r14d
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     r12d, eax
+        xor     r15d, r15d
+.variant:
+        test    r12d, r12d
+        jz      near .finished
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r12d
+        call    check_duplicate_in_list
+        mov     edi, r12d
+        mov     esi, N_A
+        call    node_slot
+        test    eax, eax
+        jz      short .implicit
+        mov     [rsp + 8], eax
+        mov     edi, eax
+        mov     esi, r14d
+        call    expect_type
+        mov     edi, [rsp + 8]
+        call    const_eval
+        mov     [rsp], rax
+        mov     rdi, rax
+        mov     esi, r14d
+        call    value_fits
+        test    eax, eax
+        jnz     short .have_value
+        mov     edi, [rsp + 8]
+        jmp     short .does_not_fit
+.implicit:
+        xor     eax, eax
+        test    r15d, r15d
+        jz      short .implicit_ok
+        mov     rdi, r13                ; previous + 1, unless previous is the maximum
+        mov     esi, r14d
+        call    type_max
+        cmp     r13, rax
+        je      short .implicit_overflow
+        lea     rax, [r13 + 1]
+.implicit_ok:
+        mov     [rsp], rax
+        jmp     short .have_value
+.implicit_overflow:
+        mov     edi, r12d
+.does_not_fit:
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, r14d
+        mov     edi, E_DOES_NOT_FIT
+        lea     rdx, [f_does_not_fit]
+        jmp     near c_fail
+.have_value:
+        ; [core.type.4] values must be distinct: compare with earlier variants
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     ecx, eax
+.compare:
+        cmp     ecx, r12d
+        je      short .distinct
+        push    rcx
+        push    rcx
+        mov     edi, ecx
+        call    nvalue_get
+        pop     rcx
+        pop     rcx
+        cmp     rax, [rsp]
+        je      short .duplicate_value
+        mov     edi, ecx
+        call    node_ptr
+        mov     ecx, [rax + N_NEXT]
+        jmp     short .compare
+.distinct:
+        mov     edi, r12d
+        mov     rsi, [rsp]
+        call    nvalue_set
+        mov     edi, ebx                ; mark the variant as defined
+        call    sym_ptr
+        mov     esi, [rax + S_TYPE]
+        mov     edi, r12d
+        call    ntype_set
+        mov     r13, [rsp]
+        mov     r15d, 1
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     near .variant
+.finished:
+        mov     edi, ebx
+        call    sym_ptr
+        mov     byte [rax + S_STATE], 2
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.bad_repr:
+        mov     edi, r12d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_BAD_REPR
+        jmp     near c_error
+.duplicate_value:
+        mov     edi, r12d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_DUPLICATE_VALUE
+        jmp     near c_error
+
+; const_resolve - type and value of const symbol edi ([core.const.2]).
+;   in: esi = token to blame if the constant is already being evaluated (E0309)
+; ebx = symbol, r12d = blame token / type
+const_resolve:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        call    sym_ptr
+        cmp     byte [rax + S_STATE], 2
+        je      short .out
+        cmp     byte [rax + S_STATE], 1
+        je      short .cycle
+        mov     byte [rax + S_STATE], 1
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r12d, eax
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_TYPE], r12d
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        mov     esi, r12d
+        call    expect_type
+        mov     edi, r13d
+        call    const_eval
+        mov     r13, rax
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_VALUE], r13
+        mov     byte [rax + S_STATE], 2
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.cycle:
+        mov     edi, [rax + S_NODE]
+        call    node_tok
+        mov     ecx, eax
+        mov     esi, r12d
+        mov     edi, E_CONST_CYCLE
+        lea     rdx, [f_const_cycle]
+        jmp     near c_fail
+
+; static_declare - type and initial value of static symbol edi ([core.const.3]).
+static_declare:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r12d, eax
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r12d
+        call    size_of
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_TYPE], r12d
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        test    eax, eax
+        jz      short .out
+        mov     r13d, eax
+        mov     edi, eax
+        mov     esi, r12d
+        call    expect_type
+        mov     edi, r13d
+        call    const_eval              ; must be a constant
+        mov     r13, rax
+        mov     edi, r12d
+        call    is_scalar_value
+        test    eax, eax
+        jz      short .out
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_VALUE], r13
+        mov     byte [rax + S_STATE], 2 ; the dump prints " = value"
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; is_scalar_value - is type edi an integer, bool or enum (a printable constant)?
+is_scalar_value:
+        call    ty_kind
+        cmp     eax, TYK_INT
+        je      short .yes
+        cmp     eax, TYK_BOOL
+        je      short .yes
+        cmp     eax, TYK_ENUM
+        je      short .yes
+        xor     eax, eax
+        ret
+.yes:
+        mov     eax, 1
+        ret
+
+; fn_signature - return and parameter types of function symbol edi.
+; ebx = symbol, r12d = parameter, r13 = parameter types, r14d = count
+fn_signature:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        mov     esi, 1                  ; void is a valid return type
+        call    resolve_type
+        mov     r12d, eax
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_TYPE], r12d
+        ; count the parameters, then fill their types
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        xor     r14d, r14d
+        mov     r12d, eax
+.count:
+        test    r12d, r12d
+        jz      short .counted
+        inc     r14d
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .count
+.counted:
+        lea     rdi, [r14*4 + 4]
+        call    arena_alloc
+        mov     r13, rax
+        mov     edi, ebx
+        call    sym_ptr
+        mov     [rax + S_AUX], r14d
+        mov     [rax + S_PARAMS], r13
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     r12d, eax
+        mov     r15d, eax               ; first parameter
+.param:
+        test    r12d, r12d
+        jz      short .done
+        mov     edi, r15d
+        mov     esi, r12d
+        call    check_duplicate_in_list
+        mov     edi, r12d
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r14d, eax
+        mov     edi, r12d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r14d
+        call    size_of
+        mov     edi, r12d
+        mov     esi, r14d
+        call    ntype_set
+        mov     [r13], r14d
+        add     r13, 4
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .param
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Function bodies and locals
+; =============================================================================
+
+; fn_body - check the body of function symbol edi.
+; ebx = symbol, r12 = saved local stack top, r13d = body, r14d = terminates
+fn_body:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        mov     r12, [c_lsp]
+        mov     [c_lbase], r12          ; main's locals are not visible here
+        call    sym_ptr
+        mov     ecx, [rax + S_TYPE]
+        mov     [c_ret], ecx
+        mov     byte [c_top], 0
+        mov     qword [c_unsafe], 0
+        mov     qword [c_loops], 0
+        ; the parameters are the first locals
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax
+.param:
+        test    r13d, r13d
+        jz      short .params_done
+        mov     edi, r13d
+        call    ntype_get
+        mov     edi, r13d
+        mov     esi, eax
+        call    local_push
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .param
+.params_done:
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_C
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_BLOCK
+        jne     short .arrow
+        mov     edi, r13d
+        call    check_stmt
+        mov     r14d, eax
+        jmp     short .check_end
+.arrow:
+        cmp     dword [c_ret], T_VOID
+        jne     short .arrow_value
+        mov     edi, r13d
+        call    node_kind
+        cmp     eax, NK_CALL
+        jne     short .no_effect
+        mov     edi, r13d
+        xor     esi, esi
+        call    check_expr
+        mov     edi, r13d
+        call    is_noreturn_call
+        mov     r14d, eax
+        jmp     short .check_end
+.arrow_value:
+        mov     edi, r13d
+        mov     esi, [c_ret]
+        call    expect_type
+        mov     r14d, 1
+.check_end:
+        cmp     dword [c_ret], T_VOID
+        je      short .done
+        test    r14d, r14d
+        jnz     short .done
+        mov     edi, ebx
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_MISSING_RETURN
+        jmp     near c_error
+.done:
+        mov     [c_lsp], r12
+        mov     qword [c_lbase], 0
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.no_effect:
+        mov     edi, r13d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NO_EFFECT
+        jmp     near c_error
+
+; local_push - add a local symbol for node edi with type esi.
+local_push:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        mov     r12d, esi
+        mov     edi, SK_LOCAL
+        mov     esi, ebx
+        call    sym_new
+        mov     [rdx + S_TYPE], r12d
+        mov     rcx, [c_lsp]
+        mov     rdx, [c_locals]
+        mov     [rdx + rcx*4], eax
+        inc     rcx
+        mov     [c_lsp], rcx
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; local_find - the visible local with token edi's name.  out: eax = symbol or 0
+; rbx = name, r12 = length, r13 = stack index
+local_find:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        call    tok_text
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     r13, [c_lsp]
+.loop:
+        cmp     r13, [c_lbase]
+        jbe     short .missing
+        dec     r13
+        mov     rax, [c_locals]
+        mov     r14d, [rax + r13*4]
+        mov     edi, r14d
+        call    sym_ptr
+        mov     ecx, [rax + S_NAMELEN]
+        cmp     rcx, r12
+        jne     short .loop
+        mov     rdi, [rax + S_NAME]
+        mov     rsi, rbx
+        mov     rdx, r12
+        call    mem_eq
+        test    eax, eax
+        jz      short .loop
+        mov     eax, r14d
+        jmp     short .out
+.missing:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; lookup - locals first, then program scope.  in: edi = token.  out: eax = symbol or 0
+lookup:
+        push    rbx
+        mov     ebx, edi
+        call    local_find
+        test    eax, eax
+        jnz     short .out
+        mov     edi, ebx
+        call    tok_text
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    g_find
+.out:
+        pop     rbx
+        ret
+
+; declare_local - [core.name.2]: add a local, E0204 if a visible local has the name.
+;   in: edi = declaring node, esi = type
+declare_local:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_tok
+        mov     edi, eax
+        call    local_find
+        test    eax, eax
+        jnz     short .redeclared
+        mov     edi, ebx
+        mov     esi, r12d
+        call    local_push
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+.redeclared:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, eax
+        mov     edi, E_REDECLARED
+        lea     rdx, [f_redeclared]
+        jmp     near c_fail
+
+; =============================================================================
+; Statements. check_stmt returns eax = 1 if the statement terminates
+; ([core.stmt.6]).
+; =============================================================================
+
+; check_stmt.  in: edi = statement node.  out: eax
+; ebx = node, r12d..r14d = parts, r15 = saved local top / scratch
+check_stmt:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        call    node_kind
+        cmp     eax, NK_BLOCK
+        je      short .block
+        cmp     eax, NK_UNSAFE
+        je      near .unsafe
+        cmp     eax, NK_IF
+        je      near .if
+        cmp     eax, NK_WHILE
+        je      near .while
+        cmp     eax, NK_FOR
+        je      near .for
+        cmp     eax, NK_BREAK
+        je      near .break
+        cmp     eax, NK_CONTINUE
+        je      near .continue
+        cmp     eax, NK_RETURN
+        je      near .return
+        cmp     eax, NK_MATCH
+        je      near .match
+        mov     edi, ebx
+        call    check_simple
+        jmp     near .out
+
+.block:
+        mov     r15, [c_lsp]
+        xor     r14d, r14d
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+.block_stmt:
+        test    r12d, r12d
+        jz      short .block_done
+        mov     edi, r12d
+        call    check_stmt
+        or      r14d, eax
+        mov     edi, r12d
+        call    node_ptr
+        mov     r12d, [rax + N_NEXT]
+        jmp     short .block_stmt
+.block_done:
+        mov     [c_lsp], r15            ; leave the block's scope
+        mov     eax, r14d
+        jmp     near .out
+
+.unsafe:
+        inc     qword [c_unsafe]
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    check_stmt
+        dec     qword [c_unsafe]
+        jmp     near .out
+
+.if:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        mov     esi, T_BOOL
+        call    expect_type
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    check_stmt
+        mov     r12d, eax
+        mov     edi, ebx
+        mov     esi, N_C
+        call    node_slot
+        test    eax, eax
+        jz      short .if_no_else
+        mov     edi, eax
+        call    check_stmt
+        and     eax, r12d
+        jmp     near .out
+.if_no_else:
+        xor     eax, eax
+        jmp     near .out
+
+.while:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        mov     esi, T_BOOL
+        call    expect_type
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    check_loop_body         ; eax = 1 if a break left this loop
+        mov     r12d, eax
+        ; terminates: condition is the literal true and nothing breaks out
+        xor     eax, eax
+        test    r12d, r12d
+        jnz     near .out
+        mov     edi, r13d
+        call    node_kind
+        cmp     eax, NK_BOOL
+        jne     near .false
+        mov     edi, r13d
+        call    node_tok
+        mov     edi, eax
+        lea     rsi, [s_true]
+        mov     edx, 4
+        call    tok_is
+        jmp     near .out
+
+.for:
+        mov     r15, [c_lsp]            ; the init's variables live in the loop's scope
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        test    eax, eax
+        jz      short .for_condition
+        mov     edi, eax
+        call    check_simple
+.for_condition:
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax
+        test    eax, eax
+        jz      short .for_step
+        mov     edi, eax
+        mov     esi, T_BOOL
+        call    expect_type
+.for_step:
+        mov     edi, ebx
+        mov     esi, N_C
+        call    node_slot
+        test    eax, eax
+        jz      short .for_body
+        mov     edi, eax
+        call    check_simple
+.for_body:
+        mov     edi, ebx
+        mov     esi, N_D
+        call    node_slot
+        mov     edi, eax
+        call    check_loop_body
+        mov     [c_lsp], r15
+        ; terminates: no condition and nothing breaks out
+        xor     ecx, ecx
+        test    r13d, r13d
+        jnz     short .for_result
+        test    eax, eax
+        jnz     short .for_result
+        mov     ecx, 1
+.for_result:
+        mov     eax, ecx
+        jmp     near .out
+
+.break:
+        cmp     qword [c_loops], 0
+        je      short .not_in_loop
+        mov     byte [c_break], 1
+        xor     eax, eax
+        jmp     near .out
+.continue:
+        cmp     qword [c_loops], 0
+        je      short .not_in_loop
+        xor     eax, eax
+        jmp     near .out
+.not_in_loop:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NOT_IN_LOOP
+        jmp     near c_error
+
+.return:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+        cmp     byte [c_top], 0
+        je      short .return_fn
+        test    r12d, r12d              ; top level: optional exit code
+        jz      short .true
+        mov     edi, r12d
+        mov     esi, T_I32
+        call    expect_type
+        jmp     short .true
+.return_fn:
+        cmp     dword [c_ret], T_VOID
+        jne     short .return_value
+        test    r12d, r12d
+        jz      short .true
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_BAD_RETURN
+        lea     rdx, [f_return_void]
+        jmp     near c_fail
+.return_value:
+        test    r12d, r12d
+        jz      short .return_missing
+        mov     edi, r12d
+        mov     esi, [c_ret]
+        call    expect_type
+        jmp     short .true
+.return_missing:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, [c_ret]
+        mov     edi, E_BAD_RETURN
+        lea     rdx, [f_return_missing]
+        jmp     near c_fail
+
+.match:
+        mov     edi, ebx
+        call    check_match
+        jmp     short .out
+
+.true:
+        mov     eax, 1
+        jmp     short .out
+.false:
+        xor     eax, eax
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; check_loop_body - check a loop body with a fresh break flag.
+;   in: edi = statement.  out: eax = 1 if a break targets this loop
+check_loop_body:
+        push    rbx
+        movzx   ebx, byte [c_break]
+        mov     byte [c_break], 0
+        inc     qword [c_loops]
+        call    check_stmt
+        dec     qword [c_loops]
+        movzx   eax, byte [c_break]
+        mov     [c_break], bl
+        pop     rbx
+        ret
+
+; check_simple - Simple statements ([core.stmt.1]-[core.stmt.3]).  out: eax = terminates
+; ebx = node, r12d = target / type, r13d = operator token, r14 = scratch
+check_simple:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    node_kind
+        cmp     eax, NK_VAR
+        je      short .var
+        cmp     eax, NK_EXPR
+        je      near .expr
+        cmp     eax, NK_ASSIGN
+        je      near .assign
+        ; NK_INC / NK_DEC
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+        mov     edi, eax
+        xor     esi, esi
+        call    check_value
+        mov     r14d, eax
+        mov     edi, ebx
+        call    node_tok
+        mov     r13d, eax
+        mov     edi, r12d
+        call    is_mutable
+        test    eax, eax
+        jz      near .not_assignable
+        mov     edi, r14d
+        call    is_int_type
+        test    eax, eax
+        jz      near .bad_operand
+        xor     eax, eax
+        jmp     near .out
+
+.var:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        test    eax, eax
+        jz      short .var_inferred
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r12d, eax
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r12d
+        call    size_of
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        test    eax, eax
+        jz      short .var_declare
+        mov     edi, eax
+        mov     esi, r12d
+        call    expect_type
+        jmp     short .var_declare
+.var_inferred:
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    check_value
+        mov     r12d, eax
+.var_declare:
+        mov     edi, ebx
+        mov     esi, r12d
+        call    declare_local
+        mov     edi, ebx
+        mov     esi, r12d
+        call    ntype_set
+        xor     eax, eax
+        jmp     near .out
+
+.expr:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r12d, eax
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_CALL
+        jne     near .no_effect
+        mov     edi, r12d
+        xor     esi, esi
+        call    check_expr
+        mov     edi, r12d
+        call    is_noreturn_call
+        jmp     near .out
+
+.assign:
+        mov     edi, ebx
+        call    node_tok
+        mov     r13d, eax
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r15d, eax
+        mov     edi, eax
+        xor     esi, esi
+        call    check_value
+        mov     r12d, eax
+        mov     edi, r15d
+        call    is_mutable
+        test    eax, eax
+        jz      near .not_assignable
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r15d, eax
+        mov     edi, r13d
+        call    tok_addr
+        cmp     dword [rax + TOK_LEN], 1
+        je      short .assign_plain           ; '=' is the only one-byte assignment operator
+        mov     edi, r12d
+        call    is_int_type
+        test    eax, eax
+        jz      short .bad_operand_r12
+        mov     edi, r13d               ; '<<=' and '>>=': any integer on the right
+        call    tok_text
+        movzx   ecx, byte [rax]
+        cmp     ecx, '<'
+        je      short .assign_shift
+        cmp     ecx, '>'
+        je      short .assign_shift
+.assign_plain:
+        mov     edi, r15d
+        mov     esi, r12d
+        call    expect_type
+        xor     eax, eax
+        jmp     short .out
+.assign_shift:
+        mov     edi, r15d
+        xor     esi, esi
+        call    check_value
+        mov     r12d, eax
+        mov     edi, eax
+        call    is_int_type
+        test    eax, eax
+        jz      short .bad_operand_r12
+        xor     eax, eax
+        jmp     short .out
+
+.no_effect:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NO_EFFECT
+        jmp     near c_error
+.not_assignable:
+        mov     esi, r13d
+        mov     edi, E_NOT_ASSIGNABLE
+        jmp     near c_error
+.bad_operand_r12:
+        mov     r14d, r12d
+.bad_operand:
+        mov     edi, r14d
+        mov     esi, r13d
+        jmp     near bad_operand
+.out:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; is_noreturn_call - is call node edi a call to exit or panic?  out: eax
+is_noreturn_call:
+        push    rbx
+        mov     edi, edi
+        mov     esi, N_A
+        call    node_slot
+        mov     ebx, eax
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_NAME
+        jne     short .no
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        call    lookup
+        test    eax, eax
+        jz      short .no
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_BUILTIN
+        jne     short .no
+        mov     ecx, [rax + S_AUX2]
+        cmp     ecx, B_EXIT
+        je      short .yes
+        cmp     ecx, B_PANIC
+        je      short .yes
+.no:
+        xor     eax, eax
+        pop     rbx
+        ret
+.yes:
+        mov     eax, 1
+        pop     rbx
+        ret
+
+; check_match - [core.stmt.7].  in: edi = match node.  out: eax = terminates
+; ebx = node, r12d = scrutinee type, r13d = arm, r14d = pattern,
+; r15 = flags (bit 0: saw '_', bit 1: an arm does not terminate); [rsp] = value
+check_match:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        xor     r15d, r15d
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        xor     esi, esi
+        call    check_value
+        mov     r12d, eax
+        mov     edi, eax
+        call    ty_kind
+        cmp     eax, TYK_INT
+        je      short .scrutinee_ok
+        cmp     eax, TYK_ENUM
+        jne     near .bad_scrutinee
+        mov     edi, r12d
+        call    ty_ptr
+        mov     edi, [rax + TY_SYM]
+        call    enum_declare
+.scrutinee_ok:
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax
+.arm:
+        test    r13d, r13d
+        jz      near .arms_done
+        mov     edi, r13d
+        mov     esi, N_A
+        call    node_slot
+        mov     r14d, eax
+.pattern:
+        test    r14d, r14d
+        jz      near .body
+        mov     edi, r14d
+        call    node_kind
+        cmp     eax, NK_WILD
+        jne     short .pattern_value
+        or      r15d, 1
+        jmp     near .pattern_next
+.pattern_value:
+        ; a bare variant name of the scrutinee's enum
+        cmp     eax, NK_NAME
+        jne     short .pattern_constant
+        mov     edi, r12d
+        call    ty_kind
+        cmp     eax, TYK_ENUM
+        jne     short .pattern_constant
+        mov     edi, r12d
+        mov     esi, r14d
+        call    enum_variant_named
+        test    eax, eax
+        jz      short .pattern_constant
+        mov     edi, eax
+        call    nvalue_get
+        mov     [rsp], rax
+        mov     edi, r14d
+        mov     esi, r12d
+        call    ntype_set
+        jmp     short .pattern_seen
+.pattern_constant:
+        mov     edi, r14d
+        mov     esi, r12d
+        call    expect_type
+        mov     edi, r14d
+        call    const_eval
+        mov     [rsp], rax
+.pattern_seen:
+        ; [core.stmt.7] each value once: compare with earlier patterns
+        mov     rdi, [rsp]
+        mov     esi, r14d
+        mov     edx, ebx
+        call    match_value_seen
+        test    eax, eax
+        jnz     near .duplicate
+        mov     edi, r14d
+        mov     rsi, [rsp]
+        call    nvalue_set
+        mov     edi, r14d               ; mark the pattern's value as recorded
+        call    node_ptr
+        or      dword [rax + N_FLAGS], NF_MATCHED
+.pattern_next:
+        mov     edi, r14d
+        call    node_ptr
+        mov     r14d, [rax + N_NEXT]
+        jmp     near .pattern
+.body:
+        mov     edi, r13d
+        mov     esi, N_B
+        call    node_slot
+        mov     r14d, eax
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_BLOCK
+        jne     short .simple_body
+        mov     edi, r14d
+        call    check_stmt
+        jmp     short .arm_done
+.simple_body:
+        mov     edi, r14d
+        call    check_simple
+.arm_done:
+        test    eax, eax
+        jnz     short .arm_next
+        or      r15d, 2
+.arm_next:
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     near .arm
+.arms_done:
+        test    r15d, 1
+        jnz     short .exhaustive
+        mov     edi, r12d
+        call    ty_kind
+        cmp     eax, TYK_ENUM
+        jne     short .not_exhaustive
+        mov     edi, r12d
+        mov     esi, ebx
+        call    enum_all_matched
+        test    eax, eax
+        jz      short .not_exhaustive
+.exhaustive:
+        xor     eax, eax
+        test    r15d, 2
+        jnz     short .out
+        mov     eax, 1
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.bad_scrutinee:
+        mov     edi, r13d
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, r12d
+        mov     edi, E_BAD_OPERAND
+        lea     rdx, [f_bad_scrutinee]
+        jmp     near c_fail
+.duplicate:
+        mov     edi, r14d
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_DUPLICATE_PATTERN
+        jmp     near c_error
+.not_exhaustive:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NOT_EXHAUSTIVE
+        jmp     near c_error
+
+; match_value_seen - has an earlier pattern of match edx recorded value rdi?
+;   in: esi = the current pattern (stop there).  out: eax
+; Patterns that recorded a value carry NF_MATCHED.
+match_value_seen:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        mov     rbx, rdi
+        mov     r12d, esi
+        mov     edi, edx
+        mov     esi, N_B
+        call    node_slot
+        mov     r13d, eax               ; arm
+.arm:
+        test    r13d, r13d
+        jz      short .no
+        mov     edi, r13d
+        mov     esi, N_A
+        call    node_slot
+        mov     r14d, eax
+.pattern:
+        test    r14d, r14d
+        jz      short .arm_next
+        cmp     r14d, r12d
+        je      short .no
+        mov     edi, r14d
+        call    node_ptr
+        test    dword [rax + N_FLAGS], NF_MATCHED
+        jz      short .pattern_next
+        mov     edi, r14d
+        call    nvalue_get
+        cmp     rax, rbx
+        je      short .yes
+.pattern_next:
+        mov     edi, r14d
+        call    node_ptr
+        mov     r14d, [rax + N_NEXT]
+        jmp     short .pattern
+.arm_next:
+        mov     edi, r13d
+        call    node_ptr
+        mov     r13d, [rax + N_NEXT]
+        jmp     short .arm
+.yes:
+        mov     eax, 1
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; enum_all_matched - does match esi name every variant of enum type edi?  out: eax
+enum_all_matched:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12d, esi
+        call    ty_ptr
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     ebx, eax                ; variant
+.variant:
+        test    ebx, ebx
+        jz      short .all
+        mov     edi, ebx
+        call    nvalue_get
+        mov     rdi, rax
+        mov     esi, 0                  ; search every pattern
+        mov     edx, r12d
+        call    match_value_seen
+        test    eax, eax
+        jz      short .missing
+        mov     edi, ebx
+        call    node_ptr
+        mov     ebx, [rax + N_NEXT]
+        jmp     short .variant
+.all:
+        mov     eax, 1
+        jmp     short .out
+.missing:
+        xor     eax, eax
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; enum_variant_named - the variant of enum type edi named by node esi's token.
+;   out: eax = variant node, or 0 (variants not yet defined are not found)
+enum_variant_named:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     r12d, esi
+        call    ty_ptr
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_B
+        call    node_slot
+        mov     ebx, eax
+        mov     edi, r12d
+        call    node_tok
+        mov     r12d, eax
+.loop:
+        test    ebx, ebx
+        jz      short .missing
+        mov     edi, ebx
+        call    ntype_get               ; defined variants carry their enum type
+        test    eax, eax
+        jz      short .next
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        mov     esi, r12d
+        call    same_name
+        test    eax, eax
+        jnz     short .found
+.next:
+        mov     edi, ebx
+        call    node_ptr
+        mov     ebx, [rax + N_NEXT]
+        jmp     short .loop
+.found:
+        mov     eax, ebx
+        jmp     short .out
+.missing:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; is_mutable - [core.stmt.3]: may this checked expression be assigned to?
+;   in: edi = node.  out: eax
+is_mutable:
+        mov     esi, 1
+        jmp     short place_check
+
+; is_addressable - [core.expr.5]: may `&` be applied?  in: edi = node.  out: eax
+is_addressable:
+        xor     esi, esi
+; place_check - shared walk: esi = 1 for assignment (slices and str are
+; read-only), 0 for address-of (any element has an address).
+place_check:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_kind
+        cmp     eax, NK_NAME
+        je      short .name
+        cmp     eax, NK_MEMBER
+        je      short .member
+        cmp     eax, NK_INDEX
+        je      short .index
+        cmp     eax, NK_UNARY
+        jne     near .no
+        mov     edi, ebx
+        call    node_ptr
+        cmp     word [rax + N_OP], TK_STAR
+        je      near .yes
+        jmp     near .no
+.name:
+        mov     edi, ebx
+        call    nsym_get
+        test    eax, eax
+        jz      near .no
+        mov     edi, eax
+        call    sym_ptr
+        movzx   eax, byte [rax + S_KIND]
+        cmp     eax, SK_LOCAL
+        je      short .yes
+        cmp     eax, SK_STATIC
+        je      short .yes
+        jmp     short .no
+.member:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     ebx, eax
+        mov     edi, eax
+        call    ntype_get
+        test    eax, eax
+        jz      short .no                     ; Enum.Variant
+        mov     edi, eax
+        call    ty_kind
+        cmp     eax, TYK_PTR
+        je      short .yes
+        cmp     eax, TYK_STRUCT
+        jne     short .no
+        mov     edi, ebx
+        mov     esi, r12d
+        call    place_check
+        jmp     short .out
+.index:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     ebx, eax
+        mov     edi, eax
+        call    ntype_get
+        mov     edi, eax
+        call    ty_kind
+        cmp     eax, TYK_ARRAY
+        je      short .index_array
+        cmp     eax, TYK_PTR
+        je      short .yes
+        test    r12d, r12d
+        jz      short .yes                    ; &s[i] of a slice or str is fine
+        jmp     short .no
+.index_array:
+        mov     edi, ebx
+        mov     esi, r12d
+        call    place_check
+        jmp     short .out
+.yes:
+        mov     eax, 1
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Expressions
+; =============================================================================
+
+; expect_type - check node edi against type esi exactly (E0301).
+expect_type:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        mov     r12d, esi
+        call    check_value
+        cmp     eax, r12d
+        jne     short .mismatch
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+.mismatch:
+        mov     edx, eax
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r12d
+        jmp     near mismatch
+
+; check_value - check_expr, but a void value is E0322 ([core.expr.11]).
+;   in: edi = node, esi = expected type or 0.  out: eax
+check_value:
+        push    rbx
+        mov     ebx, edi
+        call    check_expr
+        cmp     eax, T_VOID
+        je      short .void
+        pop     rbx
+        ret
+.void:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_VOID_VALUE
+        jmp     near c_error
+
+; is_untyped - [core.expr.2]: is this an unsuffixed literal expression?
+;   in: edi = node.  out: eax
+is_untyped:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        cmp     ecx, NK_INT
+        je      near .int
+        cmp     ecx, NK_UNARY
+        je      short .unary
+        cmp     ecx, NK_BINARY
+        jne     near .no
+        movzx   ecx, word [rax + N_OP]
+        cmp     ecx, TK_AND_AND
+        je      short .no
+        cmp     ecx, TK_OR_OR
+        je      short .no
+        lea     rdx, [tok_class]
+        movzx   edx, byte [rdx + rcx]
+        and     edx, TC_PREC
+        cmp     edx, PREC_COMPARE
+        je      short .no
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    is_untyped
+        test    eax, eax
+        jz      short .out
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    is_untyped
+        jmp     short .out
+.unary:
+        movzx   ecx, word [rax + N_OP]
+        cmp     ecx, TK_MINUS
+        je      short .operand
+        cmp     ecx, TK_TILDE
+        jne     short .no
+.operand:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    is_untyped
+        jmp     short .out
+.int:
+        mov     edi, [rax + N_TOK]
+        call    literal_split           ; edx = suffix length
+        xor     eax, eax
+        test    edx, edx
+        sete    al
+        jmp     short .out
+.no:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; type_untyped - give an untyped literal expression type esi, checking each
+; literal fits (E0304) and `-` has a signed type (E0302).  in: edi = node
+type_untyped:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        call    ntype_set
+        mov     edi, ebx
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        cmp     ecx, NK_INT
+        je      short .int
+        cmp     ecx, NK_UNARY
+        je      short .unary
+        mov     edi, ebx                ; binary: both operands
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r12d
+        call    type_untyped
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r12d
+        call    type_untyped
+        jmp     near .out
+.int:
+        mov     edi, [rax + N_TOK]
+        call    literal_value
+        test    edx, edx
+        jnz     short .int_too_big
+        mov     rdi, rax
+        mov     esi, r12d
+        call    literal_fits
+        test    eax, eax
+        jnz     near .out
+.int_too_big:
+        mov     edi, ebx
+        jmp     near .does_not_fit
+.unary:
+        cmp     word [rax + N_OP], TK_MINUS
+        jne     short .operand
+        mov     edi, r12d
+        call    ty_ptr
+        cmp     byte [rax + TY_SIGNED], 0
+        je      short .unsigned_minus
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_INT
+        jne     short .operand
+        ; -128 fits i8 even though 128 does not
+        mov     edi, r13d
+        mov     esi, r12d
+        call    ntype_set
+        mov     edi, r13d
+        call    node_tok
+        mov     edi, eax
+        call    literal_value
+        test    edx, edx
+        jnz     short .negated_too_big
+        mov     rdi, rax
+        mov     esi, r12d
+        call    negated_literal_fits
+        test    eax, eax
+        jnz     short .out
+.negated_too_big:
+        mov     edi, r13d
+        jmp     short .does_not_fit
+.operand:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r12d
+        call    type_untyped
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.unsigned_minus:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r12d
+        jmp     near bad_operand
+.does_not_fit:
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, r12d
+        mov     edi, E_DOES_NOT_FIT
+        lea     rdx, [f_does_not_fit]
+        jmp     near c_fail
+
+; check_expr - type an expression ([core.expr.*]); records it in c_ntype.
+;   in: edi = node, esi = expected type or 0.  out: eax = type
+check_expr:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     ebx, edi
+        mov     r12d, esi
+        call    is_untyped
+        test    eax, eax
+        jz      short .typed
+        mov     edi, r12d               ; expected integer type, else i32
+        call    integer_or_i32
+        mov     r12d, eax
+        mov     edi, ebx
+        mov     esi, eax
+        call    type_untyped
+        mov     edi, ebx
+        call    const_eval
+        mov     eax, r12d
+        jmp     short .out
+.typed:
+        mov     edi, ebx
+        mov     esi, r12d
+        call    check_expr_inner
+        mov     r12d, eax
+        mov     edi, ebx
+        mov     esi, eax
+        call    ntype_set
+        mov     eax, r12d
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; integer_or_i32 - type edi if it is an integer type, else i32.  out: eax
+integer_or_i32:
+        test    edi, edi
+        jz      short .i32
+        push    rbx
+        mov     ebx, edi
+        call    is_int_type
+        test    eax, eax
+        mov     eax, ebx
+        pop     rbx
+        jnz     short .done
+.i32:
+        mov     eax, T_I32
+.done:
+        ret
+
+; check_expr_inner - the per-kind rules.  in: edi = node, esi = expected.  out: eax
+; ebx = node, r12d = expected, r13d..r15d = parts
+check_expr_inner:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_kind
+        cmp     eax, NK_INT
+        je      short .int
+        cmp     eax, NK_CHAR
+        je      near .char
+        cmp     eax, NK_STRING
+        je      near .string
+        cmp     eax, NK_BOOL
+        je      near .bool
+        cmp     eax, NK_NAME
+        je      near .name
+        cmp     eax, NK_CALL
+        je      near .call
+        cmp     eax, NK_INDEX
+        je      near .index
+        cmp     eax, NK_MEMBER
+        je      near .member
+        cmp     eax, NK_UNARY
+        je      near .unary
+        cmp     eax, NK_BINARY
+        je      near .binary
+        cmp     eax, NK_CAST
+        je      near .cast
+        cmp     eax, NK_SIZEOF
+        je      near .size_query
+        cmp     eax, NK_ALIGNOF
+        je      near .size_query
+        jmp     near .new                    ; NK_NEW is the only kind left
+
+.int:                                   ; a suffixed literal
+        mov     edi, ebx
+        call    node_tok
+        mov     r13d, eax
+        mov     edi, eax
+        call    suffix_type
+        cmp     eax, -1
+        je      short .int_128
+        mov     r14d, eax
+        mov     edi, r13d
+        call    literal_value
+        test    edx, edx
+        jnz     short .int_too_big
+        mov     rdi, rax
+        mov     esi, r14d
+        call    literal_fits
+        test    eax, eax
+        jz      short .int_too_big
+        mov     eax, r14d
+        jmp     near .out
+.int_too_big:
+        mov     esi, r13d
+        mov     ecx, r14d
+        mov     edi, E_DOES_NOT_FIT
+        lea     rdx, [f_does_not_fit]
+        jmp     near c_fail
+.int_128:
+        lea     rdi, [s_int128]
+        mov     esi, r13d
+        jmp     near p_error_not_core
+
+.char:
+        mov     edi, ebx
+        call    node_tok
+        mov     r13d, eax
+        mov     edi, eax
+        call    char_value
+        cmp     rax, 0x7F
+        ja      short .char_non_ascii
+        mov     eax, T_U8
+        jmp     near .out
+.char_non_ascii:
+        lea     rdi, [s_non_ascii_chars]
+        mov     esi, r13d
+        jmp     near p_error_not_core
+
+.string:
+        mov     eax, T_STR
+        jmp     near .out
+.bool:
+        mov     eax, T_BOOL
+        jmp     near .out
+
+.name:
+        mov     edi, ebx
+        call    node_tok
+        mov     r13d, eax
+        mov     edi, eax
+        call    lookup
+        test    eax, eax
+        jz      short .unknown_name
+        mov     r14d, eax
+        mov     edi, ebx
+        mov     esi, eax
+        call    nsym_set
+        mov     edi, r14d
+        call    sym_ptr
+        movzx   ecx, byte [rax + S_KIND]
+        cmp     ecx, SK_LOCAL
+        je      short .name_type
+        cmp     ecx, SK_STATIC
+        je      short .name_type
+        cmp     ecx, SK_CONST
+        je      short .name_const
+        cmp     ecx, SK_FN
+        je      short .function_value
+        cmp     ecx, SK_BUILTIN
+        je      short .function_value
+        mov     esi, r13d               ; a type used as a value
+        mov     ecx, r13d
+        mov     edi, E_NOT_A_VALUE
+        lea     rdx, [f_not_a_value]
+        jmp     near c_fail
+.name_const:
+        mov     edi, r14d
+        mov     esi, r13d
+        call    const_resolve
+        mov     edi, r14d
+        call    sym_ptr
+.name_type:
+        mov     eax, [rax + S_TYPE]
+        jmp     near .out
+.function_value:
+        lea     rdi, [s_function_values]
+        mov     esi, r13d
+        jmp     near p_error_not_core
+.unknown_name:
+        mov     esi, r13d
+        mov     ecx, r13d
+        mov     edi, E_UNKNOWN_NAME
+        lea     rdx, [f_unknown_name]
+        jmp     near c_fail
+
+.call:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax               ; callee
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_NAME
+        jne     near .not_callable
+        mov     edi, r13d
+        call    node_tok
+        mov     r15d, eax
+        mov     edi, eax
+        call    lookup
+        test    eax, eax
+        jz      near .unknown_callee
+        mov     r14d, eax
+        mov     edi, eax
+        call    sym_ptr
+        movzx   ecx, byte [rax + S_KIND]
+        cmp     ecx, SK_FN
+        je      short .callable
+        cmp     ecx, SK_BUILTIN
+        jne     near .not_callable
+        cmp     dword [rax + S_AUX2], B_STR_FROM ; str_from vouches for raw memory
+        jne     short .callable
+        cmp     qword [c_unsafe], 0
+        je      near .needs_unsafe
+.callable:
+        ; [core.expr.8] count the arguments first
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r15d, eax
+        xor     ecx, ecx
+.count_args:
+        test    eax, eax
+        jz      short .counted
+        inc     ecx
+        push    rcx
+        push    rcx
+        mov     edi, eax
+        call    node_ptr
+        mov     eax, [rax + N_NEXT]
+        pop     rcx
+        pop     rcx
+        jmp     short .count_args
+.counted:
+        mov     [rsp], ecx
+        mov     edi, r14d
+        call    sym_ptr
+        mov     edx, [rax + S_AUX]
+        cmp     edx, [rsp]
+        jne     short .arg_count
+        mov     r13, [rax + S_PARAMS]
+.argument:
+        test    r15d, r15d
+        jz      short .call_done
+        mov     edi, r15d
+        mov     esi, [r13]
+        call    expect_type
+        add     r13, 4
+        mov     edi, r15d
+        call    node_ptr
+        mov     r15d, [rax + N_NEXT]
+        jmp     short .argument
+.call_done:
+        mov     edi, r14d
+        call    sym_ptr
+        mov     eax, [rax + S_TYPE]
+        jmp     near .out
+.arg_count:
+        mov     ecx, edx
+        mov     r8d, [rsp]
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_ARG_COUNT
+        lea     rdx, [f_arg_count]
+        jmp     near c_fail
+.unknown_callee:
+        mov     esi, r15d
+        mov     ecx, r15d
+        mov     edi, E_UNKNOWN_NAME
+        lea     rdx, [f_unknown_name]
+        jmp     near c_fail
+.not_callable:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NOT_CALLABLE
+        jmp     near c_error
+
+.index:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    check_value
+        mov     r13d, eax               ; object type
+        mov     edi, eax
+        call    ty_ptr
+        movzx   ecx, byte [rax + TY_KIND]
+        mov     r14d, [rax + TY_ELEM]
+        cmp     ecx, TYK_PTR
+        je      short .index_ptr
+        cmp     ecx, TYK_ARRAY
+        je      short .index_operand
+        cmp     ecx, TYK_SLICE
+        je      short .index_operand
+        mov     r14d, T_U8
+        cmp     ecx, TYK_STR
+        je      short .index_operand
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r13d
+        jmp     near bad_operand
+.index_ptr:
+        cmp     qword [c_unsafe], 0
+        je      near .needs_unsafe
+.index_operand:
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r15d, eax
+        mov     edi, eax
+        call    is_untyped
+        test    eax, eax
+        jz      short .index_typed
+        mov     edi, r15d
+        mov     esi, T_USIZE
+        call    check_expr
+        jmp     short .index_done
+.index_typed:
+        mov     edi, r15d
+        xor     esi, esi
+        call    check_value
+        mov     r13d, eax
+        mov     edi, eax
+        call    is_int_type
+        test    eax, eax
+        jnz     short .index_done
+        mov     edi, r15d
+        call    node_tok
+        mov     esi, eax
+        mov     r8d, r13d
+        lea     rcx, [s_an_integer_type]
+        mov     edi, E_MISMATCH
+        lea     rdx, [f_mismatch_s]
+        jmp     near c_fail
+.index_done:
+        mov     eax, r14d
+        jmp     near .out
+
+.member:
+        mov     edi, ebx
+        call    node_tok
+        mov     r15d, eax               ; member name
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax               ; object
+        ; Enum.Variant ([core.expr.7])
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_NAME
+        jne     short .member_value
+        mov     edi, r13d
+        call    node_tok
+        mov     edi, eax
+        call    lookup
+        test    eax, eax
+        jz      short .member_value
+        mov     r14d, eax
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_ENUM
+        jne     short .member_value
+        mov     edi, r14d
+        call    enum_declare
+        mov     edi, r14d
+        call    sym_ptr
+        mov     r14d, [rax + S_TYPE]
+        mov     edi, r14d
+        mov     esi, ebx
+        call    enum_variant_named
+        test    eax, eax
+        jz      near .no_member_r14
+        mov     eax, r14d
+        jmp     near .out
+.member_value:
+        mov     edi, r13d
+        xor     esi, esi
+        call    check_value
+        mov     r14d, eax               ; object type
+        mov     r13d, eax               ; struct type after auto-deref
+        mov     edi, eax
+        call    ty_ptr
+        cmp     byte [rax + TY_KIND], TYK_PTR
+        jne     short .member_struct
+        mov     ecx, [rax + TY_ELEM]
+        mov     edi, ecx
+        push    rcx
+        push    rcx
+        call    ty_kind
+        pop     rcx
+        pop     rcx
+        cmp     eax, TYK_STRUCT
+        jne     short .member_struct
+        cmp     qword [c_unsafe], 0
+        je      near .needs_unsafe
+        mov     r13d, ecx
+.member_struct:
+        mov     edi, r13d
+        call    ty_kind
+        cmp     eax, TYK_STRUCT
+        jne     short .member_view
+        mov     edi, r13d
+        call    ty_ptr
+        mov     edi, [rax + TY_SYM]
+        mov     esi, r15d
+        call    struct_layout
+        mov     edi, r13d
+        mov     esi, ebx                ; the member node: its token is the name
+        call    struct_field_named
+        test    eax, eax
+        jz      short .member_view
+        mov     edi, eax
+        call    ntype_get
+        jmp     near .out
+.member_view:
+        mov     edi, r14d
+        call    ty_kind
+        cmp     eax, TYK_STR
+        je      short .view
+        cmp     eax, TYK_SLICE
+        jne     short .no_member_r14
+.view:
+        mov     edi, r15d
+        lea     rsi, [s_len]
+        mov     edx, 3
+        call    tok_is
+        test    eax, eax
+        jz      short .view_ptr
+        mov     eax, T_USIZE
+        jmp     near .out
+.view_ptr:
+        mov     edi, r15d
+        lea     rsi, [s_ptr]
+        mov     edx, 3
+        call    tok_is
+        test    eax, eax
+        jz      short .no_member_r14
+        mov     eax, T_PTR_U8
+        mov     edi, r14d
+        call    ty_kind
+        cmp     eax, TYK_STR
+        mov     eax, T_PTR_U8
+        je      near .out
+        mov     edi, r14d
+        call    ty_ptr
+        mov     edi, [rax + TY_ELEM]
+        call    type_ptr_to
+        jmp     near .out
+.no_member_r14:
+        mov     esi, r15d
+        mov     ecx, r14d
+        mov     r8d, r15d
+        mov     edi, E_NO_MEMBER
+        lea     rdx, [f_no_member]
+        jmp     near c_fail
+
+.unary:
+        mov     edi, ebx
+        call    node_ptr
+        movzx   r14d, word [rax + N_OP]
+        mov     r15d, [rax + N_TOK]
+        mov     r13d, [rax + N_A]
+        cmp     r14d, TK_MINUS
+        je      short .negate
+        cmp     r14d, TK_TILDE
+        je      short .complement
+        cmp     r14d, TK_BANG
+        je      near .not
+        cmp     r14d, TK_STAR
+        je      near .deref
+        ; '&'
+        cmp     qword [c_unsafe], 0
+        je      near .needs_unsafe
+        mov     edi, r13d
+        xor     esi, esi
+        call    check_value
+        mov     r14d, eax
+        mov     edi, r13d
+        call    is_addressable
+        test    eax, eax
+        jz      near .not_addressable
+        mov     edi, r14d
+        call    type_ptr_to
+        jmp     near .out
+.negate:
+        mov     edi, r13d
+        mov     esi, r12d
+        call    check_value
+        mov     r14d, eax
+        mov     edi, eax
+        call    ty_ptr
+        cmp     byte [rax + TY_KIND], TYK_INT
+        jne     short .unary_bad
+        cmp     byte [rax + TY_SIGNED], 0
+        je      short .unary_bad
+        mov     eax, r14d
+        jmp     near .out
+.complement:
+        mov     edi, r13d
+        mov     esi, r12d
+        call    check_value
+        mov     r14d, eax
+        mov     edi, eax
+        call    is_int_type
+        test    eax, eax
+        jz      short .unary_bad
+        mov     eax, r14d
+        jmp     near .out
+.not:
+        mov     edi, r13d
+        xor     esi, esi
+        call    check_value
+        mov     r14d, eax
+        cmp     eax, T_BOOL
+        jne     short .unary_bad
+        jmp     near .out
+.deref:
+        cmp     qword [c_unsafe], 0
+        je      near .needs_unsafe
+        mov     edi, r13d
+        xor     esi, esi
+        call    check_value
+        mov     r14d, eax
+        mov     edi, eax
+        call    ty_ptr
+        cmp     byte [rax + TY_KIND], TYK_PTR
+        jne     short .unary_bad
+        mov     eax, [rax + TY_ELEM]
+        jmp     near .out
+.unary_bad:
+        mov     edi, r14d
+        mov     esi, r15d
+        jmp     near bad_operand
+.not_addressable:
+        mov     esi, r15d
+        mov     edi, E_NOT_ADDRESSABLE
+        jmp     near c_error
+
+.binary:
+        mov     edi, ebx
+        mov     esi, r12d
+        call    check_binary
+        jmp     near .out
+
+.cast:                                  ; [core.expr.9]
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    check_value
+        mov     r13d, eax               ; from
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r14d, eax               ; to
+        mov     edi, r13d
+        mov     esi, r14d
+        call    cast_kind               ; 0 invalid, 1 fine, 2 needs unsafe
+        test    eax, eax
+        jz      short .bad_cast
+        cmp     eax, 2
+        jne     short .cast_ok
+        cmp     qword [c_unsafe], 0
+        je      near .needs_unsafe
+.cast_ok:
+        mov     eax, r14d
+        jmp     near .out
+.bad_cast:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, r13d
+        mov     r8d, r14d
+        mov     edi, E_BAD_CAST
+        lea     rdx, [f_bad_cast]
+        jmp     near c_fail
+
+.size_query:                            ; sizeof(T) / alignof(T): usize constants
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r13d, eax
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r13d
+        call    size_of
+        mov     rsi, rax
+        mov     edi, ebx
+        call    node_kind
+        cmp     eax, NK_SIZEOF
+        je      short .size_value
+        mov     rsi, rdx
+.size_value:
+        mov     edi, ebx
+        call    nvalue_set
+        mov     eax, T_USIZE
+        jmp     near .out
+
+.new:                                   ; [core.expr.10]
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        xor     esi, esi
+        call    resolve_type
+        mov     r13d, eax
+        mov     edi, eax
+        call    ty_kind
+        cmp     eax, TYK_STRUCT
+        jne     near .new_not_struct
+        mov     edi, r13d
+        call    ty_ptr
+        mov     r14d, [rax + TY_SYM]
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r14d
+        call    struct_layout
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     r14d, eax               ; initializer
+.init:
+        test    r14d, r14d
+        jz      short .new_done
+        mov     edi, r14d
+        call    node_tok
+        mov     r15d, eax
+        mov     edi, r13d
+        mov     esi, r14d
+        call    struct_field_named
+        test    eax, eax
+        jz      short .no_field
+        mov     [rsp], eax
+        ; set twice? compare with earlier initializers
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        mov     esi, r14d
+        call    find_earlier_name
+        test    eax, eax
+        jnz     short .field_twice
+        mov     edi, [rsp]
+        call    ntype_get
+        mov     [rsp + 8], eax          ; the field's type
+        mov     edi, r14d
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        mov     esi, [rsp + 8]
+        call    expect_type
+        mov     edi, r14d
+        call    node_ptr
+        mov     r14d, [rax + N_NEXT]
+        jmp     short .init
+.new_done:
+        mov     eax, r13d
+        jmp     short .out
+.new_not_struct:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r13d
+        jmp     near bad_operand
+.no_field:
+        mov     esi, r15d
+        mov     ecx, r13d
+        mov     r8d, r15d
+        mov     edi, E_NO_MEMBER
+        lea     rdx, [f_no_member]
+        jmp     near c_fail
+.field_twice:
+        mov     esi, r15d
+        mov     ecx, r15d
+        mov     edi, E_FIELD_TWICE
+        lea     rdx, [f_field_twice]
+        jmp     near c_fail
+
+.needs_unsafe:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NEEDS_UNSAFE
+        jmp     near c_error
+
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; find_earlier_name - does a node before esi in list edi share its name?  out: eax
+find_earlier_name:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        mov     edi, esi
+        call    node_tok
+        mov     r13d, eax
+.loop:
+        cmp     ebx, r12d
+        je      short .no
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        mov     esi, r13d
+        call    same_name
+        test    eax, eax
+        jnz     short .out
+        mov     edi, ebx
+        call    node_ptr
+        mov     ebx, [rax + N_NEXT]
+        jmp     short .loop
+.no:
+        xor     eax, eax
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; struct_field_named - field node of struct type edi named by node esi's token.
+;   out: eax = field node or 0
+struct_field_named:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     r12d, esi
+        call    ty_ptr
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     edi, [rax + S_NODE]
+        mov     esi, N_A
+        call    node_slot
+        mov     ebx, eax
+        mov     edi, r12d
+        call    node_kind
+        mov     ecx, eax
+        mov     edi, r12d
+        call    node_tok
+        mov     r12d, eax               ; (member name tokens are the node's own token)
+.loop:
+        test    ebx, ebx
+        jz      short .missing
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        mov     esi, r12d
+        call    same_name
+        test    eax, eax
+        jnz     short .found
+        mov     edi, ebx
+        call    node_ptr
+        mov     ebx, [rax + N_NEXT]
+        jmp     short .loop
+.found:
+        mov     eax, ebx
+        jmp     short .out
+.missing:
+        xor     eax, eax
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; cast_kind - [core.expr.9].  in: edi = from type, esi = to type.
+;   out: eax = 0 invalid, 1 allowed, 2 allowed in unsafe only
+cast_kind:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        mov     r12d, esi
+        call    ty_kind
+        mov     r13d, eax               ; from kind
+        mov     edi, r12d
+        call    ty_kind
+        cmp     eax, TYK_INT
+        jne     short .to_ptr
+        cmp     r13d, TYK_INT
+        je      short .fine
+        cmp     r13d, TYK_BOOL
+        je      short .fine
+        cmp     r13d, TYK_ENUM
+        je      short .fine
+        cmp     r13d, TYK_PTR           ; pointer -> usize / isize
+        jne     short .same
+        cmp     r12d, T_USIZE
+        je      short .unsafe
+        cmp     r12d, T_ISIZE
+        je      short .unsafe
+        jmp     short .same
+.to_ptr:
+        cmp     eax, TYK_PTR
+        jne     short .same
+        cmp     r13d, TYK_PTR
+        je      short .unsafe
+        cmp     ebx, T_USIZE
+        je      short .unsafe
+        cmp     ebx, T_ISIZE
+        je      short .unsafe
+.same:
+        cmp     ebx, r12d
+        je      short .fine
+        xor     eax, eax
+        jmp     short .out
+.fine:
+        mov     eax, 1
+        jmp     short .out
+.unsafe:
+        mov     eax, 2
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; check_binary - [core.expr.3], [core.expr.4].  in: edi = node, esi = expected.
+;   out: eax = type
+; ebx = node, r12d = expected, r13d = operator kind, r14d = left, r15d = right;
+; [rsp] = operand type
+check_binary:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 16
+        mov     ebx, edi
+        mov     r12d, esi
+        call    node_ptr
+        movzx   r13d, word [rax + N_OP]
+        mov     r14d, [rax + N_A]
+        mov     r15d, [rax + N_B]
+        cmp     r13d, TK_AND_AND
+        je      near .logical
+        cmp     r13d, TK_OR_OR
+        je      near .logical
+        cmp     r13d, TK_SHL
+        je      near .shift
+        cmp     r13d, TK_SHR
+        je      near .shift
+        ; comparisons ignore the expected type
+        lea     rax, [tok_class]
+        movzx   eax, byte [rax + r13]
+        and     eax, TC_PREC
+        cmp     eax, PREC_COMPARE
+        jne     short .operands
+        xor     r12d, r12d
+.operands:
+        mov     edi, r14d
+        call    is_untyped
+        test    eax, eax
+        jz      near .left_typed
+        mov     edi, r15d
+        call    is_untyped
+        test    eax, eax
+        jz      short .left_untyped
+        ; both operands untyped
+        mov     edi, r12d
+        call    integer_or_i32
+        mov     [rsp], eax
+        mov     edi, r14d
+        mov     esi, eax
+        call    type_untyped
+        mov     edi, r14d
+        call    const_eval
+        mov     edi, r15d
+        mov     esi, [rsp]
+        call    type_untyped
+        mov     edi, r15d
+        call    const_eval
+        jmp     short .operator
+.left_untyped:
+        mov     edi, r15d
+        mov     esi, r12d
+        call    check_value
+        mov     [rsp], eax
+        mov     edi, eax
+        call    is_int_type
+        test    eax, eax
+        jz      short .left_mismatch
+        mov     edi, r14d
+        mov     esi, [rsp]
+        call    type_untyped
+        mov     edi, r14d
+        call    const_eval
+        jmp     short .operator
+.left_mismatch:
+        mov     edi, r14d
+        call    node_tok
+        mov     esi, eax
+        mov     ecx, [rsp]
+        lea     r8, [s_integer_literal]
+        mov     edi, E_MISMATCH
+        lea     rdx, [f_mismatch_ts]
+        jmp     near c_fail
+.left_typed:
+        mov     edi, r14d
+        mov     esi, r12d
+        call    check_value
+        mov     [rsp], eax
+        mov     edi, r15d
+        mov     esi, eax
+        call    expect_type
+.operator:
+        lea     rax, [tok_class]
+        movzx   eax, byte [rax + r13]
+        and     eax, TC_PREC
+        cmp     eax, PREC_COMPARE
+        jne     short .arithmetic
+        mov     edi, [rsp]
+        call    ty_kind
+        cmp     r13d, TK_EQ_EQ
+        je      short .equality
+        cmp     r13d, TK_NOT_EQ
+        je      short .equality
+        cmp     eax, TYK_INT
+        jne     near .bad
+        jmp     short .boolean
+.equality:
+        cmp     eax, TYK_INT
+        je      short .boolean
+        cmp     eax, TYK_BOOL
+        je      short .boolean
+        cmp     eax, TYK_ENUM
+        je      short .boolean
+        cmp     eax, TYK_PTR
+        jne     near .bad
+.boolean:
+        mov     eax, T_BOOL
+        jmp     near .out
+.arithmetic:
+        mov     edi, [rsp]
+        call    is_int_type
+        test    eax, eax
+        jz      near .bad
+        mov     eax, [rsp]
+        jmp     near .out
+.logical:
+        mov     edi, r14d
+        mov     esi, T_BOOL
+        call    expect_type
+        mov     edi, r15d
+        mov     esi, T_BOOL
+        call    expect_type
+        mov     eax, T_BOOL
+        jmp     short .out
+.shift:
+        mov     edi, r14d
+        call    is_untyped
+        test    eax, eax
+        jz      short .shift_typed
+        mov     edi, r12d
+        call    integer_or_i32
+        mov     [rsp], eax
+        mov     edi, r14d
+        mov     esi, eax
+        call    type_untyped
+        mov     edi, r14d
+        call    const_eval
+        jmp     short .shift_left_done
+.shift_typed:
+        mov     edi, r14d
+        mov     esi, r12d
+        call    check_value
+        mov     [rsp], eax
+.shift_left_done:
+        mov     edi, [rsp]
+        call    is_int_type
+        test    eax, eax
+        jz      short .bad
+        mov     edi, r15d
+        xor     esi, esi
+        call    check_value
+        mov     r12d, eax
+        mov     edi, eax
+        call    is_int_type
+        test    eax, eax
+        jz      short .bad_right
+        mov     eax, [rsp]
+        jmp     short .out
+.bad_right:
+        mov     [rsp], r12d
+.bad:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, [rsp]
+        jmp     near bad_operand
+.out:
+        add     rsp, 16
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Literals
+; =============================================================================
+
+; literal_split - an integer literal's parts ([lex.int.1]).
+;   in: edi = token.  out: rax = digits pointer (after any 0x/0b/0o),
+;   rcx = digits length (underscores included), r8d = base, rdx = suffix
+;   length (the suffix starts at the first 'i' or 'u', never a digit)
+literal_split:
+        push    rbx
+        call    tok_text
+        mov     r8d, 10
+        cmp     rdx, 2
+        jb      short .digits
+        cmp     byte [rax], '0'
+        jne     short .digits
+        movzx   ecx, byte [rax + 1]
+        mov     r9d, 16
+        cmp     ecx, 'x'
+        je      short .prefix
+        mov     r9d, 2
+        cmp     ecx, 'b'
+        je      short .prefix
+        mov     r9d, 8
+        cmp     ecx, 'o'
+        jne     short .digits
+.prefix:
+        mov     r8d, r9d
+        add     rax, 2
+        sub     rdx, 2
+.digits:
+        xor     ecx, ecx
+.scan:
+        cmp     rcx, rdx
+        jae     short .found
+        movzx   ebx, byte [rax + rcx]
+        cmp     ebx, 'i'
+        je      short .found
+        cmp     ebx, 'u'
+        je      short .found
+        inc     rcx
+        jmp     short .scan
+.found:
+        sub     rdx, rcx                ; suffix length
+        pop     rbx
+        ret
+
+; literal_value - the value of integer literal token edi.
+;   out: rax = value, edx = 1 if it does not fit in 64 bits
+literal_value:
+        push    rbx
+        push    r12
+        push    r13
+        call    literal_split
+        mov     rbx, rax                ; digits
+        mov     r12, rcx                ; length
+        mov     r13d, r8d               ; base
+        xor     eax, eax
+        xor     ecx, ecx
+.loop:
+        cmp     rcx, r12
+        jae     short .done
+        movzx   edx, byte [rbx + rcx]
+        inc     rcx
+        cmp     edx, '_'
+        je      short .loop
+        push    rax
+        push    rcx
+        mov     eax, edx
+        call    digit_value
+        mov     r8d, eax
+        pop     rcx
+        pop     rax
+        mul     r13                     ; rdx:rax = value * base
+        jc      short .overflow
+        add     rax, r8
+        jc      short .overflow
+        jmp     short .loop
+.done:
+        xor     edx, edx
+        jmp     short .out
+.overflow:
+        mov     edx, 1
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; suffix_type - type named by an integer literal's suffix.
+;   in: edi = token.  out: eax = type, 0 without a suffix, -1 for i128/u128
+suffix_type:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        call    literal_split
+        add     rax, rcx                ; suffix start
+        mov     rbx, rax
+        mov     r12, rdx
+        xor     eax, eax
+        test    r12, r12
+        jz      short .out
+        lea     r8, [suffix_types]
+.next:
+        movzx   ecx, byte [r8]
+        test    ecx, ecx
+        jz      short .wide
+        cmp     rcx, r12
+        jne     short .skip
+        push    r8
+        push    r8
+        lea     rdi, [r8 + 2]
+        mov     rsi, rbx
+        mov     rdx, r12
+        call    mem_eq
+        pop     r8
+        pop     r8
+        test    eax, eax
+        jz      short .skip
+        movzx   eax, byte [r8 + 1]
+        jmp     short .out
+.skip:
+        add     r8, 8
+        jmp     short .next
+.wide:
+        mov     eax, -1
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; type_max - largest value of integer type esi, as stored.  out: rax
+type_max:
+        mov     edi, esi
+        call    ty_ptr
+        mov     ecx, [rax + TY_SIZE]
+        shl     ecx, 3                  ; bits
+        movzx   edx, byte [rax + TY_SIGNED]
+        sub     ecx, edx                ; signed types lose the sign bit
+        mov     rax, -1
+        cmp     ecx, 64
+        je      short .done
+        mov     rax, 1
+        shl     rax, cl
+        dec     rax
+.done:
+        ret
+
+; literal_fits - does literal value rdi (unsigned) fit integer type esi?  out: eax
+literal_fits:
+        push    rbx
+        mov     rbx, rdi
+        call    type_max
+        cmp     rbx, rax
+        setbe   al
+        movzx   eax, al
+        pop     rbx
+        ret
+
+; negated_literal_fits - does -rdi fit signed type esi (rdi <= max + 1)?  out: eax
+negated_literal_fits:
+        push    rbx
+        mov     rbx, rdi
+        call    type_max
+        inc     rax
+        cmp     rbx, rax
+        setbe   al
+        movzx   eax, al
+        pop     rbx
+        ret
+
+; value_fits - does stored value rdi fit type esi (integer, bool or enum)?  out: eax
+value_fits:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     rbx, rdi
+        mov     r12d, esi
+        mov     edi, esi
+        call    ty_ptr
+        movzx   ecx, byte [rax + TY_KIND]
+        cmp     ecx, TYK_BOOL
+        je      short .bool
+        cmp     ecx, TYK_ENUM
+        jne     short .int
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     r12d, [rax + S_AUX]
+        mov     edi, r12d
+        call    ty_ptr
+.int:
+        mov     ecx, [rax + TY_SIZE]
+        shl     ecx, 3
+        cmp     ecx, 64
+        je      short .yes                    ; every 64-bit pattern is a valid i64/u64
+        cmp     byte [rax + TY_SIGNED], 0
+        je      short .unsigned
+        ; signed: sign-extending the low bits must give the value back
+        mov     edx, 64
+        sub     edx, ecx
+        mov     ecx, edx
+        mov     rax, rbx
+        shl     rax, cl
+        sar     rax, cl
+        cmp     rax, rbx
+        sete    al
+        movzx   eax, al
+        jmp     short .out
+.unsigned:
+        mov     rax, rbx
+        shr     rax, cl
+        test    rax, rax
+        setz    al
+        movzx   eax, al
+        jmp     short .out
+.bool:
+        cmp     rbx, 1
+        setbe   al
+        movzx   eax, al
+        jmp     short .out
+.yes:
+        mov     eax, 1
+.out:
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; wrap_value - reduce rdi to the bit width of integer type esi, sign- or
+; zero-extended as stored.  out: rax
+wrap_value:
+        push    rbx
+        mov     rbx, rdi
+        mov     edi, esi
+        call    ty_ptr
+        mov     ecx, [rax + TY_SIZE]
+        shl     ecx, 3
+        cmp     ecx, 64
+        je      short .same
+        mov     edx, 64
+        sub     edx, ecx
+        mov     ecx, edx
+        mov     rdx, rax
+        mov     rax, rbx
+        shl     rax, cl
+        cmp     byte [rdx + TY_SIGNED], 0
+        je      short .zero
+        sar     rax, cl
+        pop     rbx
+        ret
+.zero:
+        shr     rax, cl
+        pop     rbx
+        ret
+.same:
+        mov     rax, rbx
+        pop     rbx
+        ret
+
+; char_value - the value of a character literal token edi.  out: rax
+char_value:
+        push    rbx
+        call    tok_text
+        lea     rbx, [rax + 1]          ; after the opening quote
+        movzx   eax, byte [rbx]
+        cmp     eax, 0x5C
+        je      short .escape
+        cmp     eax, 0x80
+        jb      near .done
+        ; a multi-byte UTF-8 scalar: decode it (the lexer validated it)
+        cmp     eax, 0xE0
+        jb      short .two
+        cmp     eax, 0xF0
+        jb      short .three
+        and     eax, 0x07
+        mov     ecx, 3
+        jmp     short .continuation
+.three:
+        and     eax, 0x0F
+        mov     ecx, 2
+        jmp     short .continuation
+.two:
+        and     eax, 0x1F
+        mov     ecx, 1
+.continuation:
+        inc     rbx
+        movzx   edx, byte [rbx]
+        and     edx, 0x3F
+        shl     eax, 6
+        or      eax, edx
+        dec     ecx
+        jnz     short .continuation
+        jmp     short .done
+.escape:
+        movzx   eax, byte [rbx + 1]
+        cmp     eax, 'n'
+        mov     ecx, 10
+        je      short .simple
+        cmp     eax, 'r'
+        mov     ecx, 13
+        je      short .simple
+        cmp     eax, 't'
+        mov     ecx, 9
+        je      short .simple
+        cmp     eax, '0'
+        mov     ecx, 0
+        je      short .simple
+        cmp     eax, 'x'
+        je      short .hex
+        cmp     eax, 'u'
+        je      short .unicode
+        mov     ecx, eax                ; \\ \' \"
+.simple:
+        mov     eax, ecx
+        jmp     short .done
+.hex:
+        add     rbx, 2
+        mov     ecx, 2
+        jmp     short .hex_digits
+.unicode:
+        add     rbx, 3                  ; past \u{
+        mov     ecx, 6
+.hex_digits:
+        xor     edx, edx
+.hex_loop:
+        movzx   eax, byte [rbx]
+        cmp     eax, '}'
+        je      short .hex_done
+        cmp     eax, 0x27
+        je      short .hex_done
+        push    rdx
+        push    rcx
+        call    digit_value
+        pop     rcx
+        pop     rdx
+        shl     edx, 4
+        or      edx, eax
+        inc     rbx
+        dec     ecx
+        jnz     short .hex_loop
+.hex_done:
+        mov     eax, edx
+.done:
+        pop     rbx
+        ret
+
+; =============================================================================
+; Constants ([core.const.*])
+; =============================================================================
+
+; const_eval - the value of a checked constant expression (E0310, E0311).
+;   in: edi = node.  out: rax
+; ebx = node, r12d = type, r13 = left value, r14 = right value, r15d = operator
+const_eval:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, edi
+        call    ntype_get
+        mov     r12d, eax
+        mov     edi, ebx
+        call    node_ptr
+        movzx   ecx, word [rax + N_KIND]
+        movzx   r15d, word [rax + N_OP]
+        cmp     ecx, NK_INT
+        je      short .int
+        cmp     ecx, NK_STRING
+        je      short .zero
+        cmp     ecx, NK_CHAR
+        je      short .char
+        cmp     ecx, NK_BOOL
+        je      short .bool
+        cmp     ecx, NK_NAME
+        je      short .name
+        cmp     ecx, NK_MEMBER
+        je      near .member
+        cmp     ecx, NK_UNARY
+        je      near .unary
+        cmp     ecx, NK_BINARY
+        je      near .binary
+        cmp     ecx, NK_CAST
+        je      near .cast
+        cmp     ecx, NK_SIZEOF
+        je      short .recorded
+        cmp     ecx, NK_ALIGNOF
+        je      short .recorded
+        jmp     near .not_constant
+.int:
+        mov     edi, [rax + N_TOK]
+        call    literal_value
+        jmp     near .store
+.zero:
+        xor     eax, eax
+        jmp     near .store
+.char:
+        mov     edi, [rax + N_TOK]
+        call    char_value
+        jmp     near .store
+.bool:
+        mov     edi, [rax + N_TOK]
+        lea     rsi, [s_true]
+        mov     edx, 4
+        call    tok_is
+        jmp     near .store
+.recorded:
+        mov     edi, ebx
+        call    nvalue_get
+        jmp     near .store
+.name:
+        mov     edi, ebx
+        call    nsym_get
+        test    eax, eax
+        jnz     short .name_symbol
+        mov     edi, ebx
+        call    node_tok
+        mov     edi, eax
+        call    lookup
+.name_symbol:
+        test    eax, eax
+        jz      short .name_variant
+        mov     r13d, eax
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_CONST
+        jne     short .name_variant
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, r13d
+        call    const_resolve
+        mov     edi, r13d
+        call    sym_ptr
+        mov     rax, [rax + S_VALUE]
+        jmp     near .store
+.name_variant:
+        test    r12d, r12d
+        jz      near .not_constant
+        mov     edi, r12d
+        call    ty_kind
+        cmp     eax, TYK_ENUM
+        jne     near .not_constant
+        mov     edi, r12d
+        mov     esi, ebx
+        call    enum_variant_named
+        test    eax, eax
+        jz      near .not_constant
+        mov     edi, eax
+        call    nvalue_get
+        jmp     near .store
+.member:
+        mov     r13d, [rax + N_A]
+        mov     edi, r13d
+        call    node_kind
+        cmp     eax, NK_NAME
+        jne     near .not_constant
+        mov     edi, r13d
+        call    node_tok
+        mov     edi, eax
+        call    lookup
+        test    eax, eax
+        jz      near .not_constant
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_KIND], SK_ENUM
+        jne     near .not_constant
+        mov     edi, [rax + S_TYPE]
+        mov     esi, ebx
+        call    enum_variant_named
+        test    eax, eax
+        jz      near .not_constant
+        mov     edi, eax
+        call    nvalue_get
+        jmp     near .store
+.unary:
+        cmp     r15d, TK_MINUS
+        je      short .negate
+        cmp     r15d, TK_TILDE
+        je      short .unary_operand
+        cmp     r15d, TK_BANG
+        jne     near .not_constant
+.unary_operand:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    const_eval
+        cmp     r15d, TK_BANG
+        je      short .logical_not
+        not     rax
+        mov     rdi, rax
+        mov     esi, r12d
+        call    wrap_value
+        jmp     near .store
+.logical_not:
+        xor     rax, 1
+        jmp     near .store
+.negate:
+        ; an untyped -literal was range-checked as a whole by type_untyped
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        call    node_kind
+        cmp     eax, NK_INT
+        jne     short .negate_value
+        mov     edi, ebx
+        call    is_untyped
+        test    eax, eax
+        jz      short .negate_value
+        mov     edi, r13d
+        call    node_tok
+        mov     edi, eax
+        call    literal_value
+        neg     rax
+        jmp     near .store
+.negate_value:
+        mov     edi, r13d
+        call    const_eval
+        neg     rax
+        jo      near .failed                 ; -(-2^63)
+        mov     r13, rax
+        mov     rdi, rax
+        mov     esi, r12d
+        call    value_fits
+        test    eax, eax
+        jz      near .failed
+        mov     rax, r13
+        jmp     near .store
+.cast:
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     edi, eax
+        call    const_eval
+        mov     r13, rax
+        mov     edi, r12d
+        call    is_int_type
+        test    eax, eax
+        jz      near .not_constant
+        mov     rdi, r13
+        mov     esi, r12d
+        call    wrap_value
+        jmp     near .store
+.binary:
+        cmp     r15d, TK_AND_AND
+        je      near .not_constant
+        cmp     r15d, TK_OR_OR
+        je      near .not_constant
+        mov     edi, ebx
+        mov     esi, N_A
+        call    node_slot
+        mov     r13d, eax
+        mov     edi, eax
+        call    const_eval
+        mov     r14, rax                ; left value (for now)
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    const_eval
+        mov     rdx, rax                ; right value
+        mov     rax, r14                ; left value
+        mov     r13d, r13d
+        push    rdx
+        push    rax
+        mov     edi, r13d               ; operands' type decides signedness
+        call    ntype_get
+        mov     edi, eax
+        call    ty_ptr
+        movzx   r13d, byte [rax + TY_SIGNED]
+        pop     rax
+        pop     rdx
+        mov     rcx, rdx                ; rax = left, rcx = right
+        cmp     r15d, TK_EQ_EQ
+        je      near .eq
+        cmp     r15d, TK_NOT_EQ
+        je      near .ne
+        cmp     r15d, TK_LT
+        je      near .lt
+        cmp     r15d, TK_GT
+        je      near .gt
+        cmp     r15d, TK_LT_EQ
+        je      near .le
+        cmp     r15d, TK_GT_EQ
+        je      near .ge
+        cmp     r15d, TK_PLUS
+        je      near .add
+        cmp     r15d, TK_MINUS
+        je      near .sub
+        cmp     r15d, TK_STAR
+        je      near .mul
+        cmp     r15d, TK_WRAP_ADD
+        je      near .wrap_add
+        cmp     r15d, TK_WRAP_SUB
+        je      near .wrap_sub
+        cmp     r15d, TK_WRAP_MUL
+        je      near .wrap_mul
+        cmp     r15d, TK_SLASH
+        je      near .div
+        cmp     r15d, TK_PERCENT
+        je      near .div
+        cmp     r15d, TK_AMP
+        je      near .and
+        cmp     r15d, TK_PIPE
+        je      near .or
+        cmp     r15d, TK_CARET
+        je      near .xor
+        cmp     r15d, TK_SHL
+        je      near .shl
+        cmp     r15d, TK_SHR
+        je      near .shr
+        jmp     near .not_constant
+.eq:
+        cmp     rax, rcx
+        sete    al
+        jmp     short .flag
+.ne:
+        cmp     rax, rcx
+        setne   al
+        jmp     short .flag
+.lt:
+        test    r13d, r13d              ; signedness first: test changes the flags
+        jz      short .ltu
+        cmp     rax, rcx
+        setl    al
+        jmp     short .flag
+.ltu:
+        cmp     rax, rcx
+        setb    al
+        jmp     short .flag
+.gt:
+        test    r13d, r13d
+        jz      short .gtu
+        cmp     rax, rcx
+        setg    al
+        jmp     short .flag
+.gtu:
+        cmp     rax, rcx
+        seta    al
+        jmp     short .flag
+.le:
+        test    r13d, r13d
+        jz      short .leu
+        cmp     rax, rcx
+        setle   al
+        jmp     short .flag
+.leu:
+        cmp     rax, rcx
+        setbe   al
+        jmp     short .flag
+.ge:
+        test    r13d, r13d
+        jz      short .geu
+        cmp     rax, rcx
+        setge   al
+        jmp     short .flag
+.geu:
+        cmp     rax, rcx
+        setae   al
+.flag:
+        movzx   eax, al
+        jmp     near .store
+.add:
+        test    r13d, r13d
+        jz      short .addu
+        add     rax, rcx
+        jo      near .failed
+        jmp     short .checked
+.addu:
+        add     rax, rcx
+        jc      near .failed
+        jmp     short .checked
+.sub:
+        test    r13d, r13d
+        jz      short .subu
+        sub     rax, rcx
+        jo      near .failed
+        jmp     short .checked
+.subu:
+        sub     rax, rcx
+        jc      near .failed
+        jmp     short .checked
+.mul:
+        test    r13d, r13d
+        jz      short .mulu
+        imul    rax, rcx
+        jo      near .failed
+        jmp     short .checked
+.mulu:
+        mul     rcx
+        jc      near .failed
+.checked:
+        mov     r14, rax
+        mov     rdi, rax
+        mov     esi, r12d
+        call    value_fits
+        test    eax, eax
+        jz      near .failed
+        mov     rax, r14
+        jmp     near .store
+.wrap_add:
+        add     rax, rcx
+        jmp     short .wrapped
+.wrap_sub:
+        sub     rax, rcx
+        jmp     short .wrapped
+.wrap_mul:
+        imul    rax, rcx
+.wrapped:
+        mov     rdi, rax
+        mov     esi, r12d
+        call    wrap_value
+        jmp     near .store
+.div:
+        test    rcx, rcx
+        jz      near .failed
+        test    r13d, r13d
+        jz      short .divu
+        cmp     rcx, -1                 ; MIN / -1 overflows (and would trap)
+        jne     short .divs
+        mov     rdx, 0x8000000000000000
+        cmp     rax, rdx
+        je      near .failed
+.divs:
+        cqo
+        idiv    rcx
+        jmp     short .quotient
+.divu:
+        xor     edx, edx
+        div     rcx
+.quotient:
+        cmp     r15d, TK_PERCENT
+        jne     short .checked
+        mov     rax, rdx
+        jmp     short .checked
+.and:
+        and     rax, rcx
+        jmp     short .store
+.or:
+        or      rax, rcx
+        jmp     short .store
+.xor:
+        xor     rax, rcx
+        jmp     short .store
+.shl:
+        call    .shift_amount
+        shl     rax, cl
+        jmp     short .wrapped
+.shr:
+        call    .shift_amount
+        test    r13d, r13d
+        jz      short .shru
+        sar     rax, cl
+        jmp     short .store
+.shru:
+        shr     rax, cl
+        jmp     short .store
+
+; .shift_amount: the right operand (rcx) must be 0 <= n < bits of the result
+; type, judged by the right operand's own signedness. Keeps rax.
+.shift_amount:
+        push    rax
+        push    rcx
+        mov     edi, ebx
+        mov     esi, N_B
+        call    node_slot
+        mov     edi, eax
+        call    ntype_get
+        mov     edi, eax
+        call    ty_ptr
+        movzx   r14d, byte [rax + TY_SIGNED]
+        mov     edi, r12d
+        call    ty_ptr
+        mov     edx, [rax + TY_SIZE]
+        shl     edx, 3
+        pop     rcx
+        pop     rax
+        test    r14d, r14d
+        jz      short .amount_unsigned
+        test    rcx, rcx
+        js      short .shift_failed
+.amount_unsigned:
+        cmp     rcx, rdx
+        jae     short .shift_failed
+        ret
+.shift_failed:
+        add     rsp, 8                  ; discard the return address into .shl/.shr
+        jmp     short .failed
+
+.store:
+        mov     r13, rax
+        mov     edi, ebx
+        mov     rsi, rax
+        call    nvalue_set
+        mov     rax, r13
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.failed:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_CONST_FAILED
+        jmp     near c_error
+.not_constant:
+        mov     edi, ebx
+        call    node_tok
+        mov     esi, eax
+        mov     edi, E_NOT_CONSTANT
+        jmp     near c_error
+
+; =============================================================================
+; c_dump_extra - checker annotations after a node's position in the tree dump:
+;   struct " size S align A", field " offset O", variant / const / static
+;   " = value", and " : type" for expressions, locals, parameters and fields.
+;   in: edi = node
+; =============================================================================
+c_dump_extra:
+        push    rbx
+        push    r12
+        push    r13
+        mov     ebx, edi
+        call    node_kind
+        mov     r12d, eax
+        cmp     eax, NK_STRUCT
+        je      short .struct
+        cmp     eax, NK_FIELD
+        je      near .field
+        cmp     eax, NK_VARIANT
+        je      near .variant
+        cmp     eax, NK_CONST
+        je      near .constant
+        cmp     eax, NK_STATIC
+        je      near .constant
+        jmp     near .type
+.struct:
+        mov     edi, ebx
+        call    nsym_get
+        test    eax, eax
+        jz      near .out
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_LSTATE], 2
+        jne     near .out
+        mov     r13, rax
+        lea     rdi, [w_out]
+        lea     rsi, [s_size]
+        call    w_cstr
+        lea     rdi, [w_out]
+        mov     esi, [r13 + S_AUX]
+        call    w_u64
+        lea     rdi, [w_out]
+        lea     rsi, [s_align]
+        call    w_cstr
+        lea     rdi, [w_out]
+        mov     esi, [r13 + S_AUX2]
+        call    w_u64
+        jmp     near .out
+.field:
+        mov     edi, ebx
+        call    ntype_get
+        test    eax, eax
+        jz      near .out
+        lea     rdi, [w_out]
+        lea     rsi, [s_offset]
+        call    w_cstr
+        mov     edi, ebx
+        call    nvalue_get
+        lea     rdi, [w_out]
+        mov     rsi, rax
+        call    w_u64
+        jmp     short .type
+.variant:
+        mov     edi, ebx
+        call    ntype_get
+        test    eax, eax
+        jz      near .out
+        mov     edi, eax                ; the enum: print in its representation
+        call    ty_ptr
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     r13d, [rax + S_AUX]
+        mov     edi, ebx
+        call    nvalue_get
+        mov     rsi, rax
+        mov     edi, r13d
+        call    w_out_value
+        jmp     near .out
+.constant:
+        mov     edi, ebx
+        call    nsym_get
+        test    eax, eax
+        jz      short .out
+        mov     edi, eax
+        call    sym_ptr
+        cmp     byte [rax + S_STATE], 2
+        jne     short .out
+        mov     r13, rax
+        mov     edi, [r13 + S_TYPE]
+        call    is_scalar_value
+        test    eax, eax
+        jz      short .out
+        mov     edi, [r13 + S_TYPE]
+        mov     rsi, [r13 + S_VALUE]
+        call    w_out_value
+        jmp     short .out
+.type:
+        ; expressions, locals and parameters print their type
+        cmp     r12d, NK_INT
+        jb      short .not_expression
+        cmp     r12d, NK_NEW
+        jbe     short .typed
+.not_expression:
+        cmp     r12d, NK_VAR
+        je      short .typed
+        cmp     r12d, NK_PARAM
+        je      short .typed
+        cmp     r12d, NK_FIELD
+        jne     short .out
+.typed:
+        mov     edi, ebx
+        call    ntype_get
+        test    eax, eax
+        jz      short .out
+        mov     r13d, eax
+        lea     rdi, [w_out]
+        lea     rsi, [s_colon]
+        call    w_cstr
+        lea     rdi, [w_out]
+        mov     esi, r13d
+        call    w_type_name
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; w_out_value - write " = <value>" for a value of type edi (signed types may
+; print a minus sign; enums print in their representation).
+;   in: rsi = value
+w_out_value:
+        push    rbx
+        push    r12
+        sub     rsp, 8
+        mov     rbx, rsi
+        mov     r12d, edi
+        lea     rdi, [w_out]
+        lea     rsi, [s_equals]
+        call    w_cstr
+        mov     edi, r12d
+        call    ty_ptr
+        cmp     byte [rax + TY_KIND], TYK_ENUM
+        jne     short .signedness
+        mov     edi, [rax + TY_SYM]
+        call    sym_ptr
+        mov     edi, [rax + S_AUX]
+        call    ty_ptr
+.signedness:
+        cmp     byte [rax + TY_SIGNED], 0
+        je      short .unsigned
+        test    rbx, rbx
+        jns     short .unsigned
+        lea     rdi, [w_out]
+        mov     esi, '-'
+        call    w_byte
+        neg     rbx
+.unsigned:
+        lea     rdi, [w_out]
+        mov     rsi, rbx
+        call    w_u64
+        add     rsp, 8
+        pop     r12
+        pop     rbx
+        ret
+
+; =============================================================================
+; Data
+; =============================================================================
+
+; Primitive types, in T_* order. TY_NAME holds an offset into prim_names until
+; c_init_scope turns it into a pointer.
+        align   8, db 0
+prim_types:
+        ;       kind,       signed, namelen,  size, align, elem, count, sym, name
+        db      0, 0
+        dw      0
+        dd      0, 1, 0, 0, 0
+        dq      0
+        db      TYK_VOID, 0
+        dw      4
+        dd      0, 1, 0, 0, 0
+        dq      pn_void - prim_names
+        db      TYK_BOOL, 0
+        dw      4
+        dd      1, 1, 0, 0, 0
+        dq      pn_bool - prim_names
+        db      TYK_STR, 0
+        dw      3
+        dd      16, 8, 0, 0, 0
+        dq      pn_str - prim_names
+        db      TYK_INT, 1
+        dw      2
+        dd      1, 1, 0, 0, 0
+        dq      pn_i8 - prim_names
+        db      TYK_INT, 1
+        dw      3
+        dd      2, 2, 0, 0, 0
+        dq      pn_i16 - prim_names
+        db      TYK_INT, 1
+        dw      3
+        dd      4, 4, 0, 0, 0
+        dq      pn_i32 - prim_names
+        db      TYK_INT, 1
+        dw      3
+        dd      8, 8, 0, 0, 0
+        dq      pn_i64 - prim_names
+        db      TYK_INT, 1
+        dw      5
+        dd      8, 8, 0, 0, 0
+        dq      pn_isize - prim_names
+        db      TYK_INT, 0
+        dw      2
+        dd      1, 1, 0, 0, 0
+        dq      pn_u8 - prim_names
+        db      TYK_INT, 0
+        dw      3
+        dd      2, 2, 0, 0, 0
+        dq      pn_u16 - prim_names
+        db      TYK_INT, 0
+        dw      3
+        dd      4, 4, 0, 0, 0
+        dq      pn_u32 - prim_names
+        db      TYK_INT, 0
+        dw      3
+        dd      8, 8, 0, 0, 0
+        dq      pn_u64 - prim_names
+        db      TYK_INT, 0
+        dw      5
+        dd      8, 8, 0, 0, 0
+        dq      pn_usize - prim_names
+        db      TYK_PTR, 0              ; *u8, used by builtins
+        dw      0
+        dd      8, 8, T_U8, 0, 0
+        dq      0
+
+; Aliases ([type.prim.2]): name offset, length, type.
+        align   8, db 0
+prim_aliases:
+        dq      pn_byte - prim_names
+        dd      4, T_U8
+        dq      pn_int - prim_names
+        dd      3, T_I32
+        dq      pn_uint - prim_names
+        dd      4, T_U32
+        dq      pn_long - prim_names
+        dd      4, T_I64
+        dq      pn_ulong - prim_names
+        dd      5, T_U64
+        dq      0
+        dd      0, 0
+
+; Built-ins (envo-core.md section 6): name offset, length, return type,
+; parameter count, parameter types. 32 bytes each; ids count from 1 in order.
+        align   8, db 0
+builtin_table:
+        dq      pn_print - prim_names
+        dd      5, T_VOID, 1, T_STR, 0, 0
+        dq      pn_write - prim_names
+        dd      5, T_VOID, 2, T_I32, T_STR, 0
+        dq      pn_read - prim_names
+        dd      4, T_ISIZE, 3, T_I32, T_PTR_U8, T_USIZE
+        dq      pn_open - prim_names
+        dd      4, T_I32, 2, T_STR, T_I32, 0
+        dq      pn_close - prim_names
+        dd      5, T_VOID, 1, T_I32, 0, 0
+        dq      pn_alloc - prim_names
+        dd      5, T_PTR_U8, 1, T_USIZE, 0, 0
+        dq      pn_exit - prim_names                    ; id 7 = B_EXIT
+        dd      4, T_VOID, 1, T_I32, 0, 0
+        dq      pn_argc - prim_names
+        dd      4, T_USIZE, 0, 0, 0, 0
+        dq      pn_arg - prim_names
+        dd      3, T_STR, 1, T_USIZE, 0, 0
+        dq      pn_panic - prim_names                   ; id 10 = B_PANIC
+        dd      5, T_VOID, 1, T_STR, 0, 0
+        dq      pn_str_from - prim_names                ; id 11 = B_STR_FROM (unsafe)
+        dd      8, T_STR, 2, T_PTR_U8, T_USIZE, 0
+        dq      0
+        dd      0, 0, 0, 0, 0, 0
+
+; Integer suffixes ([lex.int.3]): length, type, spelling; 8 bytes each.
+suffix_types:
+        db      2, T_I8, 'i8', 0, 0, 0, 0
+        db      3, T_I16, 'i16', 0, 0, 0
+        db      3, T_I32, 'i32', 0, 0, 0
+        db      3, T_I64, 'i64', 0, 0, 0
+        db      5, T_ISIZE, 'isize', 0
+        db      2, T_U8, 'u8', 0, 0, 0, 0
+        db      3, T_U16, 'u16', 0, 0, 0
+        db      3, T_U32, 'u32', 0, 0, 0
+        db      3, T_U64, 'u64', 0, 0, 0
+        db      5, T_USIZE, 'usize', 0
+        db      0
+
+prim_names:
+pn_void:        db 'void'
+pn_bool:        db 'bool'
+pn_str:         db 'str'
+pn_i8:          db 'i8'
+pn_i16:         db 'i16'
+pn_i32:         db 'i32'
+pn_i64:         db 'i64'
+pn_isize:       db 'isize'
+pn_u8:          db 'u8'
+pn_u16:         db 'u16'
+pn_u32:         db 'u32'
+pn_u64:         db 'u64'
+pn_usize:       db 'usize'
+pn_byte:        db 'byte'
+pn_int:         db 'int'
+pn_uint:        db 'uint'
+pn_long:        db 'long'
+pn_ulong:       db 'ulong'
+pn_print:       db 'print'
+pn_write:       db 'write'
+pn_read:        db 'read'
+pn_open:        db 'open'
+pn_close:       db 'close'
+pn_alloc:       db 'alloc'
+pn_exit:        db 'exit'
+pn_argc:        db 'argc'
+pn_arg:         db 'arg'
+pn_panic:       db 'panic'
+pn_str_from:    db 'str_from'
+
+; Message formats for c_fail.
+f_duplicate:        db '`%n` is already defined', 0
+f_unknown_type:     db 'unknown type `%n`', 0
+f_unknown_name:     db 'unknown name `%n`', 0
+f_redeclared:       db '`%n` is already declared in this function', 0
+f_no_member:        db '`%t` has no member `%n`', 0
+f_field_twice:      db 'field `%n` is set twice', 0
+f_not_a_type:       db '`%n` is not a type', 0
+f_not_a_value:      db '`%n` is a type, not a value', 0
+f_mismatch:         db 'mismatched types: expected `%t`, found `%t`', 0
+f_mismatch_s:       db 'mismatched types: expected %s, found `%t`', 0
+f_mismatch_ts:      db 'mismatched types: expected `%t`, found %s', 0
+f_bad_operand:      db 'operator `%n` cannot be applied to `%t`', 0
+f_bad_scrutinee:    db '`match` needs an integer or enum value, found `%t`', 0
+f_recursive:        db 'struct `%n` contains itself', 0
+f_does_not_fit:     db 'value does not fit in `%t`', 0
+f_bad_cast:         db 'cannot convert `%t` to `%t`', 0
+f_arg_count:        db 'wrong number of arguments: expected %d, found %d', 0
+f_const_cycle:      db 'constant `%n` depends on itself', 0
+f_return_missing:   db 'this function returns `%t`; `return` needs a value', 0
+f_return_void:      db 'this function returns nothing; remove the return value', 0
+
+s_unknown_type:     db '?', 0
+s_true:             db 'true'
+s_len:              db 'Len'
+s_ptr:              db 'Ptr'
+s_size:             db ' size ', 0
+s_align:            db ' align ', 0
+s_offset:           db ' offset ', 0
+s_equals:           db ' = ', 0
+s_colon:            db ' : ', 0
+s_an_integer_type:  db 'an integer type', 0
+s_integer_literal:  db 'an integer literal', 0
+s_int128:           db '128-bit integers', 0
+s_non_ascii_chars:  db 'non-ASCII character literals', 0
+s_function_values:  db 'function values', 0
+msg_symbols_full:   db 'symbol table capacity exceeded'
+msg_symbols_full_len equ $ - msg_symbols_full
+msg_types_full:     db 'type table capacity exceeded'
+msg_types_full_len  equ $ - msg_types_full
+
+        align   8, db 0
+c_ntype:        dq 0                    ; u32 per node: type
+c_nvalue:       dq 0                    ; u64 per node: constant value / field offset
+c_nsym:         dq 0                    ; u32 per node: symbol
+c_types:        dq 0                    ; type table
+c_ntypes:       dq 0
+c_tcap:         dq 0
+c_syms:         dq 0                    ; symbol table
+c_nsyms:        dq 0
+c_scap:         dq 0
+c_hash:         dq 0                    ; program scope: u32 symbol per slot
+c_hcap:         dq 0
+c_locals:       dq 0                    ; local stack: u32 symbols
+c_lsp:          dq 0                    ; stack top
+c_lbase:        dq 0                    ; first local of the current function
+c_unsafe:       dq 0                    ; unsafe block depth
+c_loops:        dq 0                    ; loop depth
+c_ret:          dd 0                    ; current function's return type
+c_top:          db 0                    ; checking top-level statements
+c_break:        db 0                    ; a break left the innermost loop
+c_dump:         db 0                    ; ast_dump prints checker annotations

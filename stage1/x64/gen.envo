@@ -1,0 +1,645 @@
+// The x86-64 backend (docs/architecture/stage1.md): every SSA value lives in its own rbp
+// slot; each instruction loads its operands into fixed registers, computes and stores
+// its result. Values are kept canonical (sign- or zero-extended to 64 bits), so overflow
+// checks are the CPU flags for 64-bit types and "does it survive re-normalization" for
+// narrower ones, as in Stage 0.
+
+struct Gen {
+    *Module M;
+    *Asm A;
+    u32 Target;
+    Vec FuncLabels;     // u32 per function
+    Vec GlobalLabels;   // u32 per global
+    Vec BlockLabels;    // u32 per block (module-wide index)
+    Vec Traps;          // u32 per panic reason: the shared stub's label, 0 until used
+    u32 Func;           // the function being generated
+    u32 FirstValue;
+    u32 NParams;
+    WinImports Imports;
+}
+
+// ------------------------------------------------------------------ helpers
+
+*Module GM(*Gen g) {
+    unsafe { return g.M; }
+}
+
+*Asm GA(*Gen g) {
+    unsafe { return g.A; }
+}
+
+u32 LabelOf(*Vec v, u32 i) {
+    unsafe { return MemLoadU32(VecAt(v, i as usize)); }
+}
+
+// The rbp offset of value v: parameters are the caller's argument slots, others are
+// below the frame pointer.
+i32 VOff(*Gen g, u32 v) {
+    unsafe {
+        u32 k = v - g.FirstValue;
+        if (k < g.NParams) return (16 + 8 * k) as i32;
+        return 0 - (8 * (k + 1)) as i32;
+    }
+}
+
+void LoadV(*Gen g, u8 r, u32 v) {
+    Load(GA(g), r, RBP, VOff(g, v), 8, false);
+}
+
+void StoreV(*Gen g, u32 v, u8 r) {
+    Store(GA(g), RBP, VOff(g, v), r, 8);
+}
+
+// The value of operand o (a value or an integer) into register r.
+void LoadOp(*Gen g, u8 r, u32 o) {
+    EOp op = EOpGet(GM(g), o);
+    if (op.Kind == OK_VALUE) LoadV(g, r, op.Ref);
+    else MovRI(GA(g), r, op.Int);
+}
+
+u32 OpRef(*Gen g, u32 o) {
+    return EOpGet(GM(g), o).Ref;
+}
+
+// The label of the shared stub that panics with reason i.
+u32 TrapLabel(*Gen g, u64 reason) {
+    unsafe {
+        u32 l = MemLoadU32(VecAt(&g.Traps, reason as usize));
+        if (l == 0) {
+            l = NewLabel(g.A);
+            MemStoreU32(VecAt(&g.Traps, reason as usize), l);
+        }
+        return l;
+    }
+}
+
+const u64 TRAP_OVERFLOW = 0;
+const u64 TRAP_BOUNDS = 1;
+const u64 TRAP_DIVISION = 2;
+const u64 TRAP_SHIFT = 4;
+const u64 TRAP_UNREACHABLE = 5;
+const u64 TRAP_UTF8 = 6;
+
+// Panics with reason unless r survives re-normalization to type t (narrow types).
+void CheckNormal(*Gen g, u8 r, u32 t) {
+    *Asm a = GA(g);
+    ETy ty = ETyGet(GM(g), t);
+    MovRR(a, R11, r);
+    Extend(a, R11, ty.Size, EIsSigned(GM(g), t));
+    Alu(a, ALU_CMP, R11, r);
+    Jcc(a, CC_NE, TrapLabel(g, TRAP_OVERFLOW));
+}
+
+u32 FuncNamed(*Gen g, str name) {
+    u64 named;
+    unsafe {
+        if (!MapGet(&g.M.Names, name, &named) || named >> 32 != NAME_FUNC) {
+            Buf b = BufNew(64);
+            BufStr(&b, "x64: the runtime has no function ");
+            BufStr(&b, name);
+            Bug(BufView(&b));
+        }
+    }
+    return (named & 0xFFFFFFFF) as u32;
+}
+
+// The constant value of a value defined by `const` (for wincall's import index).
+u64 ConstOf(*Gen g, u32 v) {
+    EVal val = EValGet(GM(g), v);
+    if (val.Inst == 0 || EInstGet(GM(g), val.Inst).Op != OP_CONST) Bug("x64: wincall needs a constant import index");
+    return EInstGet(GM(g), val.Inst).Imm;
+}
+
+// ------------------------------------------------------------------ branches
+
+// Moves branch target o's arguments into the target block's parameters (a parallel
+// copy through the stack) and jumps there.
+void GenJump(*Gen g, u32 o) {
+    *Asm a = GA(g);
+    *Module m = GM(g);
+    EOp op = EOpGet(m, o);
+    EBlock target = EBlockGet(m, op.Ref);
+    for (u32 i = 0; i < op.NArgs; i++) {
+        LoadV(g, RAX, EArg(m, op.Args + i));
+        Push(a, RAX);
+    }
+    u32 i = op.NArgs;
+    while (i > 0) {
+        i--;
+        Pop(a, RAX);
+        StoreV(g, target.FirstParam + i, RAX);
+    }
+    unsafe { Jmp(a, LabelOf(&g.BlockLabels, op.Ref)); }
+}
+
+// ------------------------------------------------------------------ instructions
+
+void GenInst(*Gen g, u32 i) {
+    *Asm a = GA(g);
+    *Module m = GM(g);
+    EInst inst = EInstGet(m, i);
+    OpInfo info = OpTable(inst.Op);
+    u16 op = inst.Op;
+    u8 sh = info.Shape;
+    u32 f = inst.FirstOp;
+    u32 n = inst.NOps;
+    u32 t = inst.Ty;
+    ETy ty = ETyGet(m, t);
+    bool signed = EIsSigned(m, t);
+    if (sh == SH_CONST) {
+        MovRI(a, RAX, inst.Imm);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_ADDR) {
+        EOp rf = EOpGet(m, f);
+        unsafe {
+            if (rf.Int == NAME_FUNC) LeaLabel(a, RAX, LabelOf(&g.FuncLabels, rf.Ref));
+            else LeaLabel(a, RAX, LabelOf(&g.GlobalLabels, rf.Ref));
+        }
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_SLOT) {
+        // the address was computed when the frame was laid out; see GenFunc
+        LeaRM(a, RAX, RBP, inst.Imm as i32);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_UNARY_V) {
+        // slot.end: storage is never reused in Stage 1
+    } else if (sh == SH_BIN) {
+        LoadOp(g, RAX, f);
+        LoadOp(g, RCX, f + 1);
+        if (op == 5 || op == 8) Alu(a, ALU_ADD, RAX, RCX);
+        else if (op == 6 || op == 9) Alu(a, ALU_SUB, RAX, RCX);
+        else if (op == 7) ImulRR(a, RAX, RCX);
+        else if (op == 10) {
+            if (ty.Size == 8 && !signed) Group3(a, 4, RCX);     // mul rcx: CF/OF if the high half is set
+            else ImulRR(a, RAX, RCX);
+        } else if (op == 12 || op == 13) {
+            TestRR(a, RCX, RCX);
+            Jcc(a, CC_E, TrapLabel(g, TRAP_DIVISION));
+            if (signed) {
+                if (ty.Size == 8) {
+                    // MIN / -1 overflows (and would fault)
+                    u32 ok = NewLabel(a);
+                    AluImm(a, 7, RCX, -1);
+                    Jcc(a, CC_NE, ok);
+                    MovRI(a, RDX, 0x8000000000000000);
+                    Alu(a, ALU_CMP, RAX, RDX);
+                    Jcc(a, CC_E, TrapLabel(g, TRAP_OVERFLOW));
+                    Bind(a, ok);
+                }
+                Cqo(a);
+                Group3(a, 7, RCX);
+            } else {
+                Alu(a, ALU_XOR, RDX, RDX);
+                Group3(a, 6, RCX);
+            }
+            if (op == 13) MovRR(a, RAX, RDX);
+        } else if (op == 14) Alu(a, ALU_AND, RAX, RCX);
+        else if (op == 15) Alu(a, ALU_OR, RAX, RCX);
+        else if (op == 16) Alu(a, ALU_XOR, RAX, RCX);
+        else if (op == OP_SHL || op == OP_SHR) {
+            if (signed) {
+                TestRR(a, RCX, RCX);
+                Jcc(a, CC_L, TrapLabel(g, TRAP_SHIFT));
+            }
+            AluImm(a, 7, RCX, (ty.Size * 8) as i32);
+            Jcc(a, CC_AE, TrapLabel(g, TRAP_SHIFT));
+            if (op == OP_SHL) ShiftCl(a, 4, RAX);
+            else if (signed) ShiftCl(a, 7, RAX);
+            else ShiftCl(a, 5, RAX);
+        } else {
+            Bug("x64: floating-point instructions are not supported by the Stage 1 backend");
+        }
+        // checks and re-normalization
+        if (op == 8 || op == 9 || op == 10) {
+            if (ty.Size == 8) {
+                if (signed || op == 10) Jcc(a, CC_O, TrapLabel(g, TRAP_OVERFLOW));
+                else Jcc(a, CC_B, TrapLabel(g, TRAP_OVERFLOW));
+            } else {
+                CheckNormal(g, RAX, t);
+            }
+        } else if (op == 12) {
+            if (ty.Size != 8) CheckNormal(g, RAX, t);
+        } else if (t != ET_BOOL) {
+            Extend(a, RAX, ty.Size, signed);
+        }
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_UN) {
+        LoadOp(g, RAX, f);
+        if (op == 11) {
+            if (signed) {
+                Group3(a, 3, RAX);
+                if (ty.Size == 8) Jcc(a, CC_O, TrapLabel(g, TRAP_OVERFLOW));
+                else CheckNormal(g, RAX, t);
+            } else {
+                TestRR(a, RAX, RAX);
+                Jcc(a, CC_NE, TrapLabel(g, TRAP_OVERFLOW));
+            }
+        } else if (op == 17) {
+            if (t == ET_BOOL) {
+                AluImm(a, 6, RAX, 1);       // xor rax, 1
+            } else {
+                Group3(a, 2, RAX);
+                Extend(a, RAX, ty.Size, signed);
+            }
+        } else {
+            Bug("x64: floating-point instructions are not supported by the Stage 1 backend");
+        }
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_CMP) {
+        LoadOp(g, RAX, f);
+        LoadOp(g, RCX, f + 1);
+        Alu(a, ALU_CMP, RAX, RCX);
+        u8 cc = CC_E;
+        if (op == 21) cc = CC_NE;
+        if (op == 22) cc = CC_B;
+        if (op == 23) cc = CC_BE;
+        if (op == 24) cc = CC_A;
+        if (op == 25) cc = CC_AE;
+        if (signed && op >= 22) cc = cc + 10;      // B->L, BE->LE, A->G, AE->GE
+        if (signed && op == 23) cc = CC_LE;
+        if (signed && op == 24) cc = CC_G;
+        if (signed && op == 25) cc = CC_GE;
+        if (signed && op == 22) cc = CC_L;
+        SetCC(a, cc, RAX);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_SELECT) {
+        u32 done = NewLabel(a);
+        LoadOp(g, RAX, f + 1);
+        LoadOp(g, RCX, f);
+        TestRR(a, RCX, RCX);
+        Jcc(a, CC_NE, done);
+        LoadOp(g, RAX, f + 2);
+        Bind(a, done);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_CONV) {
+        LoadOp(g, RAX, f);
+        ETy to = ETyGet(m, inst.Ty2);
+        bool toSigned = EIsSigned(m, inst.Ty2);
+        if (op == 32 || op == 41) {
+            Extend(a, RAX, to.Size, toSigned);
+        } else if (op == 33) {
+            Extend(a, RAX, ty.Size, false);
+            Extend(a, RAX, to.Size, toSigned);
+        } else if (op == 34) {
+            Extend(a, RAX, ty.Size, true);
+            Extend(a, RAX, to.Size, toSigned);
+        } else if (op != 39 && op != 40) {
+            Bug("x64: floating-point conversions are not supported by the Stage 1 backend");
+        }
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_LOAD) {
+        LoadOp(g, RCX, f);
+        Load(a, RAX, RCX, 0, ty.Size, signed);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_STORE) {
+        LoadOp(g, RAX, f);
+        LoadOp(g, RCX, f + 1);
+        Store(a, RCX, 0, RAX, ty.Size);
+    } else if (sh == SH_FIELD) {
+        LoadOp(g, RAX, f);
+        LeaRM(a, RAX, RAX, EFieldOffset(m, t, inst.Imm as u32) as i32);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_ELEM) {
+        LoadOp(g, RAX, f);
+        LoadOp(g, RCX, f + 1);
+        MovRI(a, RDX, ty.Size as u64);
+        ImulRR(a, RCX, RDX);
+        Alu(a, ALU_ADD, RAX, RCX);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_PTRADD) {
+        LoadOp(g, RAX, f);
+        LoadOp(g, RCX, f + 1);
+        Alu(a, ALU_ADD, RAX, RCX);
+        StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_VALUES) {
+        if (op == 47) {
+            LoadOp(g, RDI, f);
+            LoadOp(g, RSI, f + 1);
+            LoadOp(g, RCX, f + 2);
+            RepMovsb(a);
+        } else if (op == 48) {
+            LoadOp(g, RDI, f);
+            LoadOp(g, RCX, f + 1);
+            Alu(a, ALU_XOR, RAX, RAX);
+            RepStosb(a);
+        } else if (op == 50) {
+            LoadOp(g, RAX, f);
+            LoadOp(g, RCX, f + 1);
+            LoadOp(g, RDX, f + 2);
+            Alu(a, ALU_CMP, RAX, RCX);
+            Jcc(a, CC_A, TrapLabel(g, TRAP_BOUNDS));
+            Alu(a, ALU_CMP, RCX, RDX);
+            Jcc(a, CC_A, TrapLabel(g, TRAP_BOUNDS));
+        } else {
+            u32 ok = NewLabel(a);
+            LoadOp(g, RDX, f);
+            LoadOp(g, RCX, f + 1);
+            LoadOp(g, RAX, f + 2);
+            TestRR(a, RAX, RAX);
+            Jcc(a, CC_E, ok);
+            Alu(a, ALU_CMP, RAX, RCX);
+            Jcc(a, CC_E, ok);
+            Alu(a, ALU_ADD, RDX, RAX);
+            Load(a, RDX, RDX, 0, 1, false);
+            AluImm(a, 4, RDX, 0xC0);
+            AluImm(a, 7, RDX, 0x80);
+            Jcc(a, CC_E, TrapLabel(g, TRAP_UTF8));
+            Bind(a, ok);
+        }
+    } else if (sh == SH_BOUNDS) {
+        LoadOp(g, RAX, f);
+        LoadOp(g, RCX, f + 1);
+        if (signed) {
+            TestRR(a, RAX, RAX);
+            Jcc(a, CC_L, TrapLabel(g, TRAP_BOUNDS));
+        }
+        Alu(a, ALU_CMP, RAX, RCX);
+        Jcc(a, CC_AE, TrapLabel(g, TRAP_BOUNDS));
+    } else if (sh == SH_CALL || sh == SH_CALLIND) {
+        u32 first = 1;
+        u32 count = n - 1;
+        if (sh == SH_CALLIND) {
+            if (inst.Str.Len > 0) Bug("x64: calls with a foreign ABI are not supported by the Stage 1 backend");
+            first = 0;
+        }
+        i32 reserve = ((8 * count + 15) & ~15) as i32;
+        if (reserve > 0) AluImm(a, 5, RSP, reserve);
+        for (u32 k = 0; k < count; k++) {
+            LoadOp(g, RAX, f + first + k);
+            Store(a, RSP, (8 * k) as i32, RAX, 8);
+        }
+        if (sh == SH_CALL) {
+            unsafe { CallLabel(a, LabelOf(&g.FuncLabels, OpRef(g, f))); }
+        } else {
+            LoadOp(g, RAX, f + n - 1);
+            CallR(a, RAX);
+        }
+        if (reserve > 0) AluImm(a, 0, RSP, reserve);
+        if (inst.Result != 0) StoreV(g, inst.Result, RAX);
+    } else if (sh == SH_INTRINSIC) {
+        GenIntrinsic(g, inst);
+    } else if (sh == SH_BR) {
+        GenJump(g, f);
+    } else if (sh == SH_CONDBR) {
+        u32 other = NewLabel(a);
+        LoadOp(g, RAX, f);
+        TestRR(a, RAX, RAX);
+        Jcc(a, CC_E, other);
+        GenJump(g, f + 1);
+        Bind(a, other);
+        GenJump(g, f + 2);
+    } else if (sh == SH_SWITCH) {
+        u32 k = 1;
+        while (k + 1 < n) {
+            u32 next = NewLabel(a);
+            LoadOp(g, RAX, f);
+            MovRI(a, RCX, EOpGet(m, f + k).Int);
+            Alu(a, ALU_CMP, RAX, RCX);
+            Jcc(a, CC_NE, next);
+            GenJump(g, f + k + 1);
+            Bind(a, next);
+            k += 2;
+        }
+        GenJump(g, f + n - 1);
+    } else if (sh == SH_RET) {
+        if (n == 1) LoadOp(g, RAX, f);
+        MovRR(a, RSP, RBP);
+        Pop(a, RBP);
+        Ret(a);
+    } else if (sh == SH_PANIC) {
+        Jmp(a, TrapLabel(g, inst.Imm));
+    } else {
+        Jmp(a, TrapLabel(g, TRAP_UNREACHABLE));
+    }
+}
+
+// Target intrinsics ([architecture/stage1.md]): `syscall` on Linux, `wincall` on Windows.
+void GenIntrinsic(*Gen g, EInst inst) {
+    *Asm a = GA(g);
+    u32 f = inst.FirstOp;
+    u32 n = inst.NOps;
+    u32 target;
+    unsafe { target = g.Target; }
+    if (StrEq(inst.Str, "syscall")) {
+        if (target != TARGET_LINUX) Bug("x64: syscall on a non-Linux target");
+        u8[6] regs;
+        regs[0] = RDI;
+        regs[1] = RSI;
+        regs[2] = RDX;
+        regs[3] = R10;
+        regs[4] = R8;
+        regs[5] = R9;
+        for (u32 k = 1; k < n; k++) LoadOp(g, regs[k - 1], f + k);
+        LoadOp(g, RAX, f);
+        Syscall(a);
+    } else if (StrEq(inst.Str, "wincall") || StrEq(inst.Str, "wincallp")) {
+        if (target != TARGET_WINDOWS) Bug("x64: wincall on a non-Windows target");
+        bool viaPointer = StrEq(inst.Str, "wincallp");
+        u32 args = n - 1;
+        u32 stackArgs = 0;
+        if (args > 4) stackArgs = args - 4;
+        i32 reserve = ((32 + 8 * stackArgs + 15) & ~15) as i32;
+        AluImm(a, 5, RSP, reserve);
+        if (viaPointer) {
+            // the function pointer, in r10 (not an argument register)
+            LoadOp(g, R10, f);
+        } else {
+            // the import's IAT slot: iat + 8 * k, in r10 (not an argument register)
+            unsafe { LeaLabel(a, R10, g.Imports.Iat); }
+            LoadOp(g, R11, f);
+            MovRI(a, RAX, 8);
+            ImulRR(a, R11, RAX);
+            Alu(a, ALU_ADD, R10, R11);
+        }
+        for (u32 k = 4; k < args; k++) {
+            LoadOp(g, RAX, f + 1 + k);
+            Store(a, RSP, (32 + 8 * (k - 4)) as i32, RAX, 8);
+        }
+        u8[4] regs;
+        regs[0] = RCX;
+        regs[1] = RDX;
+        regs[2] = R8;
+        regs[3] = R9;
+        for (u32 k = 0; k < args && k < 4; k++) LoadOp(g, regs[k], f + 1 + k);
+        if (viaPointer) CallR(a, R10);
+        else CallMem(a, R10);
+        AluImm(a, 0, RSP, reserve);
+    } else {
+        Bug("x64: portable intrinsics reach the backend only through the runtime");
+    }
+    if (inst.Result != 0) StoreV(g, inst.Result, RAX);
+}
+
+// The largest frame: displacements from rbp are 32-bit.
+const u64 FRAME_MAX = 0x7FFF0000;
+
+void FrameTooLarge() {
+    *Buf e = Err();
+    BufStr(e, "envoc1: error: a function's locals take more than 2 GiB of stack\n");
+    Exit(EXIT_ERRORS);
+}
+
+// sub rsp, frame, touching every page on the way down (a stack probe): the OS grows the
+// stack one guard page at a time, so a frame larger than a page must not skip one.
+void ReserveFrame(*Asm a, u64 frame) {
+    if (frame >= 4096) {
+        MovRI(a, R11, frame / 4096);
+        u32 top = NewLabel(a);
+        Bind(a, top);
+        AluImm(a, 5, RSP, 4096);
+        Store(a, RSP, 0, R11, 8);
+        AluImm(a, 5, R11, 1);
+        Jcc(a, CC_NE, top);
+        frame = frame % 4096;
+    }
+    if (frame > 0) AluImm(a, 5, RSP, frame as i32);
+}
+
+// ------------------------------------------------------------------ functions
+
+void GenFunc(*Gen g, u32 fi) {
+    *Asm a = GA(g);
+    *Module m = GM(g);
+    EFunc f = EFuncGet(m, fi);
+    if (f.Extern) Bug("x64: extern functions are not supported by the Stage 1 backend");
+    unsafe {
+        g.Func = fi;
+        g.FirstValue = f.FirstValue;
+        g.NParams = f.NParams;
+        Bind(a, LabelOf(&g.FuncLabels, fi));
+    }
+    // frame: value slots, then the storage of `slot` instructions (zeroed on entry)
+    u64 valueArea = 8 * f.NValues as u64;
+    u64 slotArea = 0;
+    EBlock entry = EBlockGet(m, f.FirstBlock);
+    for (u32 i = entry.FirstInst; i < entry.FirstInst + entry.NInsts; i++) {
+        EInst inst = EInstGet(m, i);
+        if (inst.Op != OP_SLOT) break;
+        ETy st = ETyGet(m, inst.Ty);
+        u64 align = st.Align as u64;
+        if (align < 8) align = 8;
+        slotArea = (slotArea + st.Size as u64 + align - 1) & ~(align - 1);
+        unsafe {
+            *EInst p = EInstPtr(m, i);
+            p.Imm = 0 -% (valueArea + slotArea);      // rbp offset of the storage
+        }
+    }
+    u64 frame = (valueArea + slotArea + 15) & ~15;
+    if (frame > FRAME_MAX) FrameTooLarge();
+    Push(a, RBP);
+    MovRR(a, RBP, RSP);
+    ReserveFrame(a, frame);
+    if (slotArea > 0) {
+        LeaRM(a, RDI, RBP, (0 -% (valueArea + slotArea)) as i32);
+        MovRI(a, RCX, slotArea);
+        Alu(a, ALU_XOR, RAX, RAX);
+        RepStosb(a);
+    }
+    for (u32 b = f.FirstBlock; b < f.FirstBlock + f.NBlocks; b++) {
+        EBlock blk = EBlockGet(m, b);
+        unsafe { Bind(a, LabelOf(&g.BlockLabels, b)); }
+        for (u32 i = blk.FirstInst; i < blk.FirstInst + blk.NInsts; i++) GenInst(g, i);
+    }
+}
+
+// ------------------------------------------------------------------ data
+
+// The bytes of initializer i for type t, appended to the data.
+void GenInit(*Gen g, u32 i, u32 t) {
+    *Asm a = GA(g);
+    *Module m = GM(g);
+    EInit init = EInitGet(m, i);
+    ETy ty = ETyGet(m, t);
+    unsafe {
+        usize start = BufLen(&a.Data);
+        if (init.Kind == EI_BYTES) {
+            BufStr(&a.Data, init.Bytes);
+        } else if (init.Kind == EI_INT) {
+            for (u32 k = 0; k < ty.Size; k++) BufByte(&a.Data, (init.Int >> (8 * k) as u64 & 0xFF) as u8);
+        } else if (init.Kind == EI_ADDR) {
+            u64 named;
+            MapGet(&m.Names, init.Bytes, &named);
+            u32 idx = (named & 0xFFFFFFFF) as u32;
+            if (named >> 32 == NAME_FUNC) DataAddr(a, LabelOf(&g.FuncLabels, idx));
+            else DataAddr(a, LabelOf(&g.GlobalLabels, idx));
+        } else if (init.Kind == EI_LIST) {
+            u32 e = init.First;
+            u32 k = 0;
+            while (e != 0) {
+                u32 et = ty.Elem;
+                u64 at = k as u64 * ETyGet(m, ty.Elem).Size as u64;
+                if (ty.Kind == EK_STRUCT) {
+                    et = EField(m, ty.Fields + k);
+                    at = EFieldOffset(m, t, k);
+                }
+                while (BufLen(&a.Data) < start + at as usize) BufByte(&a.Data, 0);
+                GenInit(g, e, et);
+                e = EInitGet(m, e).Next;
+                k++;
+            }
+        }
+        while (BufLen(&a.Data) < start + ty.Size as usize) BufByte(&a.Data, 0);
+    }
+}
+
+// ------------------------------------------------------------------ module
+
+// Generates module m for target into a complete executable image.
+str GenModule(*Module m, u32 target) {
+    Asm a;
+    Gen g;
+    unsafe {
+        AsmInit(&a);
+        g.M = m;
+        g.A = &a;
+        g.Target = target;
+        g.FuncLabels = SideTable(4, VecLen(&m.Funcs));
+        g.GlobalLabels = SideTable(4, VecLen(&m.Globals));
+        g.BlockLabels = SideTable(4, VecLen(&m.Blocks));
+        g.Traps = SideTable(4, PANIC_COUNT as usize);
+        for (u32 i = 1; i < ECount(&m.Funcs); i++) MemStoreU32(VecAt(&g.FuncLabels, i as usize), NewLabel(&a));
+        for (u32 i = 1; i < ECount(&m.Blocks); i++) MemStoreU32(VecAt(&g.BlockLabels, i as usize), NewLabel(&a));
+        for (u32 i = 1; i < ECount(&m.Globals); i++) MemStoreU32(VecAt(&g.GlobalLabels, i as usize), NewLabel(&a));
+        if (target == TARGET_WINDOWS) g.Imports = EmitImports(&a);
+        // Linux programs are position-independent: they relocate themselves first (PLAN D68)
+        u32 data0 = 0;
+        u32 relocs = 0;
+        if (target == TARGET_LINUX) {
+            data0 = NewLabel(&a);
+            relocs = NewLabel(&a);
+            RelocStub(&a, data0, relocs);
+        }
+        // the entry point: __rt_init(initial stack pointer), __main(), __rt_exit(code)
+        MovRR(&a, RAX, RSP);
+        AluImm(&a, 4, RSP, -16);
+        AluImm(&a, 5, RSP, 16);
+        Store(&a, RSP, 0, RAX, 8);
+        CallLabel(&a, LabelOf(&g.FuncLabels, FuncNamed(&g, "__rt_init")));
+        CallLabel(&a, LabelOf(&g.FuncLabels, FuncNamed(&g, "__main")));
+        Store(&a, RSP, 0, RAX, 8);
+        CallLabel(&a, LabelOf(&g.FuncLabels, FuncNamed(&g, "__rt_exit")));
+        Ud2(&a);
+        for (u32 i = 1; i < ECount(&m.Funcs); i++) GenFunc(&g, i);
+        // the panic stubs: __rt_trap(reason)
+        u32 trap = LabelOf(&g.FuncLabels, FuncNamed(&g, "__rt_trap"));
+        for (u64 r = 0; r < PANIC_COUNT; r++) {
+            u32 l = MemLoadU32(VecAt(&g.Traps, r as usize));
+            if (l == 0) continue;
+            Bind(&a, l);
+            AluImm(&a, 5, RSP, 16);
+            MovRI(&a, RAX, r);
+            Store(&a, RSP, 0, RAX, 8);
+            CallLabel(&a, trap);
+            Ud2(&a);
+        }
+        for (u32 i = 1; i < ECount(&m.Globals); i++) {
+            EGlobal gl = EGlobalGet(m, i);
+            ETy gt = ETyGet(m, gl.Type);
+            usize align = gt.Align as usize;
+            if (align < 8) align = 8;
+            DataAlign(&a, align);
+            BindData(&a, LabelOf(&g.GlobalLabels, i));
+            GenInit(&g, gl.Init, gl.Type);
+        }
+        return WriteImage(&a, target, g.Imports, data0, relocs);
+    }
+}

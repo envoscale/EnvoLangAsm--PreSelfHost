@@ -1,0 +1,331 @@
+// Lowering function types and lambdas (RFC 0003, docs/architecture/stage1.md, "Closures").
+// A function value is $fnv = { code: ptr, env: ptr } ([fn.abi.2]). Code takes the
+// hidden result pointer (for an aggregate result), then env, then the parameters. A lambda
+// becomes a function of its own; its environment is a struct of its captures: pointers to
+// them when it borrows ([fn.pos.1]), or copies on the heap otherwise (null without
+// captures). A named function used as a value goes through a thunk that skips env.
+
+// A pointer to function f.
+u32 FuncAddr(*Lower l, u32 f) {
+    *Module m = LM(l);
+    EOp g;
+    g.Kind = OK_GLOBAL;
+    g.Str = EFuncGet(m, f).Name;
+    g.Ref = f;
+    g.Int = NAME_FUNC;
+    return LEmit(l, 2, 0, 0, 0, ET_PTR, 1, g, NoOp(), NoOp());
+}
+
+u32 NullPtr(*Lower l) {
+    return LConv(l, 40, ET_U64, ET_PTR, LConst(l, ET_U64, 0));
+}
+
+// A function value { code, env } in a fresh slot.
+u32 FnValue(*Lower l, u32 code, u32 envp) {
+    u32 ft;
+    unsafe { ft = l.FnvType; }
+    u32 fv = LSlot(l, ft);
+    LStore(l, ET_PTR, code, LField(l, ft, fv, 0));
+    LStore(l, ET_PTR, envp, LField(l, ft, fv, 1));
+    return fv;
+}
+
+// A defined EIR struct named name with the field types in fields.
+u32 EStructOf(*Lower l, str name, *Vec fields) {
+    *Module m = LM(l);
+    u32 t = EStructType(m, name);
+    unsafe {
+        u32 first = ECount(&m.Fields);
+        for (usize i = 0; i < VecLen(fields); i++) MemStoreU32(VecPush(&m.Fields), MemLoadU32(VecAt(fields, i)));
+        *ETy et = ETyPtr(m, t);
+        et.Fields = first;
+        et.NFields = VecLen(fields) as u32;
+        et.Defined = true;
+    }
+    return t;
+}
+
+// The EIR parameter count and result type of code for function type ft.
+u32 FnCodeParams(*Lower l, Type fty) {
+    u32 n = fty.NArgs + 1;
+    if (IsAggregate(l, fty.Elem)) n++;
+    return n;
+}
+
+u32 FnCodeRet(*Lower l, Type fty) {
+    if (IsAggregate(l, fty.Elem)) return ET_VOID;
+    return LType(l, fty.Elem);
+}
+
+// A lambda expression: its function (lowered later, by DrainLambdas) and its value.
+u32 LowerLambda(*Lower l, u32 n) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    Node lam = CNode(c, n);
+    u64 cv = NValue(c, n);
+    u32 first = (cv & 0xFFFFFFFF) as u32;
+    u32 count = (cv >> 32) as u32;
+    bool borrow = NSym(c, n) == 1 && lam.Flags & NF_MOVE == 0;
+    Type fty = TypeGet(c, LNType(l, n));
+    Buf name = BufNew(32);
+    unsafe {
+        BufStr(&name, EFuncGet(m, l.Func).Name);
+        BufStr(&name, ".lambda");
+        BufU64(&name, l.LamCount as u64);
+        l.LamCount++;
+    }
+    str fname;
+    unsafe { fname = BufCopy(&name); }
+    u32 f = AddFunc(l, fname, FnCodeParams(l, fty), FnCodeRet(l, fty));
+    u32 envT = 0;
+    if (count > 0) {
+        Vec fields = VecNew(4, 8);
+        for (u32 i = 0; i < count; i++) {
+            u32 ft = ET_PTR;
+            if (!borrow) ft = LType(l, LSubst(l, SymGet(c, CaptureAt(c, first + i)).Type));
+            unsafe { MemStoreU32(VecPush(&fields), ft); }
+        }
+        unsafe {
+            BufStr(&name, ".env");
+            envT = EStructOf(l, BufCopy(&name), &fields);
+        }
+    }
+    unsafe {
+        MemStoreU32(VecPush(&l.PendingLams), n);
+        MemStoreU32(VecPush(&l.PendingLams), f);
+        MemStoreU32(VecPush(&l.PendingLams), envT);
+        MemStoreU32(VecPush(&l.PendingLams), l.Env);
+        MemStoreU32(VecPush(&l.PendingLams), l.NEnv);
+    }
+    u32 envp = 0;
+    if (count == 0) {
+        envp = NullPtr(l);
+    } else if (borrow) {
+        // the captures' addresses, in a slot: the lambda does not outlive this call
+        envp = LSlot(l, envT);
+        for (u32 i = 0; i < count; i++) LStore(l, ET_PTR, SymSlot(l, CaptureAt(c, first + i)), LField(l, envT, envp, i));
+    } else {
+        // copies, on the heap
+        Vec args = VecNew(4, 1);
+        unsafe {
+            MemStoreU32(VecPush(&args), LConst(l, ET_U64, ESizeOf(l, envT) as u64));
+            envp = EmitCall(l, RuntimeFunc(l, "alloc"), &args, 0);
+        }
+        for (u32 i = 0; i < count; i++) {
+            u32 s = CaptureAt(c, first + i);
+            u32 ct = LSubst(l, SymGet(c, s).Type);
+            StoreTo(l, ct, LoadPlace(l, ct, SymSlot(l, s)), LField(l, envT, envp, i));
+        }
+    }
+    return FnValue(l, FuncAddr(l, f), envp);
+}
+
+// Lowers the functions of the lambdas met so far (and of lambdas inside them).
+void DrainLambdas(*Lower l) {
+    usize i = 0;
+    while (true) {
+        u32 n;
+        u32 f;
+        u32 envT;
+        u32 env;
+        u32 ne;
+        unsafe {
+            if (i >= VecLen(&l.PendingLams)) break;
+            n = MemLoadU32(VecAt(&l.PendingLams, i));
+            f = MemLoadU32(VecAt(&l.PendingLams, i + 1));
+            envT = MemLoadU32(VecAt(&l.PendingLams, i + 2));
+            env = MemLoadU32(VecAt(&l.PendingLams, i + 3));
+            ne = MemLoadU32(VecAt(&l.PendingLams, i + 4));
+        }
+        LowerLambdaFunc(l, n, f, envT, env, ne);
+        i += 5;
+    }
+    unsafe { VecClear(&l.PendingLams); }
+}
+
+void LowerLambdaFunc(*Lower l, u32 n, u32 f, u32 envT, u32 env, u32 ne) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    Node lam = CNode(c, n);
+    unsafe {
+        l.Env = env;
+        l.NEnv = ne;
+    }
+    EFunc ef = EFuncGet(m, f);
+    BeginFunc(l, f, ef.NParams);
+    Vec stores = VecNew(4, 16);
+    u32 first = ef.FirstValue;
+    unsafe { first = EFuncGet(m, f).FirstValue; }
+    Type fty = TypeGet(c, LNType(l, n));
+    u32 k = 0;
+    ResetDropFlags(l);
+    unsafe {
+        l.Top = false;
+        l.RetType = fty.Elem;
+        l.RetSlot = 0;
+        if (IsAggregate(l, fty.Elem)) {
+            (VecAt(&m.Vals, first as usize) as *EVal).Type = ET_PTR;
+            l.RetSlot = first;
+            k = 1;
+        }
+        (VecAt(&m.Vals, (first + k) as usize) as *EVal).Type = ET_PTR;
+    }
+    // the captures live in the environment
+    u32 envv = first + k;
+    k++;
+    u64 cv = NValue(c, n);
+    u32 cf = (cv & 0xFFFFFFFF) as u32;
+    u32 count = (cv >> 32) as u32;
+    bool borrow = NSym(c, n) == 1 && lam.Flags & NF_MOVE == 0;
+    for (u32 i = 0; i < count; i++) {
+        u32 addr = LField(l, envT, envv, i);
+        if (borrow) addr = LLoad(l, ET_PTR, addr);
+        SetSymSlot(l, CaptureAt(c, cf + i), addr);
+    }
+    u32 p = lam.A;
+    for (u32 i = 0; i < fty.NArgs; i++) {
+        bool byref = EnvGet(c, fty.Sym, i) != 0;
+        unsafe { LowerParam(l, ParamSym(l, p), EnvGet(c, fty.Args, i), byref, first + k, &stores); }
+        if (!byref) TrackDrop(l, ParamSym(l, p), EnvGet(c, fty.Args, i), true, NTok(c, p));
+        k++;
+        p = CNode(c, p).Next;
+    }
+    if (NKind(c, lam.B) == NK_BLOCK) {
+        LowerStmt(l, lam.B);
+    } else if (fty.Elem == T_VOID) {
+        LowerExpr(l, lam.B);
+        DropTemps(l);
+    } else {
+        LowerReturnValue(l, lam.B);
+    }
+    DropDownTo(l, 0, false);
+    EndFunc(l, stores);
+    unsafe {
+        l.Env = 0;
+        l.NEnv = 0;
+    }
+}
+
+// A named function as a value: { its thunk, null }.
+u32 FnItemValue(*Lower l, u32 s) {
+    *Checker c = LC(l);
+    Buf key = BufNew(16);
+    u64 found;
+    u32 t = 0;
+    unsafe {
+        BufU64(&key, s as u64);
+        if (MapGet(&l.Thunks, BufView(&key), &found)) {
+            t = found as u32;
+        } else {
+            Sym sym = SymGet(c, s);
+            Buf name = BufNew(16);
+            BufStr(&name, sym.Name);
+            BufStr(&name, ".fv");
+            u32 n = sym.Aux + 1;
+            u32 ret = LType(l, sym.Type);
+            if (IsAggregate(l, sym.Type)) {
+                n++;
+                ret = ET_VOID;
+            }
+            t = AddFunc(l, BufCopy(&name), n, ret);
+            MapPut(&l.Thunks, BufCopy(&key), t as u64);
+            MemStoreU32(VecPush(&l.PendingThunks), s);
+            MemStoreU32(VecPush(&l.PendingThunks), t);
+        }
+    }
+    return FnValue(l, FuncAddr(l, t), NullPtr(l));
+}
+
+// The thunks' bodies: call the function with every argument but env. Lowered last, when
+// every function's parameter types are known.
+void DrainThunks(*Lower l) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    usize count;
+    unsafe { count = VecLen(&l.PendingThunks); }
+    for (usize i = 0; i < count; i += 2) {
+        u32 s;
+        u32 t;
+        u32 callee;
+        unsafe {
+            s = MemLoadU32(VecAt(&l.PendingThunks, i));
+            t = MemLoadU32(VecAt(&l.PendingThunks, i + 1));
+            callee = MemLoadU32(VecAt(&l.FuncIds, s as usize));
+        }
+        EFunc ce = EFuncGet(m, callee);
+        BeginFunc(l, t, ce.NParams + 1);
+        u32 tf = EFuncGet(m, t).FirstValue;
+        // env sits after the hidden result pointer, if there is one
+        u32 envAt = 0;
+        if (IsAggregate(l, SymGet(c, s).Type)) envAt = 1;
+        Vec args = VecNew(4, 8);
+        u32 j = 0;
+        for (u32 k = 0; k < ce.NParams + 1; k++) {
+            unsafe {
+                *EVal pv = VecAt(&m.Vals, (tf + k) as usize) as *EVal;
+                if (k == envAt) {
+                    pv.Type = ET_PTR;
+                    continue;
+                }
+                pv.Type = VType(m, ce.FirstValue + j);
+                MemStoreU32(VecPush(&args), tf + k);
+            }
+            j++;
+        }
+        unsafe {
+            l.Top = false;
+            u32 r = EmitCall(l, callee, &args, 0);
+            if (ce.Ret == ET_VOID) LEmit(l, 58, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+            else LEmit(l, 58, 0, 0, 0, 0, 1, OpV(r), NoOp(), NoOp());
+        }
+        EndFunc(l, VecNew(4, 1));
+    }
+}
+
+// A call through a function value: code(ret?, env, args…) with `call.ind`.
+u32 LowerIndirectCall(*Lower l, u32 n, Node node, u32 t) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    u32 ft;
+    unsafe { ft = l.FnvType; }
+    u32 fv = LowerExpr(l, node.A);
+    Type fty = TypeGet(c, LNType(l, node.A));
+    u32 code = LLoad(l, ET_PTR, LField(l, ft, fv, 0));
+    u32 envp = LLoad(l, ET_PTR, LField(l, ft, fv, 1));
+    Vec args = VecNew(4, 8);
+    u32 retTmp = 0;
+    u32 rt = LType(l, t);
+    unsafe {
+        if (IsAggregate(l, t)) {
+            retTmp = LSlot(l, rt);
+            MemStoreU32(VecPush(&args), retTmp);
+            rt = ET_VOID;
+        }
+        MemStoreU32(VecPush(&args), envp);
+    }
+    u32 a = node.B;
+    for (u32 i = 0; i < fty.NArgs; i++) {
+        u32 v = LowerArg(l, a, EnvGet(c, fty.Args, i), EnvGet(c, fty.Sym, i) != 0);
+        unsafe { MemStoreU32(VecPush(&args), v); }
+        a = CNode(c, a).Next;
+    }
+    u32 result = 0;
+    unsafe {
+        EInst inst;
+        inst.Op = 53;
+        inst.Ty = rt;
+        inst.Block = l.Block;
+        inst.FirstOp = ECount(&m.Ops);
+        for (usize k = 0; k < VecLen(&args); k++) *(VecPush(&m.Ops) as *EOp) = OpV(MemLoadU32(VecAt(&args, k)));
+        *(VecPush(&m.Ops) as *EOp) = OpV(code);
+        inst.NOps = ECount(&m.Ops) - inst.FirstOp;
+        u32 id = ECount(&m.Insts);
+        if (rt != ET_VOID) {
+            inst.Result = NewValue(m, rt, l.Block, id);
+            result = inst.Result;
+        }
+        *(VecPush(&m.Insts) as *EInst) = inst;
+    }
+    if (retTmp != 0) return retTmp;
+    return result;
+}

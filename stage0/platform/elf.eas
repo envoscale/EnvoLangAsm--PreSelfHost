@@ -1,0 +1,51 @@
+; =============================================================================
+; platform/elf.eas - envoc0's own ELF64 header (Linux build of envoc0)
+;
+; One PT_LOAD segment mapping the whole file read+write+execute at 0x400000, so
+; every label's file offset equals label - $$; plus PT_GNU_STACK. The entry
+; point is the Linux runtime block. Output programs get their headers from
+; src/writer.eas instead.
+; =============================================================================
+
+IMAGE_BASE      equ 0x400000
+
+        org     IMAGE_BASE
+
+; ---------------------------------------------------------------- ELF header
+elf_header:
+        db      0x7F, 'ELF'             ; e_ident magic
+        db      2                       ; EI_CLASS: ELFCLASS64
+        db      1                       ; EI_DATA: little-endian
+        db      1                       ; EI_VERSION: current
+        db      0                       ; EI_OSABI: System V
+        times 8 db 0                    ; EI_ABIVERSION + padding
+        dw      2                       ; e_type: ET_EXEC
+        dw      0x3E                    ; e_machine: EM_X86_64
+        dd      1                       ; e_version
+        dq      IMAGE_BASE + (rtl_begin - $$) ; e_entry: the runtime block
+        dq      elf_phdrs - $$          ; e_phoff
+        dq      0                       ; e_shoff: no section headers
+        dd      0                       ; e_flags
+        dw      64                      ; e_ehsize
+        dw      56                      ; e_phentsize
+        dw      2                       ; e_phnum
+        dw      0                       ; e_shentsize
+        dw      0                       ; e_shnum
+        dw      0                       ; e_shstrndx
+
+elf_phdrs:
+        ; PT_LOAD: map the whole file at IMAGE_BASE.
+        dd      1                       ; p_type: PT_LOAD
+        dd      7                       ; p_flags: R | W | X
+        dq      0                       ; p_offset
+        dq      IMAGE_BASE              ; p_vaddr
+        dq      IMAGE_BASE              ; p_paddr
+        dq      image_end - $$          ; p_filesz
+        dq      image_end - $$          ; p_memsz
+        dq      0x1000                  ; p_align
+        ; PT_GNU_STACK: ask for a non-executable stack.
+        dd      0x6474E551              ; p_type: PT_GNU_STACK
+        dd      6                       ; p_flags: R | W
+        dq      0, 0, 0, 0, 0
+        dq      16                      ; p_align
+

@@ -1,0 +1,9 @@
+/build/
+/envoscale/
+/nasm/.cache/
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

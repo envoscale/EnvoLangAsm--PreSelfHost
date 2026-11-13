@@ -1,0 +1,484 @@
+; =============================================================================
+; src/main.eas - envoc0 command dispatch
+;
+;   envoc0 lex <file.envo>     print the token stream
+;   envoc0 parse <file.envo>   print the syntax tree
+;   envoc0 check <file.envo>...   check names and types; print the typed tree
+;   envoc0 build <file.envo>... -o <output> [--target T]   compile to an executable
+;   (several files are one program; the first is the entry file)
+;   envoc0 version            print the version (also --version)
+;   envoc0 help                print usage (also --help)
+;
+; Exit codes: 0 success, 1 compile error, 2 usage error, 70 internal error.
+; Every command ends in exit_process, so main never returns.
+; =============================================================================
+
+; main - entry from the platform layer, with rsp aligned before the call.
+main:
+        sub     rsp, 8
+        call    io_init
+        call    sys_args
+        mov     [g_argc], rax
+        mov     [g_argv], rdx
+        cmp     rax, 2
+        jb      near .usage_error
+
+        lea     rsi, [s_cmd_lex]
+        mov     edx, s_cmd_lex_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .lex
+        lea     rsi, [s_cmd_parse]
+        mov     edx, s_cmd_parse_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .parse
+        lea     rsi, [s_cmd_check]
+        mov     edx, s_cmd_check_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .check
+        lea     rsi, [s_cmd_build]
+        mov     edx, s_cmd_build_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .build
+        lea     rsi, [s_cmd_version]
+        mov     edx, s_cmd_version_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .version
+        lea     rsi, [s_cmd_dash_version]
+        mov     edx, s_cmd_dash_version_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .version
+        lea     rsi, [s_cmd_help]
+        mov     edx, s_cmd_help_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .help
+        lea     rsi, [s_cmd_dash_help]
+        mov     edx, s_cmd_dash_help_len
+        call    arg1_is
+        test    eax, eax
+        jnz     near .help
+
+        ; unknown command
+        lea     rdi, [w_err]
+        lea     rsi, [s_unknown_command]
+        mov     edx, s_unknown_command_len
+        call    w_bytes
+        mov     rdx, [g_argv]
+        lea     rdi, [w_err]
+        mov     rsi, [rdx + 8]
+        call    w_cstr
+        lea     rdi, [w_err]
+        mov     esi, 0x27
+        call    w_byte
+        lea     rdi, [w_err]
+        mov     esi, 10
+        call    w_byte
+        jmp     near .usage_error
+
+.lex:
+        cmp     qword [g_argc], 3
+        jne     near .usage_error
+        mov     rdx, [g_argv]
+        mov     rdi, [rdx + 16]
+        call    cmd_lex                 ; does not return
+
+.parse:
+        cmp     qword [g_argc], 3
+        jne     near .usage_error
+        mov     rdx, [g_argv]
+        mov     rdi, [rdx + 16]
+        call    cmd_parse               ; does not return
+
+.check:
+        mov     rsi, [g_argc]
+        cmp     rsi, 3
+        jb      near .usage_error
+        sub     rsi, 2                  ; every argument after "check" is a file
+        mov     rdi, [g_argv]
+        add     rdi, 16
+        call    cmd_check               ; does not return
+
+.build:
+        mov     rdi, [g_argv]
+        mov     rsi, [g_argc]
+        call    cmd_build               ; does not return
+
+.version:
+        lea     rdi, [w_out]
+        lea     rsi, [s_version]
+        mov     edx, s_version_len
+        call    w_bytes
+        lea     rdi, [w_out]
+        lea     rsi, [plat_name]
+        mov     edx, plat_name_len
+        call    w_bytes
+        lea     rdi, [w_out]
+        mov     esi, ')'
+        call    w_byte
+        lea     rdi, [w_out]
+        mov     esi, 10
+        call    w_byte
+        xor     edi, edi
+        call    exit_process
+
+.help:
+        lea     rdi, [w_out]
+        lea     rsi, [s_usage]
+        mov     edx, s_usage_len
+        call    w_bytes
+        xor     edi, edi
+        call    exit_process
+
+.usage_error:
+        lea     rdi, [w_err]
+        lea     rsi, [s_usage]
+        mov     edx, s_usage_len
+        call    w_bytes
+        mov     edi, 2
+        call    exit_process
+
+; arg1_is - is argv[1] equal to the given string?
+;   in:  rsi = string, rdx = length
+;   out: eax = 1 or 0.  clobbers: rcx, rdi
+arg1_is:
+        mov     rdi, [g_argv]
+        mov     rdi, [rdi + 8]
+        jmp     near cstr_eq
+
+; cmd_lex - print the tokens of one file.
+;   in:  rdi = NUL-terminated path. Does not return.
+cmd_lex:
+        sub     rsp, 8
+        call    load_tokens
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    lex_dump
+        xor     edi, edi
+        call    exit_process
+
+; cmd_parse - print the syntax tree of one file.
+;   in:  rdi = NUL-terminated path. Does not return.
+cmd_parse:
+        sub     rsp, 8
+        call    load_tokens
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    parse
+        mov     edi, eax
+        xor     esi, esi
+        call    ast_dump
+        xor     edi, edi
+        call    exit_process
+
+; cmd_check - check a program and print its typed syntax tree.
+;   in:  rdi = array of NUL-terminated paths (the entry file first), rsi = count.
+;   Does not return.
+cmd_check:
+        push    rbx
+        call    load_program
+        mov     ebx, eax
+        mov     edi, eax
+        call    check_program
+        mov     byte [c_dump], 1
+        mov     edi, ebx
+        xor     esi, esi
+        call    ast_dump
+        xor     edi, edi
+        call    exit_process
+
+; load_program - load and parse the files of one program ([item.mod.3]).
+;   in:  rdi = array of NUL-terminated paths (the entry file first), rsi = count
+;   out: eax = program node
+load_program:
+        push    rbx
+        mov     rbx, rsi
+        call    load_files
+        mov     rdi, rax
+        mov     rsi, rdx
+        mov     rdx, rcx
+        mov     ecx, ebx
+        pop     rbx
+        jmp     near parse_files
+
+; load_tokens - load_files for one file.
+;   in:  rdi = NUL-terminated path.  out: rax = token array, rdx = token count
+load_tokens:
+        push    rdi
+        mov     rdi, rsp
+        mov     esi, 1
+        call    load_files
+        pop     rcx
+        ret
+
+; load_files - read, validate and tokenize the files of a program. The files
+; share one source buffer (each followed by a newline, so that a file's end
+; offset is not also the next file's start) and one token array (each file
+; keeps its own EOF token), so source offsets and token indices are global.
+; Sets diag_path/src/len and the file table that maps offsets back to files.
+; Reports read failures and lexical errors itself (and exits).
+;   in:  rdi = array of NUL-terminated paths, rsi = count (>= 1)
+;   out: rax = token array, rdx = total tokens,
+;        rcx = u32 index of each file's first token
+; rbx = paths, r12 = count, r13 = file table, rbp = per-file tokens/count,
+; r14 = file, r15 = running total; [rsp], [rsp+8], [rsp+16] = scratch
+load_files:
+        push    rbx
+        push    rbp
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 24
+        mov     rbx, rdi
+        mov     r12, rsi
+        mov     rax, [rdi]
+        mov     [diag_path], rax
+        lea     rdi, [rsi + rsi*2]
+        shl     rdi, 3                  ; 24 bytes per file: base, length, path
+        call    arena_alloc
+        mov     r13, rax
+        mov     rdi, r12
+        shl     rdi, 4                  ; 16 bytes per file: tokens, count
+        call    arena_alloc
+        mov     rbp, rax
+
+        ; Read every file. Until the copy the table holds the data pointer.
+        xor     r14d, r14d
+        xor     r15d, r15d
+.read:
+        cmp     r14, r12
+        jae     short .combine
+        mov     rdi, [rbx + r14*8]
+        call    read_file
+        test    rax, rax
+        jz      near .read_failed
+        ; [lex.src.2] ignore a UTF-8 byte order mark
+        cmp     rdx, 3
+        jb      short .no_bom
+        cmp     word [rax], 0xBBEF
+        jne     short .no_bom
+        cmp     byte [rax + 2], 0xBF
+        jne     short .no_bom
+        add     rax, 3
+        sub     rdx, 3
+.no_bom:
+        lea     rcx, [r14 + r14*2]
+        lea     rcx, [r13 + rcx*8]
+        mov     [rcx], rax
+        mov     [rcx + 8], rdx
+        mov     rsi, [rbx + r14*8]
+        mov     [rcx + 16], rsi
+        lea     r15, [r15 + rdx + 1]
+        inc     r14
+        jmp     short .read
+
+.combine:
+        mov     rdi, r15
+        call    arena_alloc
+        mov     [diag_src], rax
+        mov     [diag_len], r15
+        mov     [d_files], r13
+        mov     [d_nfiles], r12
+        xor     r14d, r14d
+        xor     r15d, r15d              ; the next file's base
+.copy:
+        cmp     r14, r12
+        jae     short .lex
+        lea     rax, [r14 + r14*2]
+        lea     rdx, [r13 + rax*8]
+        mov     rsi, [rdx]
+        mov     rcx, [rdx + 8]
+        mov     [rdx], r15
+        mov     rdi, [diag_src]
+        add     rdi, r15
+        lea     r15, [r15 + rcx + 1]
+        rep movsb
+        mov     byte [rdi], 10
+        inc     r14
+        jmp     short .copy
+
+        ; Validate and lex each file on its own; diag_base makes the lexer's
+        ; file-relative offsets global for diagnostics.
+.lex:
+        xor     r14d, r14d
+        xor     r15d, r15d              ; total tokens
+.lex_file:
+        cmp     r14, r12
+        jae     short .merge
+        lea     rax, [r14 + r14*2]
+        lea     rax, [r13 + rax*8]
+        mov     rsi, [rax]
+        mov     [diag_base], rsi
+        mov     rdi, [diag_src]
+        add     rdi, rsi
+        mov     rsi, [rax + 8]
+        mov     [rsp], rdi
+        mov     [rsp + 8], rsi
+        call    utf8_validate           ; [lex.src.1]
+        cmp     rax, -1
+        je      short .valid
+        mov     edi, E_INVALID_UTF8
+        mov     rsi, rax
+        call    diag_error
+.valid:
+        mov     rdi, [rsp]
+        mov     rsi, [rsp + 8]
+        call    lex
+        mov     rcx, r14
+        shl     rcx, 4
+        mov     [rbp + rcx], rax
+        mov     [rbp + rcx + 8], rdx
+        add     r15, rdx
+        inc     r14
+        jmp     short .lex_file
+
+        ; Merge the token arrays, making token offsets global.
+.merge:
+        mov     qword [diag_base], 0
+        mov     rdi, r12
+        shl     rdi, 2
+        call    arena_alloc
+        mov     [rsp + 16], rax
+        mov     rdi, r15
+        shl     rdi, 4                  ; * TOK_SIZE
+        call    arena_alloc
+        mov     [rsp], rax
+        mov     rdi, rax
+        xor     r14d, r14d
+        xor     r15d, r15d
+.merge_file:
+        cmp     r14, r12
+        jae     short .done
+        mov     rax, [rsp + 16]
+        mov     [rax + r14*4], r15d
+        lea     rax, [r14 + r14*2]
+        mov     r8, [r13 + rax*8]       ; the file's base
+        mov     rcx, r14
+        shl     rcx, 4
+        mov     rsi, [rbp + rcx]
+        mov     rcx, [rbp + rcx + 8]
+        add     r15, rcx
+.token:
+        test    rcx, rcx
+        jz      short .next_file
+        mov     rax, [rsi]
+        mov     [rdi], rax
+        mov     rax, [rsi + 8]
+        mov     [rdi + 8], rax
+        add     [rdi + TOK_START], r8d
+        add     rsi, TOK_SIZE
+        add     rdi, TOK_SIZE
+        dec     rcx
+        jmp     short .token
+.next_file:
+        inc     r14
+        jmp     short .merge_file
+.done:
+        mov     rax, [rsp]
+        mov     rdx, r15
+        mov     rcx, [rsp + 16]
+        add     rsp, 24
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbp
+        pop     rbx
+        ret
+
+.read_failed:
+        mov     rbx, [rbx + r14*8]      ; the path
+        mov     r12, rdx                ; reason: 1 open, 2 read, 3 too large
+        lea     rdi, [w_err]
+        lea     rsi, [s_err_prefix]
+        mov     edx, s_err_prefix_len
+        call    w_bytes
+        lea     rsi, [s_cannot_open]
+        mov     edx, s_cannot_open_len
+        cmp     r12, 1
+        je      short .reason
+        lea     rsi, [s_cannot_read]
+        mov     edx, s_cannot_read_len
+        cmp     r12, 2
+        je      short .reason
+        lea     rsi, [s_too_large]
+        mov     edx, s_too_large_len
+.reason:
+        lea     rdi, [w_err]
+        call    w_bytes
+        lea     rdi, [w_err]
+        mov     rsi, rbx
+        call    w_cstr
+        lea     rdi, [w_err]
+        mov     esi, 0x27
+        call    w_byte
+        cmp     r12, 3
+        jne     short .newline
+        lea     rdi, [w_err]
+        lea     rsi, [s_size_limit]
+        mov     edx, s_size_limit_len
+        call    w_bytes
+.newline:
+        lea     rdi, [w_err]
+        mov     esi, 10
+        call    w_byte
+        mov     edi, 1
+        call    exit_process
+
+s_cmd_lex:              db 'lex'
+s_cmd_lex_len           equ $ - s_cmd_lex
+s_cmd_parse:            db 'parse'
+s_cmd_parse_len         equ $ - s_cmd_parse
+s_cmd_build:            db 'build'
+s_cmd_build_len         equ $ - s_cmd_build
+s_cmd_check:            db 'check'
+s_cmd_check_len         equ $ - s_cmd_check
+s_cmd_version:          db 'version'
+s_cmd_version_len       equ $ - s_cmd_version
+s_cmd_dash_version:     db '--version'
+s_cmd_dash_version_len  equ $ - s_cmd_dash_version
+s_cmd_help:             db 'help'
+s_cmd_help_len          equ $ - s_cmd_help
+s_cmd_dash_help:        db '--help'
+s_cmd_dash_help_len     equ $ - s_cmd_dash_help
+
+s_version:              db 'envoc0 0.1.0-dev (EnvoScale stage 0, Envo-Core; '
+s_version_len           equ $ - s_version
+
+s_usage:
+        db      'usage: envoc0 <command> [arguments]', 10
+        db      10
+        db      'commands:', 10
+        db      '  lex <file.envo>     print the token stream of an Envo-Core source file', 10
+        db      '  parse <file.envo>   print the syntax tree of an Envo-Core source file', 10
+        db      '  check <file.envo>...', 10
+        db      '                      check names and types; print the typed syntax tree', 10
+        db      '  build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]', 10
+        db      '                      compile to an executable (default: this OS)', 10
+        db      '                      (several files are one program; the first is the entry file)', 10
+        db      '  version             print the version', 10
+        db      '  help                print this message', 10
+s_usage_len             equ $ - s_usage
+
+s_unknown_command:      db "envoc0: error: unknown command '"
+s_unknown_command_len   equ $ - s_unknown_command
+s_err_prefix:           db 'envoc0: error: '
+s_err_prefix_len        equ $ - s_err_prefix
+s_cannot_open:          db "cannot open '"
+s_cannot_open_len       equ $ - s_cannot_open
+s_cannot_read:          db "cannot read '"
+s_cannot_read_len       equ $ - s_cannot_read
+s_too_large:            db "file too large: '"
+s_too_large_len         equ $ - s_too_large
+s_size_limit:           db ' (Stage 0 accepts source files up to 16 MiB)'
+s_size_limit_len        equ $ - s_size_limit
+
+        align   8, db 0
+g_argc:         dq 0
+g_argv:         dq 0

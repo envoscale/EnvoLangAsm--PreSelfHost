@@ -1,0 +1,1036 @@
+; =============================================================================
+; seed/src/insn.eas - the instructions of the Stage 0 subset (eas.md section 5)
+; =============================================================================
+
+; Operand shorthand: rbx = operand 0, r12 = operand 1, r13 = operand 2 inside
+; the handlers, which are entered from instruction with those set, r14 = the
+; handler's argument, and g_nops the count. Each ends by jumping to finish.
+
+; instruction - assembles an instruction statement.
+;   in: rdi = mnemonic, rsi = length, rdx = the token after it
+instruction:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     r12, rdi
+        mov     r13, rsi
+        mov     r15, rdx
+        mov     qword [g_ilen], 0
+        mov     qword [g_rip_at], -1
+        ; rep movsb / rep stosb
+        lea     rsi, [s_rep]
+        mov     edx, 3
+        call    word_is
+        test    eax, eax
+        jnz     near .rep
+        ; jumps take short or near before their target
+        cmp     r13, 2
+        jb      short .not_jump
+        mov     rdi, r12
+        call    jump_kind
+        cmp     rax, -1
+        jne     near .jump
+.not_jump:
+        mov     rdi, r15
+        call    parse_operands
+        ; the mnemonic's handler
+        lea     r14, [mnemonics]
+.find:
+        mov     rcx, [r14 + 8]
+        test    rcx, rcx
+        jz      near .conditional
+        cmp     rcx, r13
+        jne     short .next
+        mov     rdi, r12
+        mov     rsi, [r14]
+        mov     rdx, r13
+        call    lower_eq
+        test    eax, eax
+        jnz     short .found
+.next:
+        add     r14, 32
+        jmp     short .find
+.found:
+        mov     rax, [r14 + 16]
+        mov     r14, [r14 + 24]
+.call:
+        push    rax
+        xor     edi, edi
+        call    op_at
+        mov     rbx, rax
+        mov     edi, 1
+        call    op_at
+        mov     r12, rax
+        mov     edi, 2
+        call    op_at
+        mov     r13, rax
+        pop     rax
+        call    rax
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.conditional:
+        ; setcc, cmovcc
+        cmp     r13, 4
+        jb      near .unknown
+        mov     rdi, r12
+        lea     rsi, [s_set]
+        mov     edx, 3
+        call    lower_eq
+        test    eax, eax
+        jz      short .cmov
+        lea     rdi, [r12 + 3]
+        lea     rsi, [r13 - 3]
+        call    cond_code
+        cmp     rax, -1
+        je      near .unknown
+        mov     r14, rax
+        lea     rax, [h_setcc]
+        jmp     near .call
+.cmov:
+        cmp     r13, 5
+        jb      near .unknown
+        mov     rdi, r12
+        lea     rsi, [s_cmov]
+        mov     edx, 4
+        call    lower_eq
+        test    eax, eax
+        jz      near .unknown
+        lea     rdi, [r12 + 4]
+        lea     rsi, [r13 - 4]
+        call    cond_code
+        cmp     rax, -1
+        je      near .unknown
+        mov     r14, rax
+        lea     rax, [h_cmovcc]
+        jmp     near .call
+.rep:
+        mov     rdi, r15
+        call    tok
+        cmp     qword [rax], T_IDENT
+        jne     near .unknown
+        mov     rbx, rax
+        mov     rdi, [rbx + 8]
+        mov     rsi, [rbx + 16]
+        cmp     rsi, 5
+        jne     near .unknown
+        lea     rsi, [s_movsb]
+        mov     edx, 5
+        call    lower_eq
+        mov     r14d, 0xA4
+        test    eax, eax
+        jnz     short .rep_op
+        mov     rdi, [rbx + 8]
+        lea     rsi, [s_stosb]
+        mov     edx, 5
+        call    lower_eq
+        mov     r14d, 0xAA
+        test    eax, eax
+        jz      near .unknown
+.rep_op:
+        lea     rdi, [r15 + 1]
+        call    expect_end
+        mov     edi, 0xF3
+        call    ib_byte
+        mov     rdi, r14
+        call    ib_byte
+        call    finish
+        jmp     near .done
+.jump:
+        ; jmp/jcc short|near target; jmp and call through a register or memory
+        mov     r14, rax                ; condition code, or 16 for jmp
+        mov     rdi, r15
+        lea     rsi, [s_short]
+        mov     edx, 5
+        call    tok_is
+        mov     ebx, 1
+        test    eax, eax
+        jnz     short .sized
+        mov     rdi, r15
+        lea     rsi, [s_near]
+        mov     edx, 4
+        call    tok_is
+        mov     ebx, 4
+        test    eax, eax
+        jnz     short .sized
+        ; no size: only `jmp` through a register or memory
+        cmp     r14, 16
+        jne     near .unsized
+        mov     rdi, r15
+        call    parse_operands
+        xor     edi, edi
+        call    op_at
+        mov     rbx, rax
+        cmp     qword [rbx + OP_KIND], K_IMM
+        je      near .unsized
+        mov     edi, 0xFF
+        mov     esi, 1
+        mov     edx, 4
+        mov     rcx, rbx
+        xor     r8d, r8d
+        xor     r9d, r9d
+        call    emit_rm
+        call    finish
+        jmp     near .done
+.sized:
+        mov     qword [g_known], 1
+        lea     rdi, [r15 + 1]
+        call    expr
+        mov     r12, rax                ; the target
+        mov     rdi, rdx
+        call    expect_end
+        ; opcode
+        cmp     r14, 16
+        jne     short .jcc
+        mov     edi, 0xEB
+        cmp     ebx, 1
+        je      short .op1
+        mov     edi, 0xE9
+.op1:
+        call    ib_byte
+        jmp     short .rel
+.jcc:
+        cmp     ebx, 1
+        jne     short .jcc_near
+        lea     edi, [r14 + 0x70]
+        call    ib_byte
+        jmp     short .rel
+.jcc_near:
+        mov     edi, 0x0F
+        call    ib_byte
+        lea     edi, [r14 + 0x80]
+        call    ib_byte
+.rel:
+        ; the displacement from the end of the instruction
+        mov     rax, r12
+        sub     rax, [g_addr]
+        sub     rax, [g_ilen]
+        sub     rax, rbx
+        cmp     ebx, 1
+        jne     short .rel32
+        cmp     qword [g_pass], 2
+        jne     short .rel_put
+        mov     rdi, rax
+        mov     esi, 8
+        push    rax
+        push    rax
+        call    fits8
+        mov     ecx, eax
+        pop     rax
+        pop     rax
+        test    ecx, ecx
+        jz      near .far
+        jmp     short .rel_put
+.rel32:
+.rel_put:
+        mov     rdi, rax
+        mov     esi, ebx
+        call    ib_value
+        call    finish
+.done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.unknown:
+        lea     rdi, [msg_mnemonic]
+        mov     esi, msg_mnemonic_len
+        call    asm_error
+.unsized:
+        lea     rdi, [msg_jump_size]
+        mov     esi, msg_jump_size_len
+        call    asm_error
+.far:
+        lea     rdi, [msg_far]
+        mov     esi, msg_far_len
+        call    asm_error
+
+; jump_kind - jmp: 16; jcc: its condition code; anything else -1.
+;   in: rdi = mnemonic (r13 = its length)
+jump_kind:
+        push    rbx
+        mov     rbx, rdi
+        movzx   eax, byte [rbx]
+        or      al, 0x20
+        cmp     al, 'j'
+        jne     short .no
+        cmp     r13, 3
+        jne     short .cc
+        lea     rsi, [s_jmp]
+        mov     edx, 3
+        call    lower_eq
+        test    eax, eax
+        jz      short .cc
+        mov     eax, 16
+        pop     rbx
+        ret
+.cc:
+        lea     rdi, [rbx + 1]
+        lea     rsi, [r13 - 1]
+        call    cond_code
+        pop     rbx
+        ret
+.no:
+        mov     rax, -1
+        pop     rbx
+        ret
+
+; cond_code - a condition's code (o 0 ... g 15), or -1.
+;   in: rdi = text, rsi = length
+cond_code:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdi
+        mov     r13, rsi
+        lea     rbx, [cond_table]
+.loop:
+        movzx   eax, byte [rbx + 4]
+        test    eax, eax
+        jz      short .none
+        cmp     rax, r13
+        jne     short .next
+        mov     rdi, r12
+        mov     rsi, rbx
+        mov     rdx, r13
+        call    lower_eq
+        test    eax, eax
+        jz      short .next
+        movzx   eax, byte [rbx + 5]
+        jmp     short .out
+.next:
+        add     rbx, 8
+        jmp     short .loop
+.none:
+        mov     rax, -1
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------- helpers
+; need - the instruction must have rdi operands.
+need:
+        cmp     [g_nops], rdi
+        jne     short .bad
+        ret
+.bad:
+        lea     rdi, [msg_operand]
+        mov     esi, msg_operand_len
+        call    asm_error
+
+bad_operands:
+        lea     rdi, [msg_operand]
+        mov     esi, msg_operand_len
+        call    asm_error
+
+; op_size - the size of an instruction with operands rdi and rsi (either may give
+; it; a register's size wins).  out: rax
+op_size:
+        cmp     qword [rdi + OP_KIND], K_REG
+        je      short .first
+        cmp     qword [rsi + OP_KIND], K_REG
+        je      short .second
+        mov     rax, [rdi + OP_SIZE_]
+        test    rax, rax
+        jnz     short .out
+        mov     rax, [rsi + OP_SIZE_]
+        test    rax, rax
+        jnz     short .out
+        jmp     near bad_operands
+.first:
+        mov     rax, [rdi + OP_SIZE_]
+        ret
+.second:
+        mov     rax, [rsi + OP_SIZE_]
+.out:
+        ret
+
+; imm_put - an immediate of n bytes (8 is written as 4, sign-extended by the CPU).
+;   in: rdi = value, rsi = n
+imm_put:
+        cmp     rsi, 8
+        jne     short .go
+        mov     esi, 4
+.go:
+        jmp     near ib_value
+
+; ---------------------------------------------------------------- handlers
+; ALU: add 0, or 1, adc 2, sbb 3, and 4, sub 5, xor 6, cmp 7 (r14)
+h_alu:
+        push    r15
+        mov     edi, 2
+        call    need
+        mov     rdi, rbx
+        mov     rsi, r12
+        call    op_size
+        mov     r15, rax
+        cmp     qword [r12 + OP_KIND], K_IMM
+        je      near .imm
+        cmp     qword [r12 + OP_KIND], K_REG
+        jne     short .reg_mem
+        ; r/m, reg: n*8 + 1 (byte: + 0)
+        mov     rdi, r14
+        shl     edi, 3
+        cmp     r15, 1
+        je      short .mr
+        inc     edi
+.mr:
+        mov     esi, 1
+        mov     rdx, [r12 + OP_REG]
+        mov     rcx, rbx
+        mov     r8, r15
+        mov     r9, [r12 + OP_REX8]
+        call    emit_rm
+        jmp     near .done
+.reg_mem:
+        ; reg, mem: n*8 + 3 (byte: + 2)
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     near .bad
+        mov     rdi, r14
+        shl     edi, 3
+        add     edi, 2
+        cmp     r15, 1
+        je      short .rm
+        inc     edi
+.rm:
+        mov     esi, 1
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, r15
+        mov     r9, [rbx + OP_REX8]
+        call    emit_rm
+        jmp     near .done
+.imm:
+        cmp     r15, 1
+        jne     short .wide
+        ; byte: al gets n*8 + 4 ib, else 80 /n ib
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     short .imm8
+        cmp     qword [rbx + OP_REG], 0
+        jne     short .imm8
+        mov     rdi, r14
+        shl     edi, 3
+        add     edi, 4
+        call    ib_byte
+        jmp     short .imm_byte
+.imm8:
+        mov     edi, 0x80
+        mov     esi, 1
+        mov     rdx, r14
+        mov     rcx, rbx
+        mov     r8d, 1
+        xor     r9d, r9d
+        call    emit_rm
+.imm_byte:
+        mov     rdi, [r12 + OP_VAL]
+        mov     esi, 1
+        call    ib_value
+        jmp     near .done
+.wide:
+        ; a known value that fits a signed byte: 83 /n ib
+        cmp     qword [r12 + OP_KNOWN], 0
+        je      short .imm32
+        mov     rdi, [r12 + OP_VAL]
+        mov     rsi, r15
+        call    fits8
+        test    eax, eax
+        jz      short .imm32
+        mov     edi, 0x83
+        mov     esi, 1
+        mov     rdx, r14
+        mov     rcx, rbx
+        mov     r8, r15
+        xor     r9d, r9d
+        call    emit_rm
+        mov     rdi, [r12 + OP_VAL]
+        mov     esi, 1
+        call    ib_value
+        jmp     short .done
+.imm32:
+        ; eax, ax, rax: n*8 + 5 iw/id; else 81 /n iw/id
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     short .imm81
+        cmp     qword [rbx + OP_REG], 0
+        jne     short .imm81
+        cmp     r15, 2
+        jne     short .acc_rex
+        mov     edi, 0x66
+        call    ib_byte
+.acc_rex:
+        cmp     r15, 8
+        jne     short .acc_op
+        mov     edi, 0x48
+        call    ib_byte
+.acc_op:
+        mov     rdi, r14
+        shl     edi, 3
+        add     edi, 5
+        call    ib_byte
+        jmp     short .imm_wide
+.imm81:
+        mov     edi, 0x81
+        mov     esi, 1
+        mov     rdx, r14
+        mov     rcx, rbx
+        mov     r8, r15
+        xor     r9d, r9d
+        call    emit_rm
+.imm_wide:
+        mov     rdi, [r12 + OP_VAL]
+        mov     rsi, r15
+        call    imm_put
+.done:
+        call    finish
+        pop     r15
+        ret
+.bad:
+        jmp     near bad_operands
+
+; mov
+h_mov:
+        push    r15
+        mov     edi, 2
+        call    need
+        mov     rdi, rbx
+        mov     rsi, r12
+        call    op_size
+        mov     r15, rax
+        cmp     qword [r12 + OP_KIND], K_IMM
+        je      near .imm
+        cmp     qword [r12 + OP_KIND], K_REG
+        jne     short .load
+        ; r/m, reg: 89 /r (byte 88)
+        mov     edi, 0x89
+        cmp     r15, 1
+        jne     short .store
+        mov     edi, 0x88
+.store:
+        mov     esi, 1
+        mov     rdx, [r12 + OP_REG]
+        mov     rcx, rbx
+        mov     r8, r15
+        mov     r9, [r12 + OP_REX8]
+        call    emit_rm
+        jmp     near .done
+.load:
+        ; reg, mem: 8B /r (byte 8A)
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     near .bad
+        mov     edi, 0x8B
+        cmp     r15, 1
+        jne     short .load_op
+        mov     edi, 0x8A
+.load_op:
+        mov     esi, 1
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, r15
+        mov     r9, [rbx + OP_REX8]
+        call    emit_rm
+        jmp     near .done
+.imm:
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     near .mem_imm
+        ; reg, imm: B0+r ib, B8+r iw/id; 64-bit: as 32-bit when it fits unsigned,
+        ; C7 /0 id when it fits signed, else B8+r io
+        mov     rax, [r12 + OP_VAL]
+        cmp     r15, 8
+        jne     near .reg_imm
+        cmp     qword [r12 + OP_KNOWN], 0
+        je      short .as32
+        mov     rcx, rax
+        shr     rcx, 32
+        jz      short .as32
+        movsxd  rcx, eax
+        cmp     rcx, rax
+        jne     short .imm64
+        ; mov r/m64, simm32
+        mov     edi, 0xC7
+        mov     esi, 1
+        xor     edx, edx
+        mov     rcx, rbx
+        mov     r8d, 8
+        xor     r9d, r9d
+        call    emit_rm
+        mov     rdi, [r12 + OP_VAL]
+        mov     esi, 4
+        call    ib_value
+        jmp     near .done
+.as32:
+        mov     r15d, 4
+        jmp     short .reg_imm
+.imm64:
+        mov     rdi, [rbx + OP_REG]
+        shr     edi, 3
+        or      edi, 0x48
+        call    ib_byte
+        mov     rdi, [rbx + OP_REG]
+        and     edi, 7
+        add     edi, 0xB8
+        call    ib_byte
+        mov     rdi, [r12 + OP_VAL]
+        mov     esi, 8
+        call    ib_value
+        jmp     near .done
+.reg_imm:
+        cmp     r15, 2
+        jne     short .no66
+        mov     edi, 0x66
+        call    ib_byte
+.no66:
+        mov     rax, [rbx + OP_REG]
+        test    rax, 8
+        jnz     short .rex_b
+        cmp     qword [rbx + OP_REX8], 0
+        je      short .opcode
+        mov     edi, 0x40
+        call    ib_byte
+        jmp     short .opcode
+.rex_b:
+        mov     edi, 0x41
+        call    ib_byte
+.opcode:
+        mov     rdi, [rbx + OP_REG]
+        and     edi, 7
+        add     edi, 0xB8
+        cmp     r15, 1
+        jne     short .op_put
+        sub     edi, 8
+.op_put:
+        call    ib_byte
+        mov     rdi, [r12 + OP_VAL]
+        mov     rsi, r15
+        call    ib_value
+        jmp     short .done
+.mem_imm:
+        ; mem, imm: C6 /0 ib, C7 /0 iw/id
+        mov     edi, 0xC7
+        cmp     r15, 1
+        jne     short .mem_op
+        mov     edi, 0xC6
+.mem_op:
+        mov     esi, 1
+        xor     edx, edx
+        mov     rcx, rbx
+        mov     r8, r15
+        xor     r9d, r9d
+        call    emit_rm
+        mov     rdi, [r12 + OP_VAL]
+        mov     rsi, r15
+        call    imm_put
+.done:
+        call    finish
+        pop     r15
+        ret
+.bad:
+        jmp     near bad_operands
+
+; movzx (r14 = 0xB6), movsx (0xBE): the source's size picks +0 (byte) or +1 (word)
+h_movx:
+        mov     edi, 2
+        call    need
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     near bad_operands
+        mov     rax, [r12 + OP_SIZE_]
+        lea     rdi, [r14 * 8]
+        shl     edi, 5
+        or      edi, 0x0F
+        cmp     rax, 1
+        je      short .op
+        cmp     rax, 2
+        jne     near bad_operands
+        add     edi, 0x100
+.op:
+        mov     esi, 2
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, [rbx + OP_SIZE_]
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+
+; movsxd r64, r/m32: REX.W 63 /r
+h_movsxd:
+        mov     edi, 2
+        call    need
+        mov     edi, 0x63
+        mov     esi, 1
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8d, 8
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+
+; lea reg, mem: 8D /r
+h_lea:
+        mov     edi, 2
+        call    need
+        cmp     qword [r12 + OP_KIND], K_MEM
+        jne     near bad_operands
+        mov     edi, 0x8D
+        mov     esi, 1
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, [rbx + OP_SIZE_]
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+
+; test: 85 /r (byte 84); with an immediate A8/A9 for the accumulator, else F6/F7 /0
+h_test:
+        push    r15
+        mov     edi, 2
+        call    need
+        mov     rdi, rbx
+        mov     rsi, r12
+        call    op_size
+        mov     r15, rax
+        cmp     qword [r12 + OP_KIND], K_IMM
+        je      short .imm
+        mov     edi, 0x85
+        cmp     r15, 1
+        jne     short .rr
+        mov     edi, 0x84
+.rr:
+        mov     esi, 1
+        mov     rdx, [r12 + OP_REG]
+        mov     rcx, rbx
+        mov     r8, r15
+        mov     r9, [r12 + OP_REX8]
+        call    emit_rm
+        jmp     short .done
+.imm:
+        cmp     qword [rbx + OP_KIND], K_REG
+        jne     short .f7
+        cmp     qword [rbx + OP_REG], 0
+        jne     short .f7
+        cmp     r15, 2
+        jne     short .acc_w
+        mov     edi, 0x66
+        call    ib_byte
+.acc_w:
+        cmp     r15, 8
+        jne     short .acc_op
+        mov     edi, 0x48
+        call    ib_byte
+.acc_op:
+        mov     edi, 0xA9
+        cmp     r15, 1
+        jne     short .acc_put
+        mov     edi, 0xA8
+.acc_put:
+        call    ib_byte
+        jmp     short .value
+.f7:
+        mov     edi, 0xF7
+        cmp     r15, 1
+        jne     short .f7_op
+        mov     edi, 0xF6
+.f7_op:
+        mov     esi, 1
+        xor     edx, edx
+        mov     rcx, rbx
+        mov     r8, r15
+        xor     r9d, r9d
+        call    emit_rm
+.value:
+        mov     rdi, [r12 + OP_VAL]
+        mov     rsi, r15
+        call    imm_put
+.done:
+        call    finish
+        pop     r15
+        ret
+
+; one operand, FE/FF or F6/F7 /n (r14 = n | the opcode for words << 8)
+h_group:
+        mov     edi, 1
+        call    need
+        mov     r8, [rbx + OP_SIZE_]
+        test    r8, r8
+        jz      near bad_operands
+        mov     rdi, r14
+        shr     edi, 8                  ; FF or F7
+        cmp     r8, 1
+        jne     short .op
+        dec     edi                     ; FE or F6
+.op:
+        mov     esi, 1
+        mov     rdx, r14
+        and     edx, 7
+        mov     rcx, rbx
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+
+; imul: one operand (F7 /5), reg with r/m (0F AF /r), or reg, r/m, imm (6B ib / 69 id)
+h_imul:
+        mov     rax, [g_nops]
+        cmp     rax, 1
+        jne     short .two
+        mov     r14d, 0xF705
+        jmp     near h_group
+.two:
+        cmp     rax, 2
+        jne     short .three
+        cmp     qword [r12 + OP_KIND], K_IMM
+        jne     short .rrm
+        ; imul reg, imm is imul reg, reg, imm
+        mov     r13, r12
+        mov     r12, rbx
+        jmp     short .imm
+.rrm:
+        mov     edi, 0xAF0F
+        mov     esi, 2
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, [rbx + OP_SIZE_]
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+.three:
+        cmp     rax, 3
+        jne     near bad_operands
+.imm:
+        push    r15
+        mov     r15, [rbx + OP_SIZE_]
+        mov     edi, 0x69
+        cmp     qword [r13 + OP_KNOWN], 0
+        je      short .op
+        mov     rdi, [r13 + OP_VAL]
+        mov     rsi, r15
+        call    fits8
+        mov     edi, 0x69
+        test    eax, eax
+        jz      short .op
+        mov     edi, 0x6B
+.op:
+        push    rdi
+        sub     rsp, 8
+        mov     esi, 1
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, r15
+        xor     r9d, r9d
+        call    emit_rm
+        add     rsp, 8
+        pop     rax
+        mov     rdi, [r13 + OP_VAL]
+        mov     rsi, r15
+        cmp     eax, 0x6B
+        jne     short .wide
+        mov     esi, 1
+        call    ib_value
+        jmp     short .done
+.wide:
+        call    imm_put
+.done:
+        pop     r15
+        jmp     near finish
+
+; shifts: rol 0, ror 1, shl 4, shr 5, sar 7 (r14); by 1 (D0/D1), by cl (D2/D3),
+; by imm8 (C0/C1)
+h_shift:
+        mov     edi, 2
+        call    need
+        mov     r8, [rbx + OP_SIZE_]
+        test    r8, r8
+        jz      near bad_operands
+        cmp     qword [r12 + OP_KIND], K_REG
+        je      short .cl
+        cmp     qword [r12 + OP_KIND], K_IMM
+        jne     near bad_operands
+        cmp     qword [r12 + OP_VAL], 1
+        jne     short .imm
+        cmp     qword [r12 + OP_KNOWN], 0
+        je      short .imm
+        mov     edi, 0xD1
+        jmp     short .emit
+.cl:
+        cmp     qword [r12 + OP_REG], 1
+        jne     near bad_operands
+        cmp     qword [r12 + OP_SIZE_], 1
+        jne     near bad_operands
+        mov     edi, 0xD3
+        jmp     short .emit
+.imm:
+        mov     edi, 0xC1
+.emit:
+        cmp     r8, 1
+        jne     short .op
+        dec     edi
+.op:
+        push    rdi
+        sub     rsp, 8
+        mov     esi, 1
+        mov     rdx, r14
+        mov     rcx, rbx
+        xor     r9d, r9d
+        call    emit_rm
+        add     rsp, 8
+        pop     rax
+        and     eax, 0xFE
+        cmp     eax, 0xC0
+        jne     short .done
+        mov     rdi, [r12 + OP_VAL]
+        mov     esi, 1
+        call    ib_value
+.done:
+        jmp     near finish
+
+; push: 50+r, 6A ib / 68 id, FF /6; pop: 58+r, 8F /0 (r14 = 0 push, 1 pop)
+h_push:
+        mov     edi, 1
+        call    need
+        mov     rax, [rbx + OP_KIND]
+        cmp     rax, K_REG
+        je      short .reg
+        cmp     rax, K_IMM
+        je      short .imm
+        mov     edi, 0xFF
+        mov     edx, 6
+        test    r14, r14
+        jz      short .mem
+        mov     edi, 0x8F
+        xor     edx, edx
+.mem:
+        mov     esi, 1
+        mov     rcx, rbx
+        xor     r8d, r8d
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+.reg:
+        cmp     qword [rbx + OP_SIZE_], 8
+        jne     near bad_operands
+        mov     rax, [rbx + OP_REG]
+        test    rax, 8
+        jz      short .reg_op
+        mov     edi, 0x41
+        call    ib_byte
+.reg_op:
+        mov     rdi, [rbx + OP_REG]
+        and     edi, 7
+        add     edi, 0x50
+        test    r14, r14
+        jz      short .reg_put
+        add     edi, 8
+.reg_put:
+        call    ib_byte
+        jmp     near finish
+.imm:
+        test    r14, r14
+        jnz     near bad_operands
+        cmp     qword [rbx + OP_KNOWN], 0
+        je      short .imm32
+        mov     rdi, [rbx + OP_VAL]
+        mov     esi, 8
+        call    fits8
+        test    eax, eax
+        jz      short .imm32
+        mov     edi, 0x6A
+        call    ib_byte
+        mov     rdi, [rbx + OP_VAL]
+        mov     esi, 1
+        call    ib_value
+        jmp     near finish
+.imm32:
+        mov     edi, 0x68
+        call    ib_byte
+        mov     rdi, [rbx + OP_VAL]
+        mov     esi, 4
+        call    ib_value
+        jmp     near finish
+
+; call: E8 rel32 to a target, FF /2 through a register or memory
+h_call:
+        mov     edi, 1
+        call    need
+        cmp     qword [rbx + OP_KIND], K_IMM
+        je      short .direct
+        mov     edi, 0xFF
+        mov     esi, 1
+        mov     edx, 2
+        mov     rcx, rbx
+        xor     r8d, r8d
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+.direct:
+        mov     edi, 0xE8
+        call    ib_byte
+        mov     rdi, [rbx + OP_VAL]
+        sub     rdi, [g_addr]
+        sub     rdi, 5
+        mov     esi, 4
+        call    ib_value
+        jmp     near finish
+
+; setcc r/m8: 0F 90+cc /0
+h_setcc:
+        mov     edi, 1
+        call    need
+        lea     edi, [r14 + 0x90]
+        shl     edi, 8
+        or      edi, 0x0F
+        mov     esi, 2
+        xor     edx, edx
+        mov     rcx, rbx
+        xor     r8d, r8d
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+
+; cmovcc reg, r/m: 0F 40+cc /r
+h_cmovcc:
+        mov     edi, 2
+        call    need
+        lea     edi, [r14 + 0x40]
+        shl     edi, 8
+        or      edi, 0x0F
+        mov     esi, 2
+        mov     rdx, [rbx + OP_REG]
+        mov     rcx, r12
+        mov     r8, [rbx + OP_SIZE_]
+        xor     r9d, r9d
+        call    emit_rm
+        jmp     near finish
+
+; xchg r/m, reg: 87 /r (byte 86)
+h_xchg:
+        mov     edi, 2
+        call    need
+        cmp     qword [r12 + OP_KIND], K_REG
+        jne     near bad_operands
+        mov     r8, [r12 + OP_SIZE_]
+        mov     edi, 0x87
+        cmp     r8, 1
+        jne     short .op
+        mov     edi, 0x86
+.op:
+        mov     esi, 1
+        mov     rdx, [r12 + OP_REG]
+        mov     rcx, rbx
+        mov     r9, [r12 + OP_REX8]
+        call    emit_rm
+        jmp     near finish
+
+; no operands: r14 = the bytes, the count in the top byte
+h_fixed:
+        xor     edi, edi
+        call    need
+        mov     rdi, r14
+        mov     rsi, r14
+        shr     rsi, 56
+        call    ib_value
+        jmp     near finish

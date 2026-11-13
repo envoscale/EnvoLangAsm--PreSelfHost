@@ -1,0 +1,1096 @@
+; =============================================================================
+; seed/src/asm.eas - asm0, the seed assembler (PLAN D67, docs/spec/eas.md)
+;
+; Assembles the Stage 0 subset of EAS into a flat binary, byte for byte as NASM
+; does (`nasm -f bin`), so Stage 0 can be built without NASM:
+;
+;     asm0 <file.eas> <output>
+;
+; Two passes over the source and its %includes. Pass 1 gives every label its
+; address; pass 2 writes the bytes. Sizes never depend on later definitions
+; (eas.md section 4): an operand is "known" when every name in it was defined
+; by an earlier statement (statements are numbered in both passes the same way),
+; and only known values may pick a shorter encoding.
+;
+; Internal calling convention: arguments in rdi, rsi, rdx, rcx, r8; results in
+; rax (and rdx); rbx, rbp, r12-r15 are preserved; rsp is 16-byte aligned at
+; every call. Errors go through asm_error, which prints the file and line.
+; =============================================================================
+
+; ---------------------------------------------------------------- limits
+SYM_CAP         equ 0x10000             ; symbol table slots (a power of two)
+SYM_SIZE        equ 40                  ; +0 name, +8 length, +16 value, +24 statement, +32 kind
+MAX_TOKS        equ 256                 ; tokens in one line
+TOK_SIZE        equ 24                  ; +0 kind, +8 value or pointer, +16 length
+OUT_MAX         equ 0x1000000           ; 16 MiB of output
+MAX_DEPTH       equ 16                  ; %include nesting
+NAME_MAX        equ 512                 ; a full (local) label name
+REG_ENTRY       equ 16                  ; register table: name[8], length, number, size, rex8
+
+; token kinds
+T_IDENT         equ 1
+T_NUM           equ 2
+T_STR           equ 3
+T_PUNCT         equ 4
+T_END           equ 5
+
+; symbol kinds
+S_LABEL         equ 1
+S_EQU           equ 2
+
+; operand record (OP_SIZE bytes)
+OP_KIND         equ 0                   ; K_REG, K_MEM, K_IMM
+OP_SIZE_        equ 8                   ; 0 (unsized), 1, 2, 4, 8
+OP_REG          equ 16                  ; register number; memory: base (-1: none)
+OP_INDEX        equ 24                  ; memory: index register (-1: none)
+OP_SCALE        equ 32                  ; memory: 1, 2, 4, 8
+OP_VAL          equ 40                  ; immediate or displacement
+OP_KNOWN        equ 48                  ; 1 if the value is known (see above)
+OP_REX8         equ 56                  ; register: spl, bpl, sil or dil (needs REX)
+OP_SIZE         equ 64
+
+K_REG           equ 1
+K_MEM           equ 2
+K_IMM           equ 3
+
+; ---------------------------------------------------------------- entry
+; main - asm0 <input> <output>
+main:
+        sub     rsp, 8
+        call    io_init
+        call    sys_args
+        cmp     rax, 3
+        jne     near .usage
+        mov     rbx, rdx                ; argv
+        ; tables
+        mov     edi, SYM_CAP * SYM_SIZE
+        call    arena_alloc
+        mov     [g_syms], rax
+        mov     edi, OUT_MAX
+        call    arena_alloc
+        mov     [g_out], rax
+        mov     edi, MAX_TOKS * TOK_SIZE
+        call    arena_alloc
+        mov     [g_toks], rax
+        mov     edi, NAME_MAX
+        call    arena_alloc
+        mov     [g_global], rax
+        ; the top-level file's folder: includes are relative to it
+        mov     rdi, [rbx + 8]
+        mov     [g_top], rdi
+        call    cstr_len
+        mov     rcx, rax
+        mov     rsi, [g_top]
+.dir:
+        test    rcx, rcx
+        jz      short .dir_done
+        movzx   eax, byte [rsi + rcx - 1]
+        cmp     al, '/'
+        je      short .dir_done
+        cmp     al, 0x5C
+        je      short .dir_done
+        dec     rcx
+        jmp     short .dir
+.dir_done:
+        mov     [g_dir_len], rcx
+        ; pass 1, then pass 2
+        mov     qword [g_pass], 1
+        call    run_pass
+        mov     qword [g_pass], 2
+        call    run_pass
+        ; write the output
+        mov     rdi, [rbx + 16]
+        mov     esi, 1
+        call    sys_open
+        test    rax, rax
+        js      near .cannot_write
+        mov     r12, rax
+        mov     r13, [g_out]
+        mov     r14, [g_size]
+.write:
+        test    r14, r14
+        jz      short .written
+        mov     rdi, r12
+        mov     rsi, r13
+        mov     rdx, r14
+        call    sys_write
+        test    rax, rax
+        jle     near .cannot_write
+        add     r13, rax
+        sub     r14, rax
+        jmp     short .write
+.written:
+        mov     rdi, r12
+        call    sys_close
+        xor     edi, edi
+        call    exit_process
+.usage:
+        lea     rdi, [w_err]
+        lea     rsi, [msg_usage]
+        mov     edx, msg_usage_len
+        call    w_bytes
+        mov     edi, 2
+        call    exit_process
+.cannot_write:
+        lea     rdi, [msg_write]
+        mov     esi, msg_write_len
+        call    fatal
+
+; run_pass - one pass over the program: resets the position, assembles the
+; top-level file, and checks that the passes agree on the size.
+run_pass:
+        sub     rsp, 8
+        mov     qword [g_addr], 0
+        mov     qword [g_org], 0
+        mov     qword [g_stmt], 0
+        mov     qword [g_seen_out], 0
+        mov     rdi, [g_global]
+        mov     byte [rdi], 0
+        mov     qword [g_global_len], 0
+        mov     rdi, [g_top]
+        call    cstr_len
+        mov     rsi, rax
+        mov     rdi, [g_top]
+        call    asm_file
+        mov     rax, [g_addr]
+        sub     rax, [g_org]
+        cmp     qword [g_pass], 1
+        jne     short .check
+        mov     [g_size], rax
+        add     rsp, 8
+        ret
+.check:
+        cmp     rax, [g_size]
+        jne     short .differ
+        add     rsp, 8
+        ret
+.differ:
+        lea     rdi, [msg_passes]
+        mov     esi, msg_passes_len
+        call    fatal
+
+; asm_file - assembles one source file, line by line.
+;   in: rdi = path, rsi = its length (not NUL-terminated)
+asm_file:
+        push    rbp
+        mov     rbp, rsp
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 8
+        mov     rax, [g_depth]
+        cmp     rax, MAX_DEPTH
+        jae     near .deep
+        inc     qword [g_depth]
+        ; a NUL-terminated copy of the path
+        mov     r12, rdi
+        mov     r13, rsi
+        lea     rdi, [r13 + 1]
+        call    arena_alloc
+        mov     rbx, rax
+        mov     rdi, rbx
+        mov     rsi, r12
+        mov     rcx, r13
+        rep movsb
+        mov     rdi, rbx
+        call    read_file
+        test    rax, rax
+        jz      near .unreadable
+        mov     r14, rax                ; text
+        lea     r15, [rax + rdx]        ; its end
+        ; the file and line being assembled, kept for messages
+        push    qword [g_file]
+        push    qword [g_line]
+        mov     [g_file], rbx
+        mov     qword [g_line], 0
+.line:
+        cmp     r14, r15
+        jae     short .done
+        inc     qword [g_line]
+        mov     rsi, r14
+.find_end:
+        cmp     rsi, r15
+        jae     short .at_end
+        cmp     byte [rsi], 10
+        je      short .at_end
+        inc     rsi
+        jmp     short .find_end
+.at_end:
+        mov     rdi, r14
+        mov     r12, rsi                ; the line's end
+        sub     rsi, r14
+        call    asm_line
+        lea     r14, [r12 + 1]
+        jmp     short .line
+.done:
+        pop     qword [g_line]
+        pop     qword [g_file]
+        dec     qword [g_depth]
+        lea     rsp, [rbp - 40]
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        pop     rbp
+        ret
+.deep:
+        lea     rdi, [msg_deep]
+        mov     esi, msg_deep_len
+        call    asm_error
+.unreadable:
+        lea     rdi, [w_err]
+        lea     rsi, [msg_read]
+        mov     edx, msg_read_len
+        call    w_bytes
+        lea     rdi, [w_err]
+        mov     rsi, rbx
+        mov     rdx, r13
+        call    w_bytes
+        lea     rdi, [w_err]
+        lea     rsi, [msg_newline]
+        mov     edx, 1
+        call    w_bytes
+        mov     edi, 1
+        call    exit_process
+
+; asm_error - "asm0: <file>:<line>: <message>" and exit 1.
+;   in: rdi = message, rsi = its length
+asm_error:
+        and     rsp, -16
+        mov     r12, rdi
+        mov     r13, rsi
+        lea     rdi, [w_err]
+        lea     rsi, [msg_prefix]
+        mov     edx, msg_prefix_len
+        call    w_bytes
+        mov     rdi, [g_file]
+        test    rdi, rdi
+        jz      short .no_file
+        call    w_cstr_err
+        lea     rdi, [w_err]
+        mov     esi, ':'
+        call    w_byte
+        lea     rdi, [w_err]
+        mov     rsi, [g_line]
+        call    w_u64
+        lea     rdi, [w_err]
+        lea     rsi, [msg_colon]
+        mov     edx, 2
+        call    w_bytes
+.no_file:
+        lea     rdi, [w_err]
+        mov     rsi, r12
+        mov     rdx, r13
+        call    w_bytes
+        lea     rdi, [w_err]
+        lea     rsi, [msg_newline]
+        mov     edx, 1
+        call    w_bytes
+        mov     edi, 1
+        call    exit_process
+
+; w_cstr_err - a NUL-terminated string to stderr.
+;   in: rdi = string
+w_cstr_err:
+        push    rbx
+        mov     rbx, rdi
+        call    cstr_len
+        lea     rdi, [w_err]
+        mov     rsi, rbx
+        mov     rdx, rax
+        call    w_bytes
+        pop     rbx
+        ret
+
+; ---------------------------------------------------------------- tokens
+; tokenize - splits a line into g_toks; a comment (;) ends it. A T_END token
+; follows the last one.
+;   in:  rdi = line, rsi = length
+;   out: [g_ntok]
+tokenize:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi                ; position
+        lea     r12, [rdi + rsi]        ; end
+        mov     r13, [g_toks]
+        xor     ecx, ecx                ; tokens so far
+.next:
+        cmp     rbx, r12
+        jae     near .end
+        movzx   eax, byte [rbx]
+        cmp     al, ';'
+        je      near .end
+        cmp     al, ' '
+        je      near .skip
+        cmp     al, 9
+        je      near .skip
+        cmp     al, 13
+        je      near .skip
+        cmp     rcx, MAX_TOKS - 1
+        jae     near .too_many
+        imul    rdx, rcx, TOK_SIZE
+        add     rdx, r13
+        inc     rcx
+        ; a name: letters, digits, _ . $ ? @ (not starting with a digit)
+        mov     rdi, rax
+        push    rcx
+        push    rdx
+        call    is_name_start
+        pop     rdx
+        pop     rcx
+        test    eax, eax
+        jnz     near .name
+        movzx   eax, byte [rbx]
+        cmp     al, '0'
+        jb      short .not_num
+        cmp     al, '9'
+        jbe     near .number
+.not_num:
+        cmp     al, 0x27
+        je      near .string
+        cmp     al, '"'
+        je      near .string
+        ; punctuation; << and >> are one token each ('L', 'R')
+        mov     qword [rdx], T_PUNCT
+        mov     [rdx + 8], rax
+        mov     qword [rdx + 16], 1
+        inc     rbx
+        cmp     al, '<'
+        je      short .double
+        cmp     al, '>'
+        je      short .double
+        jmp     near .next
+.double:
+        cmp     rbx, r12
+        jae     near .bad_char
+        cmp     [rbx], al
+        jne     near .bad_char
+        inc     rbx
+        mov     qword [rdx + 8], 'L'
+        cmp     al, '<'
+        je      near .next
+        mov     qword [rdx + 8], 'R'
+        jmp     near .next
+.skip:
+        inc     rbx
+        jmp     near .next
+.name:
+        mov     qword [rdx], T_IDENT
+        mov     [rdx + 8], rbx
+        mov     rsi, rbx
+.name_more:
+        inc     rsi
+        cmp     rsi, r12
+        jae     short .name_done
+        movzx   edi, byte [rsi]
+        push    rcx
+        push    rdx
+        push    rsi
+        call    is_name_char
+        pop     rsi
+        pop     rdx
+        pop     rcx
+        test    eax, eax
+        jnz     short .name_more
+.name_done:
+        mov     rax, rsi
+        sub     rax, rbx
+        mov     [rdx + 16], rax
+        mov     rbx, rsi
+        jmp     near .next
+.number:
+        ; decimal, or hex after 0x
+        mov     qword [rdx], T_NUM
+        xor     r8d, r8d                ; value
+        cmp     al, '0'
+        jne     short .dec
+        lea     rsi, [rbx + 1]
+        cmp     rsi, r12
+        jae     short .dec
+        movzx   eax, byte [rsi]
+        or      al, 0x20
+        cmp     al, 'x'
+        jne     short .dec
+        add     rbx, 2
+.hex:
+        cmp     rbx, r12
+        jae     short .num_done
+        movzx   eax, byte [rbx]
+        cmp     al, '0'
+        jb      short .hex_alpha
+        cmp     al, '9'
+        ja      short .hex_alpha
+        sub     al, '0'
+        jmp     short .hex_digit
+.hex_alpha:
+        or      al, 0x20
+        cmp     al, 'a'
+        jb      short .num_done
+        cmp     al, 'f'
+        ja      short .num_done
+        sub     al, 'a' - 10
+.hex_digit:
+        shl     r8, 4
+        or      r8, rax
+        inc     rbx
+        jmp     short .hex
+.dec:
+        cmp     rbx, r12
+        jae     short .num_done
+        movzx   eax, byte [rbx]
+        cmp     al, '0'
+        jb      short .num_done
+        cmp     al, '9'
+        ja      short .num_done
+        sub     al, '0'
+        imul    r8, r8, 10
+        add     r8, rax
+        inc     rbx
+        jmp     short .dec
+.num_done:
+        mov     [rdx + 8], r8
+        mov     qword [rdx + 16], 0
+        jmp     near .next
+.string:
+        ; the text between the quotes (no escapes)
+        mov     qword [rdx], T_STR
+        lea     rsi, [rbx + 1]
+        mov     [rdx + 8], rsi
+.str_more:
+        cmp     rsi, r12
+        jae     near .open_string
+        cmp     [rsi], al
+        je      short .str_done
+        inc     rsi
+        jmp     short .str_more
+.str_done:
+        mov     rax, rsi
+        sub     rax, [rdx + 8]
+        mov     [rdx + 16], rax
+        lea     rbx, [rsi + 1]
+        jmp     near .next
+.end:
+        imul    rdx, rcx, TOK_SIZE
+        add     rdx, r13
+        mov     qword [rdx], T_END
+        mov     [g_ntok], rcx
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.too_many:
+        lea     rdi, [msg_long]
+        mov     esi, msg_long_len
+        call    asm_error
+.bad_char:
+        lea     rdi, [msg_char]
+        mov     esi, msg_char_len
+        call    asm_error
+.open_string:
+        lea     rdi, [msg_string]
+        mov     esi, msg_string_len
+        call    asm_error
+
+; is_name_start / is_name_char - in: edi = byte; out: eax = 1 or 0
+is_name_start:
+        xor     eax, eax
+        cmp     dil, '_'
+        je      short .yes
+        cmp     dil, '.'
+        je      short .yes
+        cmp     dil, '$'
+        je      short .yes
+        cmp     dil, '?'
+        je      short .yes
+        cmp     dil, '@'
+        je      short .yes
+        mov     ecx, edi
+        or      cl, 0x20
+        cmp     cl, 'a'
+        jb      short .no
+        cmp     cl, 'z'
+        ja      short .no
+.yes:
+        mov     eax, 1
+.no:
+        ret
+
+is_name_char:
+        call    is_name_start
+        test    eax, eax
+        jnz     short .yes
+        cmp     dil, '0'
+        jb      short .no
+        cmp     dil, '9'
+        ja      short .no
+        mov     eax, 1
+.yes:
+        ret
+.no:
+        xor     eax, eax
+        ret
+
+; tok - the address of token i.  in: rdi = i; out: rax
+tok:
+        imul    rax, rdi, TOK_SIZE
+        add     rax, [g_toks]
+        ret
+
+; is_punct - is token i the punctuation c?  in: rdi = i, esi = c; out: eax
+is_punct:
+        call    tok
+        cmp     qword [rax], T_PUNCT
+        jne     short .no
+        cmp     [rax + 8], rsi
+        jne     short .no
+        mov     eax, 1
+        ret
+.no:
+        xor     eax, eax
+        ret
+
+; tok_is - is token i the name (lowercase) s?  in: rdi = i, rsi = s, rdx = length
+tok_is:
+        push    rbx
+        call    tok
+        mov     rbx, rax
+        xor     eax, eax
+        cmp     qword [rbx], T_IDENT
+        jne     short .out
+        cmp     [rbx + 16], rdx
+        jne     short .out
+        mov     rdi, [rbx + 8]
+        call    lower_eq
+.out:
+        pop     rbx
+        ret
+
+; lower_eq - is the text at rdi (rdx bytes) equal to the lowercase rsi, ignoring
+; the case of rdi's letters?  out: eax = 1 or 0
+lower_eq:
+        xor     ecx, ecx
+.loop:
+        cmp     rcx, rdx
+        jae     short .yes
+        movzx   eax, byte [rdi + rcx]
+        cmp     al, 'A'
+        jb      short .cmp
+        cmp     al, 'Z'
+        ja      short .cmp
+        or      al, 0x20
+.cmp:
+        cmp     al, [rsi + rcx]
+        jne     short .no
+        inc     rcx
+        jmp     short .loop
+.yes:
+        mov     eax, 1
+        ret
+.no:
+        xor     eax, eax
+        ret
+
+; ---------------------------------------------------------------- symbols
+; full_name - the full name of a label or reference: a name starting with `.`
+; gets the last non-local label in front.
+;   in:  rdi = name, rsi = length
+;   out: rax = name, rdx = length (in g_name, or the name itself)
+full_name:
+        cmp     rsi, 0
+        je      short .plain
+        cmp     byte [rdi], '.'
+        jne     short .plain
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdi
+        mov     r13, rsi
+        mov     rbx, [g_global_len]
+        lea     rax, [rbx + r13]
+        cmp     rax, NAME_MAX
+        jae     short .long
+        lea     rdi, [g_name]
+        mov     rsi, [g_global]
+        mov     rcx, rbx
+        rep movsb
+        mov     rsi, r12
+        mov     rcx, r13
+        rep movsb
+        lea     rax, [g_name]
+        lea     rdx, [rbx + r13]
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.plain:
+        mov     rax, rdi
+        mov     rdx, rsi
+        ret
+.long:
+        lea     rdi, [msg_long]
+        mov     esi, msg_long_len
+        call    asm_error
+
+; sym_find - the slot for a name (its entry, or the empty slot where it goes).
+;   in:  rdi = name, rsi = length
+;   out: rax = slot
+sym_find:
+        push    rbx
+        push    r12
+        push    r13
+        mov     r12, rdi
+        mov     r13, rsi
+        ; FNV-1a
+        mov     rax, 0xCBF29CE484222325
+        mov     rdx, 0x100000001B3
+        xor     ecx, ecx
+.hash:
+        cmp     rcx, r13
+        jae     short .hashed
+        movzx   r8d, byte [r12 + rcx]
+        xor     rax, r8
+        imul    rax, rdx
+        inc     rcx
+        jmp     short .hash
+.hashed:
+        mov     rbx, rax
+.probe:
+        and     rbx, SYM_CAP - 1
+        imul    rax, rbx, SYM_SIZE
+        add     rax, [g_syms]
+        cmp     qword [rax], 0
+        je      short .out
+        cmp     [rax + 8], r13
+        jne     short .again
+        push    rax
+        mov     rdi, [rax]
+        mov     rsi, r12
+        mov     rdx, r13
+        call    mem_eq
+        mov     r8d, eax
+        pop     rax
+        test    r8d, r8d
+        jnz     short .out
+.again:
+        inc     rbx
+        jmp     short .probe
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; sym_define - defines a name (pass 1), or checks it (pass 2).
+;   in: rdi = name, rsi = length, rdx = value, rcx = kind
+sym_define:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     r14, rdx
+        mov     r15, rcx
+        call    full_name
+        mov     r12, rax
+        mov     r13, rdx
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    sym_find
+        mov     rbx, rax
+        cmp     qword [g_pass], 1
+        jne     short .pass2
+        cmp     qword [rbx], 0
+        jne     near .twice
+        ; keep a copy of the name
+        lea     rdi, [r13 + 1]
+        call    arena_alloc
+        mov     [rbx], rax
+        mov     [rbx + 8], r13
+        mov     rdi, rax
+        mov     rsi, r12
+        mov     rcx, r13
+        rep movsb
+        mov     [rbx + 16], r14
+        mov     rax, [g_stmt]
+        mov     [rbx + 24], rax
+        mov     [rbx + 32], r15
+        jmp     short .out
+.pass2:
+        ; the same value as in pass 1, or the passes disagree
+        cmp     [rbx + 16], r14
+        jne     near .moved
+.out:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.twice:
+        lea     rdi, [msg_twice]
+        mov     esi, msg_twice_len
+        call    asm_error
+.moved:
+        lea     rdi, [msg_moved]
+        mov     esi, msg_moved_len
+        call    asm_error
+
+; ---------------------------------------------------------------- expressions
+; expr - evaluates the expression starting at token rdi.
+;   out: rax = value, rdx = the token after it; [g_known] is cleared if a name in it
+;        was not defined by an earlier statement
+expr:
+        jmp     near e_or
+
+; Each level: rdi = token index in; rax = value, rdx = next token out.
+e_or:
+        push    rbx
+        push    r12
+        call    e_xor
+.loop:
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     rdi, rdx
+        mov     esi, '|'
+        call    is_punct
+        test    eax, eax
+        jz      short .out
+        lea     rdi, [r12 + 1]
+        call    e_xor
+        or      rax, rbx
+        jmp     short .loop
+.out:
+        mov     rax, rbx
+        mov     rdx, r12
+        pop     r12
+        pop     rbx
+        ret
+
+e_xor:
+        push    rbx
+        push    r12
+        call    e_and
+.loop:
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     rdi, rdx
+        mov     esi, '^'
+        call    is_punct
+        test    eax, eax
+        jz      short .out
+        lea     rdi, [r12 + 1]
+        call    e_and
+        xor     rax, rbx
+        jmp     short .loop
+.out:
+        mov     rax, rbx
+        mov     rdx, r12
+        pop     r12
+        pop     rbx
+        ret
+
+e_and:
+        push    rbx
+        push    r12
+        call    e_shift
+.loop:
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     rdi, rdx
+        mov     esi, '&'
+        call    is_punct
+        test    eax, eax
+        jz      short .out
+        lea     rdi, [r12 + 1]
+        call    e_shift
+        and     rax, rbx
+        jmp     short .loop
+.out:
+        mov     rax, rbx
+        mov     rdx, r12
+        pop     r12
+        pop     rbx
+        ret
+
+e_shift:
+        push    rbx
+        push    r12
+        push    r13
+        call    e_add
+.loop:
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     rdi, rdx
+        call    tok
+        cmp     qword [rax], T_PUNCT
+        jne     short .out
+        mov     r13, [rax + 8]
+        cmp     r13, 'L'
+        je      short .op
+        cmp     r13, 'R'
+        jne     short .out
+.op:
+        lea     rdi, [r12 + 1]
+        call    e_add
+        mov     rcx, rax
+        mov     rax, rbx
+        cmp     r13, 'L'
+        jne     short .right
+        shl     rax, cl
+        jmp     short .loop
+.right:
+        shr     rax, cl
+        jmp     short .loop
+.out:
+        mov     rax, rbx
+        mov     rdx, r12
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+e_add:
+        push    rbx
+        push    r12
+        push    r13
+        call    e_mul
+.loop:
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     rdi, rdx
+        call    tok
+        cmp     qword [rax], T_PUNCT
+        jne     short .out
+        mov     r13, [rax + 8]
+        cmp     r13, '+'
+        je      short .op
+        cmp     r13, '-'
+        jne     short .out
+.op:
+        lea     rdi, [r12 + 1]
+        call    e_mul
+        cmp     r13, '+'
+        jne     short .minus
+        add     rax, rbx
+        jmp     short .loop
+.minus:
+        sub     rbx, rax
+        mov     rax, rbx
+        jmp     short .loop
+.out:
+        mov     rax, rbx
+        mov     rdx, r12
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+e_mul:
+        push    rbx
+        push    r12
+        push    r13
+        call    e_unary
+.loop:
+        mov     rbx, rax
+        mov     r12, rdx
+        mov     rdi, rdx
+        call    tok
+        cmp     qword [rax], T_PUNCT
+        jne     short .out
+        mov     r13, [rax + 8]
+        cmp     r13, '*'
+        je      short .op
+        cmp     r13, '/'
+        je      short .op
+        cmp     r13, '%'
+        jne     short .out
+.op:
+        lea     rdi, [r12 + 1]
+        call    e_unary
+        cmp     r13, '*'
+        jne     short .divide
+        imul    rax, rbx
+        jmp     short .loop
+.divide:
+        mov     r8, rdx                 ; the next token (div uses rdx)
+        test    rax, rax
+        jz      short .zero
+        mov     rcx, rax
+        mov     rax, rbx
+        xor     edx, edx
+        div     rcx
+        cmp     r13, '/'
+        je      short .quotient
+        mov     rax, rdx
+.quotient:
+        mov     rdx, r8
+        jmp     short .loop
+.zero:
+        ; pass 1 may divide by a name not yet defined (0): the result is unknown
+        cmp     qword [g_pass], 1
+        jne     short .div_error
+        xor     eax, eax
+        mov     rdx, r8
+        jmp     short .loop
+.out:
+        mov     rax, rbx
+        mov     rdx, r12
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.div_error:
+        lea     rdi, [msg_div]
+        mov     esi, msg_div_len
+        call    asm_error
+
+e_unary:
+        push    rbx
+        mov     rbx, rdi
+        mov     esi, '-'
+        call    is_punct
+        test    eax, eax
+        jnz     short .neg
+        mov     rdi, rbx
+        mov     esi, '~'
+        call    is_punct
+        test    eax, eax
+        jnz     short .not
+        mov     rdi, rbx
+        mov     esi, '+'
+        call    is_punct
+        test    eax, eax
+        jnz     short .plus
+        mov     rdi, rbx
+        call    e_primary
+        pop     rbx
+        ret
+.neg:
+        lea     rdi, [rbx + 1]
+        call    e_unary
+        neg     rax
+        pop     rbx
+        ret
+.not:
+        lea     rdi, [rbx + 1]
+        call    e_unary
+        not     rax
+        pop     rbx
+        ret
+.plus:
+        lea     rdi, [rbx + 1]
+        call    e_unary
+        pop     rbx
+        ret
+
+; e_primary: a number, a character constant, a name, $, $$, or ( expr ).
+e_primary:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi
+        call    tok
+        mov     r12, rax
+        mov     rax, [r12]
+        cmp     rax, T_NUM
+        je      near .number
+        cmp     rax, T_STR
+        je      near .chars
+        cmp     rax, T_IDENT
+        je      near .name
+        mov     rdi, rbx
+        mov     esi, '('
+        call    is_punct
+        test    eax, eax
+        jz      near .bad
+        lea     rdi, [rbx + 1]
+        call    expr
+        mov     r13, rax
+        mov     rbx, rdx
+        mov     rdi, rdx
+        mov     esi, ')'
+        call    is_punct
+        test    eax, eax
+        jz      near .bad
+        mov     rax, r13
+        lea     rdx, [rbx + 1]
+        jmp     near .out
+.number:
+        mov     rax, [r12 + 8]
+        lea     rdx, [rbx + 1]
+        jmp     near .out
+.chars:
+        ; up to 8 characters, little-endian
+        mov     rcx, [r12 + 16]
+        cmp     rcx, 8
+        ja      near .bad
+        mov     rsi, [r12 + 8]
+        xor     eax, eax
+.char:
+        test    rcx, rcx
+        jz      short .chars_done
+        shl     rax, 8
+        movzx   edx, byte [rsi + rcx - 1]
+        or      rax, rdx
+        dec     rcx
+        jmp     short .char
+.chars_done:
+        lea     rdx, [rbx + 1]
+        jmp     near .out
+.name:
+        mov     rdi, [r12 + 8]
+        mov     rsi, [r12 + 16]
+        ; $$ and $
+        cmp     rsi, 2
+        jne     short .dollar1
+        cmp     word [rdi], 0x2424
+        jne     short .symbol
+        mov     rax, [g_org]
+        lea     rdx, [rbx + 1]
+        jmp     near .out
+.dollar1:
+        cmp     rsi, 1
+        jne     short .symbol
+        cmp     byte [rdi], '$'
+        jne     short .symbol
+        mov     rax, [g_here]
+        lea     rdx, [rbx + 1]
+        jmp     near .out
+.symbol:
+        call    full_name
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    sym_find
+        cmp     qword [rax], 0
+        je      short .undefined
+        mov     rcx, [rax + 24]
+        cmp     rcx, [g_stmt]
+        jb      short .known
+        mov     qword [g_known], 0
+.known:
+        mov     rax, [rax + 16]
+        lea     rdx, [rbx + 1]
+        jmp     short .out
+.undefined:
+        cmp     qword [g_pass], 1
+        jne     short .unknown_name
+        mov     qword [g_known], 0
+        xor     eax, eax
+        lea     rdx, [rbx + 1]
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.bad:
+        lea     rdi, [msg_expr]
+        mov     esi, msg_expr_len
+        call    asm_error
+.unknown_name:
+        lea     rdi, [msg_undefined]
+        mov     esi, msg_undefined_len
+        call    asm_error

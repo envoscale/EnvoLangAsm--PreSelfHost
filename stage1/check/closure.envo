@@ -1,0 +1,401 @@
+// Envo-S1 function types, lambdas and function values (RFC 0003; docs/architecture/
+// stage1.md, "Closures"). Stage 1 represents every function-typed value the same way, as a
+// function value { code, env } ([fn.abi.2]); a lambda passed straight to a function-typed
+// parameter borrows its captures ([fn.pos.1], [fn.cap.1]), any other lambda copies them
+// into its environment.
+
+const u32 T_INFER = 0xFFFFFFFE;     // Checker.Ret: a lambda whose result is inferred
+
+const u32 FK_FN = 0;                // kinds ([fn.type.2]); they nest: fn < mut fn < once fn
+const u32 FK_MUT = 1;
+const u32 FK_ONCE = 2;
+
+// The interned function type `kind fn(params) -> ret`. params and modes are n entries of
+// Checker.TypeArgs (types; 0, NF_IN or NF_REF). Type.Elem is the result, Count the kind,
+// Args/NArgs the parameter types and Sym the first mode.
+u32 FnTypeOf(*Checker c, u32 kind, u32 params, u32 modes, u32 n, u32 ret) {
+    Buf key = BufNew(32);
+    unsafe {
+        BufStr(&key, "F:");
+        BufU64(&key, kind as u64);
+        BufByte(&key, ':');
+        BufU64(&key, ret as u64);
+        for (u32 i = 0; i < n; i++) {
+            BufByte(&key, ',');
+            BufU64(&key, EnvGet(c, params, i) as u64);
+            BufByte(&key, '/');
+            BufU64(&key, EnvGet(c, modes, i) as u64);
+        }
+        u64 found;
+        if (MapGet(&c.Instances, BufView(&key), &found)) return found as u32;
+        u32 p = EnvNew(c, n);
+        u32 m = EnvNew(c, n);
+        for (u32 i = 0; i < n; i++) {
+            EnvSet(c, p, i, EnvGet(c, params, i));
+            EnvSet(c, m, i, EnvGet(c, modes, i));
+        }
+        u32 t = TypeNew(c, TYK_FN);
+        *Type ty = TypePtr(c, t);
+        ty.Name = "fn";
+        ty.Size = 16;
+        ty.Align = 8;
+        ty.Elem = ret;
+        ty.Count = kind;
+        ty.Args = p;
+        ty.NArgs = n;
+        ty.Sym = m;
+        MapPut(&c.Instances, BufCopy(&key), t as u64);
+        return t;
+    }
+}
+
+// fn type t with its types substituted.
+u32 FnTypeSubst(*Checker c, u32 t, u32 env, u32 n) {
+    Type ty = TypeGet(c, t);
+    u32 p = EnvNew(c, ty.NArgs);
+    for (u32 i = 0; i < ty.NArgs; i++) EnvSet(c, p, i, Subst(c, EnvGet(c, ty.Args, i), env, n));
+    return FnTypeOf(c, ty.Count, p, ty.Sym, ty.NArgs, Subst(c, ty.Elem, env, n));
+}
+
+// `[mut|once] fn(P…) -> R` ([fn.syn.*]).
+u32 ResolveFnType(*Checker c, u32 n) {
+    Node node = CNode(c, n);
+    u32 count = ListCount(c, node.A);
+    u32 p = EnvNew(c, count);
+    u32 m = EnvNew(c, count);
+    u32 a = node.A;
+    for (u32 i = 0; i < count; i++) {
+        EnvSet(c, p, i, ResolveType(c, a, false));
+        EnvSet(c, m, i, CNode(c, a).Flags & (NF_IN | NF_REF));
+        a = CNode(c, a).Next;
+    }
+    u32 ret = T_VOID;
+    if (node.B != 0) ret = ResolveType(c, node.B, true);
+    u32 kind = FK_FN;
+    if (node.Flags & NF_MUT != 0) kind = FK_MUT;
+    if (node.Flags & NF_ONCE != 0) kind = FK_ONCE;
+    return FnTypeOf(c, kind, p, m, count, ret);
+}
+
+void BufFnType(*Buf b, *Checker c, Type ty) {
+    if (ty.Count == FK_MUT) BufStr(b, "mut ");
+    if (ty.Count == FK_ONCE) BufStr(b, "once ");
+    BufStr(b, "fn(");
+    for (u32 i = 0; i < ty.NArgs; i++) {
+        if (i > 0) BufStr(b, ", ");
+        u32 mode = EnvGet(c, ty.Sym, i);
+        if (mode == NF_IN) BufStr(b, "in ");
+        if (mode == NF_REF) BufStr(b, "ref ");
+        BufType(b, c, EnvGet(c, ty.Args, i));
+    }
+    BufByte(b, ')');
+    if (ty.Elem != T_VOID) {
+        BufStr(b, " -> ");
+        BufType(b, c, ty.Elem);
+    }
+}
+
+// May a value of type got be used where want is expected? Equal types, or function types
+// that match except for a weaker kind ([fn.type.4]).
+bool Assignable(*Checker c, u32 got, u32 want) {
+    if (got == want) return true;
+    Type g = TypeGet(c, got);
+    Type w = TypeGet(c, want);
+    // `mut T[]` is also a `T[]` ([view.5])
+    if (g.Kind == TYK_SLICE && w.Kind == TYK_SLICE && g.Count == 1 && w.Count == 0 && g.Elem == w.Elem) return true;
+    if (g.Kind != TYK_FN || w.Kind != TYK_FN) return false;
+    if (g.Count > w.Count || g.Elem != w.Elem || g.NArgs != w.NArgs) return false;
+    for (u32 i = 0; i < g.NArgs; i++) {
+        if (EnvGet(c, g.Args, i) != EnvGet(c, w.Args, i)) return false;
+        if (EnvGet(c, g.Sym, i) != EnvGet(c, w.Sym, i)) return false;
+    }
+    return true;
+}
+
+// ------------------------------------------------------------------ captures
+
+// A use of local s inside lambdas: every enclosing lambda that s is outside of captures it
+// ([fn.cap.1]). A local's Value is its index on the locals stack.
+void NoteLocalUse(*Checker c, u32 s) {
+    u64 idx = SymGet(c, s).Value;
+    unsafe {
+        usize k = VecLen(&c.LamStack);
+        while (k >= 3) {
+            k -= 3;
+            u32 lam = MemLoadU32(VecAt(&c.LamStack, k));
+            u32 start = MemLoadU32(VecAt(&c.LamStack, k + 1));
+            if ((start as u64) <= idx) return;
+            bool seen = false;
+            for (usize i = 0; i < VecLen(&c.CapTmp); i += 2) {
+                if (MemLoadU32(VecAt(&c.CapTmp, i)) == lam && MemLoadU32(VecAt(&c.CapTmp, i + 1)) == s) seen = true;
+            }
+            if (!seen) {
+                MemStoreU32(VecPush(&c.CapTmp), lam);
+                MemStoreU32(VecPush(&c.CapTmp), s);
+            }
+        }
+    }
+}
+
+// The local or receiver a place expression is rooted in (through fields and array
+// elements, not through pointers), or 0.
+u32 PlaceRoot(*Checker c, u32 n) {
+    while (n != 0) {
+        Node node = CNode(c, n);
+        if (node.Kind == NK_NAME || node.Kind == NK_THIS) return n;
+        if (node.Kind == NK_MEMBER) {
+            if (TyKind(c, NType(c, node.A)) == TYK_PTR) return 0;
+            n = node.A;
+        } else if (node.Kind == NK_INDEX) {
+            if (TyKind(c, NType(c, node.A)) != TYK_ARRAY) return 0;
+            n = node.A;
+        } else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// A change to place n: lambdas that capture its root become `mut fn` ([fn.type.2]); the
+// first change is remembered for E0331.
+void MarkMutation(*Checker c, u32 n) {
+    u32 root = PlaceRoot(c, n);
+    if (root == 0) return;
+    u32 s = NSym(c, root);
+    if (s == 0 || SymGet(c, s).Kind != SK_LOCAL) return;
+    u64 idx = SymGet(c, s).Value;
+    unsafe {
+        usize k = VecLen(&c.LamStack);
+        while (k >= 3) {
+            k -= 3;
+            if ((MemLoadU32(VecAt(&c.LamStack, k + 1)) as u64) <= idx) return;
+            if (MemLoadU32(VecAt(&c.LamStack, k + 2)) == 0) MemStoreU32(VecAt(&c.LamStack, k + 2), NTok(c, root));
+        }
+    }
+}
+
+// ------------------------------------------------------------------ lambdas
+
+// A lambda against target type `target` (0 if none). inferRet: the target's result is not
+// known yet (generic inference), so the body decides it ([fn.lam.1], [fn.lam.2]).
+u32 CheckLambda(*Checker c, u32 n, u32 target, bool inferRet) {
+    Node lam = CNode(c, n);
+    u32 count = ListCount(c, lam.A);
+    bool has = target != 0 && TyKind(c, target) == TYK_FN;
+    Type tt = TypeGet(c, target);
+    if (target != 0 && !has) LambdaMismatch(c, n, target, count);
+    if (has && tt.NArgs != count) LambdaMismatch(c, n, target, count);
+    u32 pl = EnvNew(c, count);
+    u32 ml = EnvNew(c, count);
+    u32 p = lam.A;
+    for (u32 i = 0; i < count; i++) {
+        Node pn = CNode(c, p);
+        u32 pt = 0;
+        u32 mode = pn.Flags & (NF_IN | NF_REF);
+        if (pn.A != 0) pt = ResolveType(c, pn.A, false);
+        if (has) {
+            u32 tpt = EnvGet(c, tt.Args, i);
+            u32 tm = EnvGet(c, tt.Sym, i);
+            if (pt == 0) pt = tpt;
+            else if (pt != tpt) Mismatch(c, tpt, NTok(c, pn.A), pt);
+            if (mode == 0) mode = tm;
+            else if (mode != tm) CFail(c, pn.Tok, E_MISMATCH, "mismatched types: this parameter's mode differs from the target's");
+        }
+        if (pt == 0) CFailName(c, pn.Tok, E_LAMBDA_INFER, "cannot infer the type of lambda parameter `", pn.Tok, "`; write its type");
+        EnvSet(c, pl, i, pt);
+        EnvSet(c, ml, i, mode);
+        SetNType(c, p, pt);
+        p = pn.Next;
+    }
+    u32 ret = T_INFER;
+    if (has && !inferRet) ret = tt.Elem;
+    // the body is a function of its own, inside the enclosing one's scope
+    u32 sRet;
+    bool sTop;
+    usize sUnsafe;
+    usize sLoops;
+    bool sBrk;
+    usize sLSP;
+    unsafe {
+        sRet = c.Ret;
+        sTop = c.Top;
+        sUnsafe = c.Unsafe;
+        sLoops = c.Loops;
+        sBrk = c.Brk;
+        sLSP = c.LSP;
+        MemStoreU32(VecPush(&c.LamStack), n);
+        MemStoreU32(VecPush(&c.LamStack), c.LSP as u32);
+        MemStoreU32(VecPush(&c.LamStack), 0);
+        c.Ret = ret;
+        c.Top = false;
+        c.Unsafe = 0;
+        c.Loops = 0;
+    }
+    p = lam.A;
+    for (u32 i = 0; i < count; i++) {
+        u32 local = LocalPush(c, p, EnvGet(c, pl, i));
+        SetNSym(c, p, local);
+        u32 mode = EnvGet(c, ml, i);
+        unsafe {
+            if (mode == NF_IN) SymPtr(c, local).Flags = SF_BYREF | SF_READONLY;
+            if (mode == NF_REF) SymPtr(c, local).Flags = SF_BYREF;
+        }
+        p = CNode(c, p).Next;
+    }
+    bool terminates = false;
+    u32 body = lam.B;
+    if (NKind(c, body) == NK_BLOCK) {
+        terminates = CheckStmt(c, body);
+    } else if (ret == T_INFER) {
+        if (NKind(c, body) == NK_CALL) unsafe { c.Ret = CheckExpr(c, body, 0); }
+        else unsafe { c.Ret = CheckValue(c, body, 0); }
+        terminates = true;
+    } else if (ret == T_VOID) {
+        if (NKind(c, body) != NK_CALL) CError(c, E_NO_EFFECT, NTok(c, body));
+        CheckExpr(c, body, 0);
+    } else {
+        ExpectType(c, body, ret);
+        terminates = true;
+    }
+    u32 mutTok;
+    unsafe {
+        ret = c.Ret;
+        if (ret == T_INFER) ret = T_VOID;
+        usize top = VecLen(&c.LamStack) - 3;
+        mutTok = MemLoadU32(VecAt(&c.LamStack, top + 2));
+        VecTruncate(&c.LamStack, top);
+        c.Ret = sRet;
+        c.Top = sTop;
+        c.Unsafe = sUnsafe;
+        c.Loops = sLoops;
+        c.Brk = sBrk;
+        c.LSP = sLSP;
+    }
+    if (ret != T_VOID && !terminates) CError(c, E_MISSING_RETURN, lam.Tok);
+    TakeCaptures(c, n);
+    u32 kind = FK_FN;
+    if (mutTok != 0) kind = FK_MUT;
+    if (has) {
+        if (kind > tt.Count) CFailName(c, mutTok, E_LAMBDA_KIND, "this lambda changes `", mutTok, "`, but the target is a `fn`");
+        kind = tt.Count;
+    }
+    u32 lt = FnTypeOf(c, kind, pl, ml, count, ret);
+    if (!CCore(c)) {
+        SetNType(c, n, lt);
+        OriginCheckLambda(c, n);
+    }
+    return lt;
+}
+
+// Moves lambda n's captures from Checker.CapTmp to Checker.Captures; the lambda's NValue
+// is first | count << 32.
+void TakeCaptures(*Checker c, u32 n) {
+    unsafe {
+        u32 first = VecLen(&c.Captures) as u32;
+        usize keep = 0;
+        for (usize i = 0; i < VecLen(&c.CapTmp); i += 2) {
+            u32 lam = MemLoadU32(VecAt(&c.CapTmp, i));
+            u32 s = MemLoadU32(VecAt(&c.CapTmp, i + 1));
+            if (lam == n) {
+                MemStoreU32(VecPush(&c.Captures), s);
+            } else {
+                MemStoreU32(VecAt(&c.CapTmp, keep), lam);
+                MemStoreU32(VecAt(&c.CapTmp, keep + 1), s);
+                keep += 2;
+            }
+        }
+        VecTruncate(&c.CapTmp, keep);
+        u32 count = VecLen(&c.Captures) as u32 - first;
+        SetNValue(c, n, first as u64 | (count as u64) << 32);
+    }
+}
+
+void LambdaMismatch(*Checker c, u32 n, u32 target, u32 count) {
+    Buf b = BufNew(64);
+    unsafe {
+        BufStr(&b, "mismatched types: expected `");
+        BufType(&b, c, target);
+        BufStr(&b, "`, found a lambda with ");
+        BufU64(&b, count as u64);
+        BufStr(&b, " parameter");
+        if (count != 1) BufByte(&b, 's');
+        CFail(c, NTok(c, n), E_MISMATCH, BufView(&b));
+    }
+}
+
+u32 CaptureAt(*Checker c, u32 i) {
+    unsafe { return MemLoadU32(VecAt(&c.Captures, i as usize)); }
+}
+
+// Marks a lambda argument for a function-typed parameter: it borrows its captures
+// ([fn.pos.1]) unless written `move`.
+void MarkParamLambda(*Checker c, u32 a, u32 pt) {
+    if (NKind(c, a) == NK_LAMBDA && TyKind(c, pt) == TYK_FN) SetNSym(c, a, 1);
+}
+
+// ------------------------------------------------------------------ calls and values
+
+// A call through a function value ([fn.type.3]): callee is any expression of function type.
+u32 CheckIndirectCall(*Checker c, u32 n, u32 callee) {
+    Node node = CNode(c, n);
+    u32 ft = NType(c, callee);
+    if (ft == 0) ft = CheckValue(c, callee, 0);
+    Type f = TypeGet(c, ft);
+    if (f.Kind != TYK_FN) CError(c, E_NOT_CALLABLE, node.Tok);
+    if (f.Count != FK_FN) {
+        // a `mut fn` (or `once fn`) needs owned or exclusive access
+        u32 root = PlaceRoot(c, callee);
+        if (root != 0 && NSym(c, root) != 0 && SymGet(c, NSym(c, root)).Flags & SF_READONLY != 0) {
+            CFailName(c, NTok(c, root), E_MUT_FN_SHARED, "`", NTok(c, root), "` is a `mut fn`, so calling it needs `ref` or owned access, not a shared borrow");
+        }
+        MarkMutation(c, callee);
+    }
+    u32 count = ListCount(c, node.B);
+    if (count != f.NArgs) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "wrong number of arguments: expected ");
+            BufU64(&b, f.NArgs as u64);
+            BufStr(&b, ", found ");
+            BufU64(&b, count as u64);
+            CFail(c, node.Tok, E_ARG_COUNT, BufView(&b));
+        }
+    }
+    u32 a = node.B;
+    for (u32 i = 0; i < count; i++) {
+        u32 pt = EnvGet(c, f.Args, i);
+        MarkParamLambda(c, a, pt);
+        ExpectType(c, a, pt);
+        CheckArgMode(c, a, EnvGet(c, f.Sym, i) == NF_REF);
+        a = CNode(c, a).Next;
+    }
+    SetNSym(c, n, 0);
+    return f.Elem;
+}
+
+// [own.mode.1] `ref` is written at the call, on a mutable place; `in` borrows implicitly.
+void CheckArgMode(*Checker c, u32 a, bool refParam) {
+    bool refArg = CNode(c, a).Flags & NF_REF != 0;
+    if (refParam) {
+        if (!refArg) CFail(c, NTok(c, a), E_ARG_MODE, "this parameter is `ref`; write `ref` before the argument");
+        if (!IsMutable(c, a)) CError(c, E_NOT_ASSIGNABLE, NTok(c, a));
+        MarkMutation(c, a);
+    } else if (refArg) {
+        CFail(c, NTok(c, a), E_ARG_MODE, "only `ref` parameters take `ref` arguments");
+    }
+}
+
+// A named function used as a value ([fn.type.1]): its function type, kind `fn`.
+u32 FnItemType(*Checker c, u32 s, u32 tok) {
+    Sym sym = SymGet(c, s);
+    if (sym.Flags & (SF_METHOD | SF_GENERIC) != 0) CNotCore(c, "generic functions and methods as values; wrap the call in a lambda", tok);
+    u32 p = EnvNew(c, sym.Aux);
+    u32 m = EnvNew(c, sym.Aux);
+    u32 pn = FirstParam(c, s);
+    for (u32 i = 0; i < sym.Aux; i++) {
+        EnvSet(c, p, i, ParamType(c, s, i));
+        EnvSet(c, m, i, CNode(c, pn).Flags & (NF_IN | NF_REF));
+        pn = CNode(c, pn).Next;
+    }
+    return FnTypeOf(c, FK_FN, p, m, sym.Aux, sym.Type);
+}

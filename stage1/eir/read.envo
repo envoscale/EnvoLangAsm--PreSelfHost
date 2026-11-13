@@ -1,0 +1,961 @@
+// The EIR text reader (eir.md section 3). Newlines are whitespace: every instruction's
+// shape fixes its operands, so lines need not be tracked. `;` starts a comment.
+
+const u8 XT_EOF = 0;
+const u8 XT_WORD = 1;       // keywords, opcodes, primitive types: [A-Za-z_][A-Za-z0-9_.]*
+const u8 XT_VALUE = 2;      // %name
+const u8 XT_GLOBAL = 3;     // @name
+const u8 XT_BLOCK = 4;      // ^name
+const u8 XT_TYPE = 5;       // $Name
+const u8 XT_INT = 6;        // -?digits, 0x…, 0f… (float bits)
+const u8 XT_STRING = 7;     // "…"
+const u8 XT_PUNCT = 8;      // : , ( ) [ ] { } = ->
+
+struct XTok {
+    u8 Kind;
+    u32 Start;
+    u32 Len;
+}
+
+struct Reader {
+    u32 File;
+    str Src;
+    Vec Toks;       // XTok
+    usize Pos;
+    *Module M;
+    Map Values;     // per function: value name -> id
+    Map Blocks;     // per function: block name -> id
+    u32 Func;
+    u32 Block;
+}
+
+// ------------------------------------------------------------------ tokens
+
+bool XIsNameChar(u8 c) {
+    return IsIdentCont(c) || c == '.';
+}
+
+void XFail(*Reader r, usize off, u32 code, str msg) {
+    unsafe { Fail(r.File, off, code, msg); }
+}
+
+void XTokenize(*Reader r) {
+    str s;
+    unsafe { s = r.Src; }
+    usize i = 0;
+    while (true) {
+        while (i < s.Len) {
+            u8 c = s[i];
+            if (c == ' ' || c == 9 || c == 10 || c == 13) {
+                i++;
+            } else if (c == ';') {
+                while (i < s.Len && s[i] != 10) i++;
+            } else {
+                break;
+            }
+        }
+        XTok t;
+        t.Start = i as u32;
+        if (i >= s.Len) {
+            t.Kind = XT_EOF;
+            unsafe { *(VecPush(&r.Toks) as *XTok) = t; }
+            return;
+        }
+        u8 c = s[i];
+        usize j = i + 1;
+        if (IsLetter(c) || c == '_') {
+            t.Kind = XT_WORD;
+            while (j < s.Len && XIsNameChar(s[j])) j++;
+        } else if (c == '%' || c == '@' || c == '^' || c == '$') {
+            if (c == '%') t.Kind = XT_VALUE;
+            if (c == '@') t.Kind = XT_GLOBAL;
+            if (c == '^') t.Kind = XT_BLOCK;
+            if (c == '$') t.Kind = XT_TYPE;
+            while (j < s.Len && XIsNameChar(s[j])) j++;
+            if (j == i + 1) XFail(r, i, 601, "EIR syntax: expected a name after the sigil");
+        } else if ((c >= '0' && c <= '9') || (c == '-' && i + 1 < s.Len && s[i + 1] >= '0' && s[i + 1] <= '9')) {
+            t.Kind = XT_INT;
+            while (j < s.Len && IsIdentCont(s[j])) j++;
+        } else if (c == '"') {
+            t.Kind = XT_STRING;
+            while (j < s.Len && s[j] != '"') {
+                if (s[j] == 0x5C) j++;
+                if (s[j] == 10) XFail(r, i, 601, "EIR syntax: unterminated string");
+                j++;
+            }
+            if (j >= s.Len) XFail(r, i, 601, "EIR syntax: unterminated string");
+            j++;
+        } else if (c == '-' && i + 1 < s.Len && s[i + 1] == '>') {
+            t.Kind = XT_PUNCT;
+            j = i + 2;
+        } else if (c == ':' || c == ',' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' ||
+            c == '}' || c == '=') {
+            t.Kind = XT_PUNCT;
+        } else {
+            XFail(r, i, 601, "EIR syntax: unexpected character");
+        }
+        t.Len = (j - i) as u32;
+        unsafe { *(VecPush(&r.Toks) as *XTok) = t; }
+        i = j;
+    }
+}
+
+XTok XCur(*Reader r) {
+    unsafe { return *(VecAt(&r.Toks, r.Pos) as *XTok); }
+}
+
+XTok XAt(*Reader r, usize k) {
+    unsafe {
+        usize i = r.Pos + k;
+        if (i >= VecLen(&r.Toks)) i = VecLen(&r.Toks) - 1;
+        return *(VecAt(&r.Toks, i) as *XTok);
+    }
+}
+
+str XText(*Reader r, XTok t) {
+    unsafe { return StrSub(r.Src, t.Start as usize, (t.Start + t.Len) as usize); }
+}
+
+// The name after a sigil.
+str XName(*Reader r, XTok t) {
+    unsafe { return StrSub(r.Src, (t.Start + 1) as usize, (t.Start + t.Len) as usize); }
+}
+
+XTok XNext(*Reader r) {
+    XTok t = XCur(r);
+    unsafe {
+        if (t.Kind != XT_EOF) r.Pos++;
+    }
+    return t;
+}
+
+usize XOff(*Reader r) {
+    return XCur(r).Start as usize;
+}
+
+void XExpected(*Reader r, str what) {
+    Buf b = BufNew(64);
+    XTok t = XCur(r);
+    unsafe {
+        BufStr(&b, "EIR syntax: expected ");
+        BufStr(&b, what);
+        BufStr(&b, ", found ");
+        if (t.Kind == XT_EOF) BufStr(&b, "end of file");
+        else {
+            BufByte(&b, '`');
+            BufStr(&b, XText(r, t));
+            BufByte(&b, '`');
+        }
+        XFail(r, t.Start as usize, 601, BufView(&b));
+    }
+}
+
+bool XIsPunct(*Reader r, str p) {
+    XTok t = XCur(r);
+    return t.Kind == XT_PUNCT && StrEq(XText(r, t), p);
+}
+
+bool XIsWord(*Reader r, str w) {
+    XTok t = XCur(r);
+    return t.Kind == XT_WORD && StrEq(XText(r, t), w);
+}
+
+void XPunct(*Reader r, str p) {
+    if (!XIsPunct(r, p)) {
+        Buf b = BufNew(8);
+        unsafe {
+            BufByte(&b, '`');
+            BufStr(&b, p);
+            BufByte(&b, '`');
+            XExpected(r, BufCopy(&b));
+        }
+    }
+    XNext(r);
+}
+
+bool XAcceptPunct(*Reader r, str p) {
+    if (!XIsPunct(r, p)) return false;
+    XNext(r);
+    return true;
+}
+
+void XWord(*Reader r, str w) {
+    if (!XIsWord(r, w)) {
+        Buf b = BufNew(16);
+        unsafe {
+            BufByte(&b, '`');
+            BufStr(&b, w);
+            BufByte(&b, '`');
+            XExpected(r, BufCopy(&b));
+        }
+    }
+    XNext(r);
+}
+
+// An integer token: decimal (optionally negative) or 0x hex, as a 64-bit pattern;
+// 0f… is a float bit pattern in hex.
+u64 XInt(*Reader r) {
+    XTok t = XCur(r);
+    if (t.Kind != XT_INT) XExpected(r, "an integer");
+    XNext(r);
+    str s = XText(r, t);
+    bool negative = false;
+    usize i = 0;
+    if (s[0] == '-') {
+        negative = true;
+        i = 1;
+    }
+    u64 radix = 10;
+    if (s.Len >= i + 2 && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'f')) {
+        radix = 16;
+        i += 2;
+    }
+    u64 v = 0;
+    if (i >= s.Len) XFail(r, t.Start as usize, 601, "EIR syntax: malformed integer");
+    while (i < s.Len) {
+        u64 d = DigitValue(s[i]) as u64;
+        if (d >= radix || v > (18446744073709551615 - d) / radix) XFail(r, t.Start as usize, 601, "EIR syntax: malformed integer");
+        v = v * radix + d;
+        i++;
+    }
+    if (negative) v = 0 -% v;
+    return v;
+}
+
+// A string token's bytes, with the escapes of chapter 1 (\n \r \t \0 \\ \" \' \xHH).
+str XString(*Reader r) {
+    XTok t = XCur(r);
+    if (t.Kind != XT_STRING) XExpected(r, "a string");
+    XNext(r);
+    str s = XText(r, t);
+    Buf b = BufNew(s.Len);
+    usize i = 1;
+    unsafe {
+        while (i + 1 < s.Len) {
+            u8 c = s[i];
+            if (c == 0x5C) {
+                u8 e = s[i + 1];
+                i += 2;
+                if (e == 'n') BufByte(&b, 10);
+                else if (e == 'r') BufByte(&b, 13);
+                else if (e == 't') BufByte(&b, 9);
+                else if (e == '0') BufByte(&b, 0);
+                else if (e == 'x') {
+                    if (i + 1 >= s.Len) XFail(r, t.Start as usize, 601, "EIR syntax: malformed escape");
+                    BufByte(&b, (DigitValue(s[i]) * 16 + DigitValue(s[i + 1])) as u8);
+                    i += 2;
+                } else BufByte(&b, e);
+            } else {
+                BufByte(&b, c);
+                i++;
+            }
+        }
+        return BufCopy(&b);
+    }
+}
+
+// ------------------------------------------------------------------ types
+
+u32 XType(*Reader r) {
+    XTok t = XCur(r);
+    *Module m;
+    unsafe { m = r.M; }
+    if (t.Kind == XT_TYPE) {
+        XNext(r);
+        return EStructType(m, XName(r, t));
+    }
+    if (XAcceptPunct(r, "[")) {
+        u64 n = XInt(r);
+        XWord(r, "x");
+        u32 elem = XType(r);
+        XPunct(r, "]");
+        return EArrayType(m, elem, n as u32);
+    }
+    if (t.Kind == XT_WORD) {
+        str w = XText(r, t);
+        for (u32 k = ET_VOID; k <= ET_PTR; k++) {
+            if (StrEq(ETyGet(m, k).Name, w)) {
+                XNext(r);
+                return k;
+            }
+        }
+    }
+    XExpected(r, "a type");
+    return 0;
+}
+
+// ------------------------------------------------------------------ module
+
+void ReadModule(*Reader r) {
+    *Module m;
+    unsafe { m = r.M; }
+    XWord(r, "eir");
+    usize vpos = XOff(r);
+    u64 version = XInt(r);
+    if (version != 1) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "unsupported EIR version ");
+            BufU64(&b, version);
+            BufStr(&b, " (this reader knows version 1)");
+            XFail(r, vpos, 602, BufView(&b));
+        }
+    }
+    XWord(r, "target");
+    unsafe { m.Target = XString(r); }
+    while (XCur(r).Kind != XT_EOF) {
+        if (XIsWord(r, "type")) ReadTypeDecl(r);
+        else if (XIsWord(r, "global")) ReadGlobal(r);
+        else if (XIsWord(r, "func") || XIsWord(r, "extern")) ReadFunc(r);
+        else XExpected(r, "`type`, `global`, `func` or `extern`");
+    }
+}
+
+void ReadTypeDecl(*Reader r) {
+    *Module m;
+    unsafe { m = r.M; }
+    XNext(r);
+    XTok nameTok = XCur(r);
+    if (nameTok.Kind != XT_TYPE) XExpected(r, "a struct name");
+    XNext(r);
+    u32 t = EStructType(m, XName(r, nameTok));
+    if (ETyGet(m, t).Defined) XFail(r, nameTok.Start as usize, 604, "type defined twice");
+    XPunct(r, "=");
+    bool packed = false;
+    if (XIsWord(r, "packed")) {
+        XNext(r);
+        packed = true;
+    }
+    XPunct(r, "{");
+    Vec fields = VecNew(4, 8);
+    unsafe {
+        while (!XIsPunct(r, "}")) {
+            MemStoreU32(VecPush(&fields), XType(r));
+            if (!XAcceptPunct(r, ",")) break;
+        }
+        XPunct(r, "}");
+        u32 first = ECount(&m.Fields);
+        for (usize i = 0; i < VecLen(&fields); i++) MemStoreU32(VecPush(&m.Fields), MemLoadU32(VecAt(&fields, i)));
+        *ETy ty = ETyPtr(m, t);
+        ty.Fields = first;
+        ty.NFields = VecLen(&fields) as u32;
+        ty.Packed = packed;
+        ty.Defined = true;
+    }
+}
+
+void DefineName(*Reader r, str name, u64 kind, u32 index, usize pos) {
+    unsafe {
+        if (MapHas(&r.M.Names, name)) XFail(r, pos, 604, "name defined twice");
+        MapPut(&r.M.Names, name, (kind << 32) | index as u64);
+    }
+}
+
+void ReadGlobal(*Reader r) {
+    *Module m;
+    unsafe { m = r.M; }
+    XNext(r);
+    XTok nameTok = XCur(r);
+    if (nameTok.Kind != XT_GLOBAL) XExpected(r, "a global name");
+    XNext(r);
+    XPunct(r, ":");
+    u32 t = XType(r);
+    bool ro = false;
+    if (XIsWord(r, "readonly")) {
+        XNext(r);
+        ro = true;
+    }
+    XPunct(r, "=");
+    u32 init = ReadInit(r);
+    unsafe {
+        u32 g = ECount(&m.Globals);
+        *EGlobal gl = VecPush(&m.Globals) as *EGlobal;
+        gl.Name = XName(r, nameTok);
+        gl.Type = t;
+        gl.ReadOnly = ro;
+        gl.Init = init;
+        gl.Pos = nameTok.Start;
+        DefineName(r, gl.Name, NAME_GLOBAL, g, nameTok.Start as usize);
+    }
+}
+
+u32 ReadInit(*Reader r) {
+    *Module m;
+    unsafe { m = r.M; }
+    EInit init;
+    if (XIsWord(r, "zero")) {
+        XNext(r);
+        init.Kind = EI_ZERO;
+    } else if (XIsWord(r, "bytes")) {
+        XNext(r);
+        init.Kind = EI_BYTES;
+        init.Bytes = XString(r);
+    } else if (XCur(r).Kind == XT_INT) {
+        init.Kind = EI_INT;
+        init.Int = XInt(r);
+    } else if (XCur(r).Kind == XT_GLOBAL) {
+        init.Kind = EI_ADDR;
+        init.Bytes = XName(r, XNext(r));
+    } else if (XAcceptPunct(r, "{")) {
+        init.Kind = EI_LIST;
+        u32 prev = 0;
+        while (!XIsPunct(r, "}")) {
+            u32 e = ReadInit(r);
+            unsafe {
+                if (prev == 0) {
+                    init.First = e;
+                } else {
+                    *EInit pi = VecAt(&m.Inits, prev as usize) as *EInit;
+                    pi.Next = e;
+                }
+            }
+            prev = e;
+            if (!XAcceptPunct(r, ",")) break;
+        }
+        XPunct(r, "}");
+    } else {
+        XExpected(r, "an initializer");
+    }
+    unsafe {
+        u32 i = ECount(&m.Inits);
+        *(VecPush(&m.Inits) as *EInit) = init;
+        return i;
+    }
+}
+
+// ------------------------------------------------------------------ functions
+
+// A new value of type t defined in block b (inst 0 for a parameter).
+u32 NewValue(*Module m, u32 t, u32 b, u32 inst) {
+    unsafe {
+        u32 v = ECount(&m.Vals);
+        *EVal val = VecPush(&m.Vals) as *EVal;
+        val.Type = t;
+        val.Block = b;
+        val.Inst = inst;
+        return v;
+    }
+}
+
+// The value named by the current %token, created on first use (a forward reference).
+u32 ReadValueRef(*Reader r) {
+    XTok t = XCur(r);
+    if (t.Kind != XT_VALUE) XExpected(r, "a value");
+    XNext(r);
+    str name = XName(r, t);
+    u64 v;
+    unsafe {
+        if (MapGet(&r.Values, name, &v)) return v as u32;
+        u32 id = NewValue(r.M, 0, 0, 0);
+        *EVal fresh = VecAt(&r.M.Vals, id as usize) as *EVal;
+        fresh.Pos = t.Start;        // in case it is never defined
+        MapPut(&r.Values, name, id as u64);
+        return id;
+    }
+}
+
+// Defines value %name (a parameter or a result) with type t in block b.
+u32 DefineValue(*Reader r, XTok t, u32 type, u32 b, u32 inst) {
+    str name = XName(r, t);
+    u64 found;
+    unsafe {
+        if (MapGet(&r.Values, name, &found)) {
+            EVal old = EValGet(r.M, found as u32);
+            if (old.Block != 0) XFail(r, t.Start as usize, 604, "value defined twice");
+            *EVal val = VecAt(&r.M.Vals, found as usize) as *EVal;
+            val.Type = type;
+            val.Block = b;
+            val.Inst = inst;
+            return found as u32;
+        }
+        u32 v = NewValue(r.M, type, b, inst);
+        *EVal val = VecAt(&r.M.Vals, v as usize) as *EVal;
+        val.Pos = t.Start;
+        MapPut(&r.Values, name, v as u64);
+        return v;
+    }
+}
+
+// The block named by the current ^token (blocks are known from the pre-scan).
+u32 ReadBlockRef(*Reader r) {
+    XTok t = XCur(r);
+    if (t.Kind != XT_BLOCK) XExpected(r, "a block");
+    XNext(r);
+    u64 b;
+    unsafe {
+        if (!MapGet(&r.Blocks, XName(r, t), &b)) XFail(r, t.Start as usize, 603, "unknown block");
+    }
+    return b as u32;
+}
+
+void ReadFunc(*Reader r) {
+    *Module m;
+    unsafe { m = r.M; }
+    bool ext = XIsWord(r, "extern");
+    XNext(r);
+    XTok nameTok = XCur(r);
+    if (nameTok.Kind != XT_GLOBAL) XExpected(r, "a function name");
+    XNext(r);
+    u32 f;
+    unsafe {
+        f = ECount(&m.Funcs);
+        VecPush(&m.Funcs);
+        r.Func = f;
+        r.Values = MapNew(64);
+        r.Blocks = MapNew(16);
+        DefineName(r, XName(r, nameTok), NAME_FUNC, f, nameTok.Start as usize);
+    }
+    u32 firstValue;
+    u32 firstBlock;
+    unsafe {
+        firstValue = ECount(&m.Vals);
+        firstBlock = ECount(&m.Blocks);
+    }
+    // The entry block exists for definitions (its parameters are the function's).
+    if (!ext) {
+        unsafe {
+            *EBlock eb = VecPush(&m.Blocks) as *EBlock;
+            eb.Func = f;
+        }
+    }
+    u32 entry = 0;
+    if (!ext) entry = firstBlock;
+    XPunct(r, "(");
+    u32 nparams = 0;
+    while (!XIsPunct(r, ")")) {
+        XTok pt = XCur(r);
+        if (pt.Kind != XT_VALUE) XExpected(r, "a parameter");
+        XNext(r);
+        XPunct(r, ":");
+        u32 type = XType(r);
+        DefineValue(r, pt, type, entry, 0);
+        nparams++;
+        if (!XAcceptPunct(r, ",")) break;
+    }
+    XPunct(r, ")");
+    XPunct(r, "->");
+    u32 ret = XType(r);
+    str abi = "";
+    if (XIsWord(r, "abi")) {
+        XNext(r);
+        abi = XString(r);
+    }
+    unsafe {
+        *EFunc fn = EFuncPtr(m, f);
+        fn.Name = XName(r, nameTok);
+        fn.Extern = ext;
+        fn.Abi = abi;
+        fn.Ret = ret;
+        fn.NParams = nparams;
+        fn.FirstValue = firstValue;
+        fn.FirstBlock = firstBlock;
+        fn.Pos = nameTok.Start;
+    }
+    if (!ext) {
+        if (!XIsPunct(r, "{")) XExpected(r, "`{`");
+        PrescanBlocks(r, firstBlock, f);
+        XPunct(r, "{");
+        u32 b = firstBlock;
+        bool first = true;
+        while (!XIsPunct(r, "}")) {
+            if (XCur(r).Kind == XT_EOF) XExpected(r, "`}`");
+            b = ReadBlock(r, first);
+            first = false;
+        }
+        XPunct(r, "}");
+        if (first) XFail(r, nameTok.Start as usize, 606, "a function needs at least one block");
+    }
+    unsafe {
+        *EFunc fn = EFuncPtr(m, f);
+        fn.NBlocks = ECount(&m.Blocks) - firstBlock;
+        fn.NValues = ECount(&m.Vals) - firstValue;
+        // every value used must be defined
+        if (!ext) {
+            for (u32 v = firstValue; v < firstValue + fn.NValues; v++) {
+                EVal val = EValGet(m, v);
+                if (val.Block == 0) XFail(r, val.Pos as usize, 603, "unknown value");
+            }
+        }
+    }
+}
+
+// Finds the function body's block labels, `^name:` or `^name(…):`, so blocks get ids in
+// the order they are written and branches can refer forward.
+void PrescanBlocks(*Reader r, u32 firstBlock, u32 f) {
+    usize save;
+    unsafe { save = r.Pos; }
+    XNext(r);      // {
+    usize depth = 1;
+    bool first = true;
+    while (depth > 0) {
+        XTok t = XCur(r);
+        if (t.Kind == XT_EOF) break;
+        if (t.Kind == XT_PUNCT && (StrEq(XText(r, t), "{") || StrEq(XText(r, t), "["))) depth++;
+        if (t.Kind == XT_PUNCT && (StrEq(XText(r, t), "}") || StrEq(XText(r, t), "]"))) depth--;
+        if (t.Kind == XT_BLOCK) {
+            usize k = 1;
+            XTok after = XAt(r, 1);
+            if (after.Kind == XT_PUNCT && StrEq(XText(r, after), "(")) {
+                while (true) {
+                    XTok a = XAt(r, k);
+                    if (a.Kind == XT_EOF) break;
+                    if (a.Kind == XT_PUNCT && StrEq(XText(r, a), ")")) break;
+                    k++;
+                }
+                k++;
+            }
+            XTok colon = XAt(r, k);
+            if (colon.Kind == XT_PUNCT && StrEq(XText(r, colon), ":")) {
+                unsafe {
+                    str name = XName(r, t);
+                    if (MapHas(&r.Blocks, name)) XFail(r, t.Start as usize, 604, "block defined twice");
+                    u32 b = firstBlock;
+                    if (!first) {
+                        b = ECount(&r.M.Blocks);
+                        *EBlock nb = VecPush(&r.M.Blocks) as *EBlock;
+                        nb.Func = f;
+                    }
+                    first = false;
+                    MapPut(&r.Blocks, name, b as u64);
+                }
+            }
+        }
+        XNext(r);
+    }
+    unsafe { r.Pos = save; }
+}
+
+// One block: label, optional parameters, instructions. Returns its id.
+u32 ReadBlock(*Reader r, bool entry) {
+    *Module m;
+    unsafe { m = r.M; }
+    XTok label = XCur(r);
+    u32 b = ReadBlockRef(r);
+    unsafe {
+        r.Block = b;
+        EBlockPtr(m, b).Pos = label.Start;
+        EBlockPtr(m, b).FirstParam = ECount(&m.Vals);
+    }
+    u32 nparams = 0;
+    if (XAcceptPunct(r, "(")) {
+        if (entry) XFail(r, label.Start as usize, 601, "EIR syntax: the entry block's parameters are the function's");
+        while (!XIsPunct(r, ")")) {
+            XTok pt = XCur(r);
+            if (pt.Kind != XT_VALUE) XExpected(r, "a parameter");
+            XNext(r);
+            XPunct(r, ":");
+            u32 type = XType(r);
+            u32 v = DefineValue(r, pt, type, b, 0);
+            unsafe {
+                // block parameters must be the block's consecutive values
+                if (v != EBlockGet(m, b).FirstParam + nparams) XFail(r, pt.Start as usize, 604, "block parameter already used as a value elsewhere");
+            }
+            nparams++;
+            if (!XAcceptPunct(r, ",")) break;
+        }
+        XPunct(r, ")");
+    }
+    XPunct(r, ":");
+    unsafe {
+        *EBlock blk = EBlockPtr(m, b);
+        blk.NParams = nparams;
+        if (entry) {
+            blk.FirstParam = EFuncGet(m, r.Func).FirstValue;
+            blk.NParams = EFuncGet(m, r.Func).NParams;
+        }
+        blk.FirstInst = ECount(&m.Insts);
+    }
+    while (true) {
+        XTok t = XCur(r);
+        if (t.Kind == XT_EOF) break;
+        if (t.Kind == XT_PUNCT && StrEq(XText(r, t), "}")) break;
+        if (t.Kind == XT_BLOCK) break;
+        ReadInst(r);
+    }
+    unsafe { EBlockPtr(m, b).NInsts = ECount(&m.Insts) - EBlockGet(m, b).FirstInst; }
+    return b;
+}
+
+u32 PushOp(*Module m, EOp op) {
+    unsafe {
+        u32 i = ECount(&m.Ops);
+        *(VecPush(&m.Ops) as *EOp) = op;
+        return i;
+    }
+}
+
+void OpValue(*Reader r) {
+    EOp op;
+    op.Kind = OK_VALUE;
+    op.Pos = XCur(r).Start;
+    op.Ref = ReadValueRef(r);
+    unsafe { PushOp(r.M, op); }
+}
+
+// A value or an integer constant (the size operand of copy and zero).
+void OpValueOrInt(*Reader r) {
+    if (XCur(r).Kind == XT_INT) {
+        EOp op;
+        op.Kind = OK_INT;
+        op.Pos = XCur(r).Start;
+        op.Int = XInt(r);
+        unsafe { PushOp(r.M, op); }
+        return;
+    }
+    OpValue(r);
+}
+
+// ^block or ^block(args)
+void OpTarget(*Reader r) {
+    EOp op;
+    op.Kind = OK_TARGET;
+    op.Pos = XCur(r).Start;
+    op.Ref = ReadBlockRef(r);
+    Vec args = VecNew(4, 4);
+    if (XAcceptPunct(r, "(")) {
+        while (!XIsPunct(r, ")")) {
+            unsafe { MemStoreU32(VecPush(&args), ReadValueRef(r)); }
+            if (!XAcceptPunct(r, ",")) break;
+        }
+        XPunct(r, ")");
+    }
+    unsafe {
+        op.Args = ECount(&r.M.Args);
+        op.NArgs = VecLen(&args) as u32;
+        for (usize i = 0; i < VecLen(&args); i++) MemStoreU32(VecPush(&r.M.Args), MemLoadU32(VecAt(&args, i)));
+        PushOp(r.M, op);
+    }
+}
+
+// '(' value ( ',' value )* ')'
+void OpArgList(*Reader r) {
+    XPunct(r, "(");
+    while (!XIsPunct(r, ")")) {
+        OpValue(r);
+        if (!XAcceptPunct(r, ",")) break;
+    }
+    XPunct(r, ")");
+}
+
+void ReadInst(*Reader r) {
+    *Module m;
+    unsafe { m = r.M; }
+    XTok resultTok;
+    bool hasResult = false;
+    if (XCur(r).Kind == XT_VALUE) {
+        resultTok = XNext(r);
+        hasResult = true;
+        XPunct(r, "=");
+    }
+    XTok opTok = XCur(r);
+    if (opTok.Kind != XT_WORD) XExpected(r, "an instruction");
+    XNext(r);
+    u16 op = OpByName(XText(r, opTok));
+    if (op == 0) XFail(r, opTok.Start as usize, 614, "unknown instruction");
+    OpInfo info = OpTable(op);
+    EInst inst;
+    inst.Op = op;
+    inst.Pos = opTok.Start;
+    unsafe {
+        inst.Block = r.Block;
+        inst.FirstOp = ECount(&m.Ops);
+    }
+    u32 resultType = 0;
+    u8 sh = info.Shape;
+    if (sh == SH_CONST) {
+        inst.Ty = XType(r);
+        inst.Imm = XInt(r);
+        resultType = inst.Ty;
+    } else if (sh == SH_ADDR) {
+        EOp g;
+        g.Kind = OK_GLOBAL;
+        g.Pos = XCur(r).Start;
+        if (XCur(r).Kind != XT_GLOBAL) XExpected(r, "a global");
+        g.Str = XName(r, XNext(r));
+        unsafe { PushOp(m, g); }
+        resultType = ET_PTR;
+    } else if (sh == SH_SLOT) {
+        inst.Ty = XType(r);
+        resultType = ET_PTR;
+    } else if (sh == SH_UNARY_V) {
+        OpValue(r);
+    } else if (sh == SH_BIN || sh == SH_CMP) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+        resultType = inst.Ty;
+        if (sh == SH_CMP) resultType = ET_BOOL;
+    } else if (sh == SH_UN) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        resultType = inst.Ty;
+    } else if (sh == SH_SELECT) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+        resultType = inst.Ty;
+    } else if (sh == SH_CONV) {
+        inst.Ty = XType(r);
+        XPunct(r, "->");
+        inst.Ty2 = XType(r);
+        OpValue(r);
+        resultType = inst.Ty2;
+    } else if (sh == SH_LOAD) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        resultType = inst.Ty;
+    } else if (sh == SH_STORE) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+    } else if (sh == SH_FIELD) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        inst.Imm = XInt(r);
+        resultType = ET_PTR;
+    } else if (sh == SH_ELEM) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+        resultType = ET_PTR;
+    } else if (sh == SH_PTRADD) {
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+        resultType = ET_PTR;
+    } else if (sh == SH_VALUES) {
+        for (u8 i = 0; i < info.Operands; i++) {
+            if (i > 0) XPunct(r, ",");
+            if (i == info.Operands - 1 && (op == 47 || op == 48)) OpValueOrInt(r);
+            else OpValue(r);
+        }
+    } else if (sh == SH_BOUNDS) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        OpValue(r);
+    } else if (sh == SH_CALL) {
+        EOp g;
+        g.Kind = OK_GLOBAL;
+        g.Pos = XCur(r).Start;
+        if (XCur(r).Kind != XT_GLOBAL) XExpected(r, "a function");
+        g.Str = XName(r, XNext(r));
+        unsafe { PushOp(m, g); }
+        OpArgList(r);
+        // the result type comes from the callee, resolved after the whole module is read
+    } else if (sh == SH_CALLIND) {
+        if (XIsWord(r, "abi")) {
+            XNext(r);
+            inst.Str = XString(r);
+        }
+        inst.Ty = XType(r);
+        OpArgList(r);
+        OpValue(r);
+        resultType = inst.Ty;
+    } else if (sh == SH_INTRINSIC) {
+        XTok nameTok = XCur(r);
+        if (nameTok.Kind != XT_WORD) XExpected(r, "an intrinsic name");
+        XNext(r);
+        inst.Str = XText(r, nameTok);
+        Intrinsic x = IntrinsicNamed(inst.Str);
+        if (x.Name.Len == 0) XFail(r, nameTok.Start as usize, 614, "unknown intrinsic");
+        OpArgList(r);
+        resultType = x.Ret;
+    } else if (sh == SH_BR) {
+        OpTarget(r);
+    } else if (sh == SH_CONDBR) {
+        OpValue(r);
+        XPunct(r, ",");
+        OpTarget(r);
+        XPunct(r, ",");
+        OpTarget(r);
+    } else if (sh == SH_SWITCH) {
+        inst.Ty = XType(r);
+        OpValue(r);
+        XPunct(r, ",");
+        XPunct(r, "[");
+        while (!XIsPunct(r, "]")) {
+            EOp k;
+            k.Kind = OK_CASE;
+            k.Pos = XCur(r).Start;
+            k.Int = XInt(r);
+            unsafe { PushOp(m, k); }
+            XPunct(r, ":");
+            OpTarget(r);
+            if (!XAcceptPunct(r, ",")) break;
+        }
+        XPunct(r, "]");
+        XPunct(r, ",");
+        OpTarget(r);
+    } else if (sh == SH_RET) {
+        if (XCur(r).Kind == XT_VALUE) OpValue(r);
+    } else if (sh == SH_PANIC) {
+        usize pos = XOff(r);
+        str reason = XString(r);
+        u64 i = 0;
+        while (i < PANIC_COUNT && !StrEq(PanicReason(i), reason)) i++;
+        if (i == PANIC_COUNT) XFail(r, pos, 611, "unknown panic reason");
+        inst.Imm = i;
+    }
+    unsafe {
+        inst.NOps = ECount(&m.Ops) - inst.FirstOp;
+        u32 id = ECount(&m.Insts);
+        if (hasResult) {
+            if (resultType == ET_VOID || (resultType == 0 && sh != SH_CALL)) XFail(r, resultTok.Start as usize, 605, "this instruction has no result");
+            inst.Result = DefineValue(r, resultTok, resultType, r.Block, id);
+        }
+        *(VecPush(&m.Insts) as *EInst) = inst;
+    }
+}
+
+// After the whole module is read: callees and globals by name, and call result types.
+void ResolveNames(*Module m, u32 file) {
+    unsafe {
+        for (u32 i = 1; i < ECount(&m.Insts); i++) {
+            EInst inst = EInstGet(m, i);
+            if (inst.Op != OP_CALL && inst.Op != 2) continue;
+            EOp g = EOpGet(m, inst.FirstOp);
+            u64 named;
+            if (!MapGet(&m.Names, g.Str, &named)) Fail(file, g.Pos as usize, 603, "unknown global or function");
+            if (inst.Op == OP_CALL) {
+                if (named >> 32 != NAME_FUNC) Fail(file, g.Pos as usize, 610, "only a function can be called");
+                u32 f = (named & 0xFFFFFFFF) as u32;
+                *EOp gp = VecAt(&m.Ops, inst.FirstOp as usize) as *EOp;
+                gp.Ref = f;
+                u32 ret = EFuncGet(m, f).Ret;
+                if (inst.Result != 0) {
+                    if (ret == ET_VOID) Fail(file, inst.Pos as usize, 610, "this function returns nothing");
+                    *EVal rv = VecAt(&m.Vals, inst.Result as usize) as *EVal;
+                    rv.Type = ret;
+                }
+            } else {
+                *EOp gp = VecAt(&m.Ops, inst.FirstOp as usize) as *EOp;
+                gp.Ref = (named & 0xFFFFFFFF) as u32;
+                gp.Int = named >> 32;
+            }
+        }
+    }
+}
+
+// Reads EIR text from source file `file` into m. Stops at the first error.
+void ReadEir(u32 file, *Module m) {
+    Reader r;
+    r.File = file;
+    r.Src = SrcGet(file).Text;
+    r.Toks = VecNew(sizeof(XTok), 1024);
+    r.M = m;
+    unsafe {
+        m.Text = file;
+        m.FromText = true;
+        XTokenize(&r);
+        ReadModule(&r);
+    }
+    ResolveNames(m, file);
+}

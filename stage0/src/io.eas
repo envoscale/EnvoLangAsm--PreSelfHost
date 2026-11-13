@@ -1,0 +1,269 @@
+; =============================================================================
+; src/io.eas - buffered output, whole-file reads, and process exit
+;
+; All output goes through two buffered writers (stdout, stderr). Every way out
+; of the process goes through exit_process or fatal, which flush them first.
+;
+; A writer is 32 bytes:
+;   +0 fd, +8 buffer pointer, +16 bytes used, +24 capacity
+; =============================================================================
+
+W_FD            equ 0
+W_BUF           equ 8
+W_LEN           equ 16
+W_CAP           equ 24
+
+IO_BUF_SIZE     equ 0x10000             ; 64 KiB per writer
+MAX_SOURCE      equ 0x1000000           ; 16 MiB: Stage 0's source file size limit
+
+; io_init - allocate the writer buffers. Call once, first thing in main.
+;   clobbers: caller-saved registers
+io_init:
+        sub     rsp, 8
+        mov     edi, IO_BUF_SIZE
+        call    arena_alloc
+        mov     [w_out + W_BUF], rax
+        mov     edi, IO_BUF_SIZE
+        call    arena_alloc
+        mov     [w_err + W_BUF], rax
+        add     rsp, 8
+        ret
+
+; w_flush - write out a writer's buffer. Write errors drop the output: there is
+; nowhere better to report them.
+;   in:  rdi = writer
+;   clobbers: caller-saved registers
+w_flush:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi
+        xor     r12d, r12d              ; bytes flushed so far
+.loop:
+        mov     r13, [rbx + W_LEN]
+        cmp     r12, r13
+        jae     short .done
+        mov     rdi, [rbx + W_FD]
+        mov     rsi, [rbx + W_BUF]
+        add     rsi, r12
+        mov     rdx, r13
+        sub     rdx, r12
+        call    sys_write
+        test    rax, rax
+        jle     short .done
+        add     r12, rax
+        jmp     short .loop
+.done:
+        mov     qword [rbx + W_LEN], 0
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; w_bytes - append bytes to a writer.
+;   in:  rdi = writer, rsi = pointer, rdx = length
+;   clobbers: caller-saved registers
+w_bytes:
+        push    rbx
+        push    r12
+        push    r13
+        mov     rbx, rdi
+        mov     r12, rsi                ; source cursor
+        mov     r13, rdx                ; bytes remaining
+.loop:
+        test    r13, r13
+        jz      short .done
+        mov     rax, [rbx + W_CAP]
+        sub     rax, [rbx + W_LEN]      ; free space
+        jnz     short .copy
+        mov     rdi, rbx
+        call    w_flush
+        jmp     short .loop
+.copy:
+        cmp     rax, r13
+        cmova   rax, r13                ; copy min(free, remaining)
+        mov     rdi, [rbx + W_BUF]
+        add     rdi, [rbx + W_LEN]
+        mov     rsi, r12
+        mov     rcx, rax
+        rep movsb
+        add     [rbx + W_LEN], rax
+        add     r12, rax
+        sub     r13, rax
+        jmp     short .loop
+.done:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; w_byte - append one byte to a writer.
+;   in:  rdi = writer, sil = byte
+;   clobbers: caller-saved registers
+w_byte:
+        mov     rax, [rdi + W_LEN]
+        cmp     rax, [rdi + W_CAP]
+        jb      short .put
+        push    rdi
+        push    rsi
+        sub     rsp, 8
+        call    w_flush
+        add     rsp, 8
+        pop     rsi
+        pop     rdi
+        xor     eax, eax                ; buffer is empty after a flush
+.put:
+        mov     rdx, [rdi + W_BUF]
+        mov     [rdx + rax], sil
+        inc     rax
+        mov     [rdi + W_LEN], rax
+        ret
+
+; w_cstr - append a NUL-terminated string to a writer.
+;   in:  rdi = writer, rsi = string
+;   clobbers: caller-saved registers
+w_cstr:
+        push    rdi
+        push    rsi
+        sub     rsp, 8
+        mov     rdi, rsi
+        call    cstr_len
+        mov     rdx, rax
+        add     rsp, 8
+        pop     rsi
+        pop     rdi
+        jmp     near w_bytes
+
+; w_u64 - append an unsigned integer in decimal.
+;   in:  rdi = writer, rsi = value
+;   clobbers: caller-saved registers
+w_u64:
+        sub     rsp, 40                 ; 32-byte scratch buffer, keeps rsp aligned
+        mov     rax, rsi
+        lea     r8, [rsp + 32]          ; digits are produced backwards from here
+        mov     r9, r8
+        mov     ecx, 10
+.digit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     r8
+        mov     [r8], dl
+        test    rax, rax
+        jnz     short .digit
+        mov     rsi, r8
+        mov     rdx, r9
+        sub     rdx, r8
+        call    w_bytes
+        add     rsp, 40
+        ret
+
+; read_file - read a whole file into arena memory.
+;   in:  rdi = NUL-terminated path
+;   out: rax = buffer, rdx = length; or rax = 0 and rdx = reason
+;        (1 = cannot open, 2 = read error, 3 = larger than MAX_SOURCE)
+;   clobbers: caller-saved registers
+read_file:
+        push    rbx
+        push    r12
+        push    r13
+        xor     esi, esi                ; mode 0: read
+        call    sys_open
+        test    rax, rax
+        js      short .open_fail
+        mov     rbx, rax                ; fd
+        mov     rdi, MAX_SOURCE + 1     ; one extra byte detects "too large"
+        call    arena_alloc
+        mov     r12, rax                ; buffer
+        xor     r13d, r13d              ; bytes read
+.read:
+        mov     rdx, MAX_SOURCE + 1
+        sub     rdx, r13
+        jz      short .too_large
+        mov     rdi, rbx
+        lea     rsi, [r12 + r13]
+        call    sys_read
+        test    rax, rax
+        js      short .read_fail
+        jz      short .eof
+        add     r13, rax
+        jmp     short .read
+.eof:
+        mov     rdi, rbx
+        call    sys_close
+        mov     rax, r12
+        mov     rdx, r13
+        jmp     short .out
+.too_large:
+        mov     edx, 3
+        jmp     short .fail_close
+.read_fail:
+        mov     edx, 2
+.fail_close:
+        mov     r13, rdx                ; keep the reason across the call
+        mov     rdi, rbx
+        call    sys_close
+        mov     rdx, r13
+        xor     eax, eax
+        jmp     short .out
+.open_fail:
+        xor     eax, eax
+        mov     edx, 1
+.out:
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; exit_process - flush both writers and exit. Does not return.
+;   in:  edi = exit code
+exit_process:
+        and     rsp, -16
+        mov     ebx, edi                ; never returns, so callee-saved regs are free
+        lea     rdi, [w_out]
+        call    w_flush
+        lea     rdi, [w_err]
+        call    w_flush
+        mov     edi, ebx
+        call    sys_exit
+
+; fatal - report an internal error ("envoc0: fatal: <msg>") and exit with 70.
+; Works before io_init: it flushes only writers that have a buffer, and writes
+; the message itself directly with sys_write.
+;   in:  rdi = message, rsi = message length
+fatal:
+        and     rsp, -16
+        mov     rbx, rdi
+        mov     r12, rsi
+        cmp     qword [w_out + W_BUF], 0
+        je      short .no_out
+        lea     rdi, [w_out]
+        call    w_flush
+.no_out:
+        cmp     qword [w_err + W_BUF], 0
+        je      short .no_err
+        lea     rdi, [w_err]
+        call    w_flush
+.no_err:
+        mov     edi, 2
+        lea     rsi, [msg_fatal]
+        mov     edx, msg_fatal_len
+        call    sys_write
+        mov     edi, 2
+        mov     rsi, rbx
+        mov     rdx, r12
+        call    sys_write
+        mov     edi, 2
+        lea     rsi, [msg_newline]
+        mov     edx, 1
+        call    sys_write
+        mov     edi, 70
+        call    sys_exit
+
+msg_fatal:      db 'envoc0: fatal: '
+msg_fatal_len   equ $ - msg_fatal
+msg_newline:    db 10
+
+        align   8, db 0
+w_out:          dq 1, 0, 0, IO_BUF_SIZE
+w_err:          dq 2, 0, 0, IO_BUF_SIZE

@@ -1,0 +1,523 @@
+// Executable images (PLAN D68): code and data in separate pages, the code read and
+// execute, the data read and write (W^X), loaded at an address the system chooses (ASLR):
+// Linux programs are position-independent (ET_DYN) and relocate their few absolute
+// addresses themselves (RelocStub); Windows programs carry base relocations. Stage 0's
+// own executables keep one read-write-execute section (docs/architecture/bootstrap.md). Windows images import from
+// KERNEL32.dll and ADVAPI32.dll; the runtime and the native adapters reach import k
+// through `wincall`, where k is the import's slot in the address table: KERNEL32's
+// functions are 0-27, slot 28 ends them, ADVAPI32's SystemFunction036 (RtlGenRandom) is
+// slot 29 and slot 30 ends it, WS2_32's are slots 31-45, ended by slot 46, CRYPT32's are
+// slots 47-49, ended by slot 50, more of KERNEL32's (a second descriptor) are slots 51-60,
+// ended by 61, USER32's are slots 62-76, ended by 77, and GDI32's is slot 78, ended by 79
+// (PLAN D25, D28, D40, D41, D43, D45). Stage 2 writes the same tables.
+
+const u64 IMAGE_BASE = 0x400000;
+const u64 ELF_HEADERS = 232;        // ELF header (64) + 3 program headers (56 each)
+const u64 PE_SECTION_RVA = 0x1000;
+
+const u32 TARGET_LINUX = 1;
+const u32 TARGET_WINDOWS = 2;
+
+const u32 WIN_IMPORTS = 28;        // from KERNEL32.dll; then ADVAPI32's one, at slot 29
+const u32 WS_IMPORTS = 15;         // from WS2_32.dll, at slots 31-45
+const u32 CR_IMPORTS = 3;          // from CRYPT32.dll, at slots 47-49
+const u32 K2_IMPORTS = 10;         // from KERNEL32.dll again, at slots 51-60
+const u32 US_IMPORTS = 15;         // from USER32.dll, at slots 62-76
+const u32 GD_IMPORTS = 1;          // from GDI32.dll, at slot 78
+
+// The KERNEL32.dll functions, by wincall index.
+str WinImport(u32 k) {
+    match k {
+        0 => { return "GetStdHandle"; }
+        1 => { return "GetCommandLineW"; }
+        2 => { return "CreateFileW"; }
+        3 => { return "ReadFile"; }
+        4 => { return "WriteFile"; }
+        5 => { return "CloseHandle"; }
+        6 => { return "VirtualAlloc"; }
+        7 => { return "VirtualFree"; }
+        8 => { return "GetLastError"; }
+        9 => { return "ExitProcess"; }
+        10 => { return "MultiByteToWideChar"; }
+        11 => { return "WideCharToMultiByte"; }
+        12 => { return "GetSystemTimePreciseAsFileTime"; }
+        13 => { return "QueryPerformanceCounter"; }
+        14 => { return "QueryPerformanceFrequency"; }
+        15 => { return "DeleteFileW"; }
+        16 => { return "CreateDirectoryW"; }
+        17 => { return "RemoveDirectoryW"; }
+        18 => { return "GetFileAttributesW"; }
+        19 => { return "CreateProcessW"; }
+        20 => { return "WaitForSingleObject"; }
+        21 => { return "GetExitCodeProcess"; }
+        22 => { return "FindFirstFileW"; }
+        23 => { return "FindNextFileW"; }
+        24 => { return "FindClose"; }
+        25 => { return "SetHandleInformation"; }
+        26 => { return "GetEnvironmentVariableW"; }
+        _ => { return "GetCurrentDirectoryW"; }
+    }
+}
+
+// The WS2_32.dll functions (D40), by their index after ADVAPI32's: import slot 31 + k.
+str WsImport(u32 k) {
+    match k {
+        0 => { return "WSAStartup"; }
+        1 => { return "socket"; }
+        2 => { return "connect"; }
+        3 => { return "bind"; }
+        4 => { return "listen"; }
+        5 => { return "accept"; }
+        6 => { return "send"; }
+        7 => { return "recv"; }
+        8 => { return "closesocket"; }
+        9 => { return "getaddrinfo"; }
+        10 => { return "freeaddrinfo"; }
+        11 => { return "WSAGetLastError"; }
+        12 => { return "setsockopt"; }
+        13 => { return "shutdown"; }
+        _ => { return "getsockname"; }
+    }
+}
+
+// The CRYPT32.dll functions (D41), by their index after WS2_32's: import slot 47 + k.
+str CrImport(u32 k) {
+    match k {
+        0 => { return "CertOpenSystemStoreW"; }
+        1 => { return "CertEnumCertificatesInStore"; }
+        _ => { return "CertCloseStore"; }
+    }
+}
+
+// More KERNEL32.dll functions, in a second descriptor (D43, D45): import slot 51 + k.
+str K2Import(u32 k) {
+    match k {
+        0 => { return "GetConsoleMode"; }
+        1 => { return "SetConsoleMode"; }
+        2 => { return "GetConsoleScreenBufferInfo"; }
+        3 => { return "SetConsoleOutputCP"; }
+        4 => { return "ReadConsoleInputW"; }
+        5 => { return "GetModuleHandleW"; }
+        6 => { return "GetProcAddress"; }
+        7 => { return "LoadLibraryW"; }
+        8 => { return "PeekNamedPipe"; }
+        _ => { return "Sleep"; }
+    }
+}
+
+// The USER32.dll functions (D45): import slot 62 + k.
+str UsImport(u32 k) {
+    match k {
+        0 => { return "RegisterClassExW"; }
+        1 => { return "CreateWindowExW"; }
+        2 => { return "PeekMessageW"; }
+        3 => { return "TranslateMessage"; }
+        4 => { return "DispatchMessageW"; }
+        5 => { return "IsWindow"; }
+        6 => { return "DestroyWindow"; }
+        7 => { return "GetClientRect"; }
+        8 => { return "GetDC"; }
+        9 => { return "ReleaseDC"; }
+        10 => { return "LoadCursorW"; }
+        11 => { return "AdjustWindowRect"; }
+        12 => { return "SetWindowTextW"; }
+        13 => { return "ShowWindow"; }
+        _ => { return "SetProcessDPIAware"; }
+    }
+}
+
+// The GDI32.dll functions (D45): import slot 78 + k.
+str GdImport(u32 k) {
+    match k {
+        _ => { return "SetDIBitsToDevice"; }
+    }
+}
+
+struct WinImports {
+    u32 Dir;        // the import directory (eight descriptors, 160 bytes)
+    u32 Iat;        // the first IAT entry; entry k is 8k bytes after it
+}
+
+// The import directory, lookup and address tables, hint/name entries and DLL name, in
+// the data. Returns the labels the PE header and wincall need.
+WinImports EmitImports(*Asm a) {
+    WinImports w;
+    u32[28] names;
+    u32[15] wsNames;
+    u32[3] crNames;
+    u32[10] k2Names;
+    u32[15] usNames;
+    u32[1] gdNames;
+    u32 ilt5 = NewLabel(a);
+    u32 iat5 = NewLabel(a);
+    u32 ilt6 = NewLabel(a);
+    u32 dll6 = NewLabel(a);
+    u32 iat6 = NewLabel(a);
+    u32 ilt7 = NewLabel(a);
+    u32 dll7 = NewLabel(a);
+    u32 iat7 = NewLabel(a);
+    u32 ilt4 = NewLabel(a);
+    u32 dll4 = NewLabel(a);
+    u32 iat4 = NewLabel(a);
+    u32 ilt3 = NewLabel(a);
+    u32 dll3 = NewLabel(a);
+    u32 iat3 = NewLabel(a);
+    u32 ilt = NewLabel(a);
+    u32 dll = NewLabel(a);
+    u32 ilt2 = NewLabel(a);
+    u32 dll2 = NewLabel(a);
+    u32 iat2 = NewLabel(a);
+    u32 name2 = NewLabel(a);
+    w.Dir = NewLabel(a);
+    w.Iat = NewLabel(a);
+    for (u32 k = 0; k < WIN_IMPORTS; k++) names[k] = NewLabel(a);
+    for (u32 k = 0; k < WS_IMPORTS; k++) wsNames[k] = NewLabel(a);
+    for (u32 k = 0; k < CR_IMPORTS; k++) crNames[k] = NewLabel(a);
+    for (u32 k = 0; k < K2_IMPORTS; k++) k2Names[k] = NewLabel(a);
+    for (u32 k = 0; k < US_IMPORTS; k++) usNames[k] = NewLabel(a);
+    for (u32 k = 0; k < GD_IMPORTS; k++) gdNames[k] = NewLabel(a);
+    unsafe {
+        DataAlign(a, 8);
+        BindData(a, w.Dir);
+        DataRva(a, ilt, 4);         // OriginalFirstThunk
+        DataU32(a, 0);              // TimeDateStamp
+        DataU32(a, 0);              // ForwarderChain
+        DataRva(a, dll, 4);         // Name
+        DataRva(a, w.Iat, 4);       // FirstThunk
+        DataRva(a, ilt2, 4);        // ADVAPI32.dll
+        DataU32(a, 0);
+        DataU32(a, 0);
+        DataRva(a, dll2, 4);
+        DataRva(a, iat2, 4);
+        DataRva(a, ilt3, 4);        // WS2_32.dll
+        DataU32(a, 0);
+        DataU32(a, 0);
+        DataRva(a, dll3, 4);
+        DataRva(a, iat3, 4);
+        DataRva(a, ilt4, 4);        // CRYPT32.dll
+        DataU32(a, 0);
+        DataU32(a, 0);
+        DataRva(a, dll4, 4);
+        DataRva(a, iat4, 4);
+        DataRva(a, ilt5, 4);        // KERNEL32.dll again
+        DataU32(a, 0);
+        DataU32(a, 0);
+        DataRva(a, dll, 4);
+        DataRva(a, iat5, 4);
+        DataRva(a, ilt6, 4);        // USER32.dll
+        DataU32(a, 0);
+        DataU32(a, 0);
+        DataRva(a, dll6, 4);
+        DataRva(a, iat6, 4);
+        DataRva(a, ilt7, 4);        // GDI32.dll
+        DataU32(a, 0);
+        DataU32(a, 0);
+        DataRva(a, dll7, 4);
+        DataRva(a, iat7, 4);
+        BufRepeat(&a.Data, 0, 20);  // the null descriptor
+        DataAlign(a, 8);
+        BindData(a, ilt);
+        for (u32 k = 0; k < WIN_IMPORTS; k++) DataRva(a, names[k], 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, ilt2);
+        DataRva(a, name2, 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, ilt3);
+        for (u32 k = 0; k < WS_IMPORTS; k++) DataRva(a, wsNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, ilt4);
+        for (u32 k = 0; k < CR_IMPORTS; k++) DataRva(a, crNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, ilt5);
+        for (u32 k = 0; k < K2_IMPORTS; k++) DataRva(a, k2Names[k], 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, ilt6);
+        for (u32 k = 0; k < US_IMPORTS; k++) DataRva(a, usNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, ilt7);
+        for (u32 k = 0; k < GD_IMPORTS; k++) DataRva(a, gdNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);
+        BindData(a, w.Iat);
+        for (u32 k = 0; k < WIN_IMPORTS; k++) DataRva(a, names[k], 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 28 ends KERNEL32's
+        BindData(a, iat2);          // slot 29
+        DataRva(a, name2, 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 30 ends ADVAPI32's
+        BindData(a, iat3);          // slots 31-45
+        for (u32 k = 0; k < WS_IMPORTS; k++) DataRva(a, wsNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 46 ends WS2_32's
+        BindData(a, iat4);          // slots 47-49
+        for (u32 k = 0; k < CR_IMPORTS; k++) DataRva(a, crNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 50 ends CRYPT32's
+        BindData(a, iat5);          // slots 51-60
+        for (u32 k = 0; k < K2_IMPORTS; k++) DataRva(a, k2Names[k], 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 61 ends KERNEL32's second
+        BindData(a, iat6);          // slots 62-76
+        for (u32 k = 0; k < US_IMPORTS; k++) DataRva(a, usNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 77 ends USER32's
+        BindData(a, iat7);          // slot 78
+        for (u32 k = 0; k < GD_IMPORTS; k++) DataRva(a, gdNames[k], 8);
+        BufRepeat(&a.Data, 0, 8);   // slot 79 ends GDI32's
+        for (u32 k = 0; k < WIN_IMPORTS; k++) {
+            DataAlign(a, 2);
+            BindData(a, names[k]);
+            BufRepeat(&a.Data, 0, 2);       // hint
+            BufStr(&a.Data, WinImport(k));
+            BufByte(&a.Data, 0);
+        }
+        DataAlign(a, 2);
+        BindData(a, name2);
+        BufRepeat(&a.Data, 0, 2);
+        BufStr(&a.Data, "SystemFunction036");
+        BufByte(&a.Data, 0);
+        for (u32 k = 0; k < WS_IMPORTS; k++) {
+            DataAlign(a, 2);
+            BindData(a, wsNames[k]);
+            BufRepeat(&a.Data, 0, 2);       // hint
+            BufStr(&a.Data, WsImport(k));
+            BufByte(&a.Data, 0);
+        }
+        for (u32 k = 0; k < CR_IMPORTS; k++) {
+            DataAlign(a, 2);
+            BindData(a, crNames[k]);
+            BufRepeat(&a.Data, 0, 2);       // hint
+            BufStr(&a.Data, CrImport(k));
+            BufByte(&a.Data, 0);
+        }
+        for (u32 k = 0; k < K2_IMPORTS; k++) {
+            DataAlign(a, 2);
+            BindData(a, k2Names[k]);
+            BufRepeat(&a.Data, 0, 2);       // hint
+            BufStr(&a.Data, K2Import(k));
+            BufByte(&a.Data, 0);
+        }
+        for (u32 k = 0; k < US_IMPORTS; k++) {
+            DataAlign(a, 2);
+            BindData(a, usNames[k]);
+            BufRepeat(&a.Data, 0, 2);       // hint
+            BufStr(&a.Data, UsImport(k));
+            BufByte(&a.Data, 0);
+        }
+        for (u32 k = 0; k < GD_IMPORTS; k++) {
+            DataAlign(a, 2);
+            BindData(a, gdNames[k]);
+            BufRepeat(&a.Data, 0, 2);       // hint
+            BufStr(&a.Data, GdImport(k));
+            BufByte(&a.Data, 0);
+        }
+        BindData(a, dll);
+        BufStr(&a.Data, "KERNEL32.dll");
+        BufByte(&a.Data, 0);
+        BindData(a, dll2);
+        BufStr(&a.Data, "ADVAPI32.dll");
+        BufByte(&a.Data, 0);
+        BindData(a, dll3);
+        BufStr(&a.Data, "WS2_32.dll");
+        BufByte(&a.Data, 0);
+        BindData(a, dll4);
+        BufStr(&a.Data, "CRYPT32.dll");
+        BufByte(&a.Data, 0);
+        BindData(a, dll6);
+        BufStr(&a.Data, "USER32.dll");
+        BufByte(&a.Data, 0);
+        BindData(a, dll7);
+        BufStr(&a.Data, "GDI32.dll");
+        BufByte(&a.Data, 0);
+    }
+    return w;
+}
+
+void PutU16(*u8 p, usize at, u64 v) {
+    unsafe {
+        p[at] = (v & 0xFF) as u8;
+        p[at + 1] = (v >> 8 & 0xFF) as u8;
+    }
+}
+
+void PutU32(*u8 p, usize at, u64 v) {
+    unsafe { MemStoreU32(&p[at], (v & 0xFFFFFFFF) as u32); }
+}
+
+void PutU64(*u8 p, usize at, u64 v) {
+    unsafe { MemStoreU64(&p[at], v); }
+}
+
+// Links the code and data and writes a complete executable. The code starts with the
+// entry point. data0 and relocs are the labels of RelocStub (Linux).
+str WriteImage(*Asm a, u32 target, WinImports imports, u32 data0, u32 relocs) {
+    u64 dataStart;
+    if (target == TARGET_WINDOWS) {
+        str section;
+        unsafe { section = AsmLink(a, IMAGE_BASE, PE_SECTION_RVA, &dataStart); }
+        u64 textSize = dataStart;
+        u64 dataSize = (section.Len as u64 - dataStart + 0xFFF) & ~0xFFF;
+        str reloc = BaseRelocs(a, dataStart);
+        u64 relocRva = PE_SECTION_RVA + textSize + dataSize;
+        u64 relocSize = (reloc.Len as u64 + 0xFFF) & ~0xFFF;
+        u64 fileSize = relocRva + relocSize;
+        *u8 f = alloc(fileSize as usize);
+        unsafe {
+            MemCopy(&f[0x1000], section.Ptr, section.Len);
+            MemCopy(&f[relocRva as usize], reloc.Ptr, reloc.Len);
+        }
+        PutU16(f, 0, 0x5A4D);                   // MZ
+        PutU32(f, 0x3C, 0x40);                  // e_lfanew
+        PutU32(f, 0x40, 0x4550);                // PE
+        PutU16(f, 0x44, 0x8664);                // AMD64
+        PutU16(f, 0x46, 3);                     // .text, .data, .reloc
+        PutU16(f, 0x54, 240);                   // SizeOfOptionalHeader
+        PutU16(f, 0x56, 0x0022);                // EXECUTABLE | LARGE_ADDRESS_AWARE
+        PutU16(f, 0x58, 0x020B);                // PE32+
+        PutU32(f, 0x5C, textSize);              // SizeOfCode
+        PutU32(f, 0x60, dataSize + relocSize);  // SizeOfInitializedData
+        PutU32(f, 0x68, PE_SECTION_RVA);        // entry point: the start of the code
+        PutU32(f, 0x6C, PE_SECTION_RVA);        // BaseOfCode
+        PutU64(f, 0x70, IMAGE_BASE);            // preferred; the loader moves it (ASLR)
+        PutU32(f, 0x78, 0x1000);                // SectionAlignment
+        PutU32(f, 0x7C, 0x1000);                // FileAlignment
+        PutU16(f, 0x80, 6);                     // OS version 6.0
+        PutU16(f, 0x88, 6);                     // subsystem version 6.0
+        PutU32(f, 0x90, fileSize);              // SizeOfImage
+        PutU32(f, 0x94, 0x1000);                // SizeOfHeaders
+        PutU16(f, 0x9C, 3);                     // console
+        PutU16(f, 0x9E, 0x8160);                // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+        PutU64(f, 0xA0, 0x800000);              // stack reserve (8 MiB)
+        PutU64(f, 0xA8, 0x1000);                // stack commit
+        PutU64(f, 0xB0, 0x100000);              // heap reserve
+        PutU64(f, 0xB8, 0x1000);                // heap commit
+        PutU32(f, 0xC4, 16);                    // NumberOfRvaAndSizes
+        PutU32(f, 0xD0, PE_SECTION_RVA + LabelOffset(a, imports.Dir, dataStart));
+        PutU32(f, 0xD4, 100);
+        PutU32(f, 0xF0, relocRva);              // base relocation table
+        PutU32(f, 0xF4, reloc.Len as u64);
+        PeSection(f, 0x148, 0x7865742E, 0x74, textSize, PE_SECTION_RVA, textSize, 0x60000020);                  // .text: CODE | EXECUTE | READ
+        PeSection(f, 0x170, 0x7461642E, 0x61, dataSize, PE_SECTION_RVA + textSize, dataSize, 0xC0000040);       // .data: DATA | READ | WRITE
+        PeSection(f, 0x198, 0x6C65722E, 0x636F, reloc.Len as u64, relocRva, relocSize, 0x42000040);            // .reloc: DATA | DISCARDABLE | READ
+        unsafe { return str_from(f, fileSize as usize); }
+    }
+    // the table RelocStub reads: the count, then the data offset of each absolute address
+    DataAlign(a, 4);
+    BindData(a, relocs);
+    u32 count = 0;
+    unsafe {
+        for (usize i = 0; i < VecLen(&a.Fixups); i++) {
+            Fixup x = *(VecAt(&a.Fixups, i) as *Fixup);
+            if (x.Kind == FX_ABS64 && x.InData) count++;
+        }
+    }
+    DataU32(a, count);
+    unsafe {
+        usize n = VecLen(&a.Fixups);
+        for (usize i = 0; i < n; i++) {
+            Fixup x = *(VecAt(&a.Fixups, i) as *Fixup);
+            if (x.Kind == FX_ABS64 && x.InData) DataU32(a, x.At);
+        }
+    }
+    BindDataStart(a, data0);
+    str section;
+    unsafe { section = AsmLink(a, 0, ELF_HEADERS, &dataStart); }
+    u64 codeEnd = ELF_HEADERS + dataStart;      // page-aligned
+    u64 fileSize = ELF_HEADERS + section.Len as u64;
+    *u8 f = alloc(fileSize as usize);
+    unsafe { MemCopy(&f[ELF_HEADERS as usize], section.Ptr, section.Len); }
+    PutU32(f, 0, 0x464C457F);                   // 0x7F 'E' 'L' 'F'
+    PutU32(f, 4, 0x00010102);                   // 64-bit, little-endian, version 1
+    PutU16(f, 16, 3);                           // ET_DYN: position-independent
+    PutU16(f, 18, 0x3E);                        // x86-64
+    PutU32(f, 20, 1);
+    PutU64(f, 24, ELF_HEADERS);                 // entry point: the start of the code
+    PutU64(f, 32, 64);                          // program headers follow
+    PutU16(f, 52, 64);
+    PutU16(f, 54, 56);
+    PutU16(f, 56, 3);
+    PutU32(f, 64, 1);                           // PT_LOAD, R | X: the headers and the code
+    PutU32(f, 68, 5);
+    PutU64(f, 96, codeEnd);
+    PutU64(f, 104, codeEnd);
+    PutU64(f, 112, 0x1000);
+    PutU32(f, 120, 1);                          // PT_LOAD, R | W: the data
+    PutU32(f, 124, 6);
+    PutU64(f, 128, codeEnd);
+    PutU64(f, 136, codeEnd);
+    PutU64(f, 144, codeEnd);
+    PutU64(f, 152, fileSize - codeEnd);
+    PutU64(f, 160, fileSize - codeEnd);
+    PutU64(f, 168, 0x1000);
+    PutU32(f, 176, 0x6474E551);                 // PT_GNU_STACK, R | W
+    PutU32(f, 180, 6);
+    PutU64(f, 224, 16);
+    unsafe { return str_from(f, fileSize as usize); }
+}
+
+// A PE section header at `at`: name (low 4 bytes, then 4 more), sizes, address, flags.
+void PeSection(*u8 f, usize at, u64 name, u64 name2, u64 vsize, u64 rva, u64 rawSize, u64 flags) {
+    PutU32(f, at, name);
+    PutU32(f, at + 4, name2);
+    PutU32(f, at + 8, vsize);
+    PutU32(f, at + 12, rva);
+    PutU32(f, at + 16, rawSize);
+    PutU32(f, at + 20, rva);                    // PointerToRawData: files map 1:1
+    PutU32(f, at + 36, flags);
+}
+
+void BufU32(*Buf b, u64 v) {
+    BufByte(b, (v & 0xFF) as u8);
+    BufByte(b, (v >> 8 & 0xFF) as u8);
+    BufByte(b, (v >> 16 & 0xFF) as u8);
+    BufByte(b, (v >> 24 & 0xFF) as u8);
+}
+
+// The base relocation table: a DIR64 entry for each 8-byte absolute address, in blocks of
+// one page each. With none, one block of padding (the loader needs no work).
+str BaseRelocs(*Asm a, u64 dataStart) {
+    Buf r = BufNew(64);
+    usize total = 0;
+    *u64 rvas;
+    unsafe {
+        total = VecLen(&a.Fixups);
+        rvas = alloc((total + 1) * 8) as *u64;
+    }
+    usize n = 0;
+    unsafe {
+        for (usize i = 0; i < total; i++) {
+            Fixup x = *(VecAt(&a.Fixups, i) as *Fixup);
+            if (x.Kind != FX_ABS64) continue;
+            u64 at = x.At as u64;
+            if (x.InData) at += dataStart;
+            rvas[n] = PE_SECTION_RVA + at;
+            n++;
+        }
+    }
+    if (n == 0) {
+        unsafe {
+            BufU32(&r, PE_SECTION_RVA);
+            BufU32(&r, 12);
+            BufU32(&r, 0);                      // two ABSOLUTE (padding) entries
+            return BufView(&r);
+        }
+    }
+    usize i = 0;
+    unsafe {
+        while (i < n) {
+            u64 page = rvas[i] & ~0xFFF;
+            usize j = i;
+            while (j < n && rvas[j] & ~0xFFF == page) j++;
+            u64 count = (j - i) as u64;
+            u64 size = 8 + 2 * count;
+            if (count % 2 == 1) size += 2;
+            BufU32(&r, page);
+            BufU32(&r, size);
+            for (usize k = i; k < j; k++) {
+                u64 e = 0xA000 | (rvas[k] & 0xFFF);     // IMAGE_REL_BASED_DIR64
+                BufByte(&r, (e & 0xFF) as u8);
+                BufByte(&r, (e >> 8) as u8);
+            }
+            if (count % 2 == 1) {
+                BufByte(&r, 0);
+                BufByte(&r, 0);
+            }
+            i = j;
+        }
+        return BufView(&r);
+    }
+}

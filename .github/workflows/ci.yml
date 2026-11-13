@@ -1,0 +1,102 @@
+# Builds the chain from assembly on Linux and Windows, checks both hosts made the same
+# bytes, and, for a tag named seed-*, publishes the seed compilers as a release.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sh nasm/install-ubuntu.sh
+      - run: ./bootstrap.sh check
+      - run: ./bootstrap.sh test
+      - run: ./bootstrap.sh seed
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: built-on-linux
+          path: |
+            build/stage0/envoc0
+            build/stage0/envoc0.exe
+            build/stage1/envoc1
+            build/stage1/envoc1.exe
+            build/stage2/envoc
+            build/stage2/envoc.exe
+            build/stage2c/envoc
+            build/stage2c/envoc.exe
+            build/seed-release
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: choco install nasm --no-progress -y
+      - run: .\bootstrap.ps1 check
+        shell: powershell
+      - run: .\bootstrap.ps1 test
+        shell: powershell
+      - run: .\bootstrap.ps1 seed
+        shell: powershell
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: built-on-windows
+          path: |
+            build/stage0/envoc0
+            build/stage0/envoc0.exe
+            build/stage1/envoc1
+            build/stage1/envoc1.exe
+            build/stage2/envoc
+            build/stage2/envoc.exe
+            build/stage2c/envoc
+            build/stage2c/envoc.exe
+            build/seed-release
+
+  # The same sources must give byte-identical compilers on both hosts.
+  reproducible:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: built-on-linux
+          path: build/from-linux
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: built-on-windows
+          path: build/from-windows
+      - run: ./bootstrap.sh compare build/from-linux build/from-windows
+      - run: cmp build/from-linux/seed-release/SHA256SUMS build/from-windows/seed-release/SHA256SUMS
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/seed-')
+    needs: [reproducible]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: built-on-linux
+          path: build
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" build/seed-release/* \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "Seed compilers for EnvoScale, built from assembly by this tag's CI run on Linux and Windows (byte-identical on both). EnvoScale commit: $(cat envoscale.ref)"

@@ -1,0 +1,91 @@
+// Map: a hash map from str keys to u64 values, with open addressing and linear probing.
+// Keys are stored as views, not copied: the caller keeps them alive (source text and
+// arena strings always are). Used for interning names and for symbol tables.
+
+struct MapSlot {
+    str Key;
+    u64 Hash;
+    u64 Value;
+    bool Used;
+}
+
+struct Map {
+    *MapSlot Slots;
+    usize Cap;      // a power of two
+    usize Len;
+}
+
+Map MapNew(usize cap) {
+    usize c = 16;
+    while (c < cap * 2) c *= 2;
+    unsafe {
+        return new Map { Slots = alloc(c * sizeof(MapSlot)) as *MapSlot, Cap = c, Len = 0 };
+    }
+}
+
+usize MapLen(*Map m) {
+    unsafe { return m.Len; }
+}
+
+// The slot for key: the one holding it, or the empty one where it would go.
+*MapSlot MapFind(*Map m, str key, u64 h) {
+    unsafe {
+        usize mask = m.Cap - 1;
+        usize i = h as usize & mask;
+        while (true) {
+            *MapSlot s = &m.Slots[i];
+            if (!s.Used) return s;
+            if (s.Hash == h && StrEq(s.Key, key)) return s;
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+// Looks key up. Returns true and stores the value in *out if it is present.
+bool MapGet(*Map m, str key, *u64 result) {
+    *MapSlot s = MapFind(m, key, StrHash(key));
+    unsafe {
+        if (!s.Used) return false;
+        *result = s.Value;
+    }
+    return true;
+}
+
+bool MapHas(*Map m, str key) {
+    u64 ignored;
+    unsafe { return MapGet(m, key, &ignored); }
+}
+
+void MapGrow(*Map m) {
+    unsafe {
+        *MapSlot old = m.Slots;
+        usize oldCap = m.Cap;
+        m.Cap = oldCap * 2;
+        m.Slots = alloc(m.Cap * sizeof(MapSlot)) as *MapSlot;
+        for (usize i = 0; i < oldCap; i++) {
+            *MapSlot s = &old[i];
+            if (s.Used) {
+                *MapSlot d = MapFind(m, s.Key, s.Hash);
+                *d = *s;
+            }
+        }
+    }
+}
+
+// Sets key to value, adding it if needed.
+void MapPut(*Map m, str key, u64 value) {
+    unsafe {
+        if ((m.Len + 1) * 4 > m.Cap * 3) MapGrow(m);
+    }
+    u64 h = StrHash(key);
+    *MapSlot s = MapFind(m, key, h);
+    unsafe {
+        if (!s.Used) {
+            s.Used = true;
+            s.Key = key;
+            s.Hash = h;
+            m.Len++;
+        }
+        s.Value = value;
+    }
+}

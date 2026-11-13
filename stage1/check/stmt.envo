@@ -1,0 +1,308 @@
+// Statements. CheckStmt returns true if the statement terminates ([core.stmt.6]).
+// Follows Stage 0's check_stmt, check_simple and check_match.
+
+bool CheckStmt(*Checker c, u32 n) {
+    Node node = CNode(c, n);
+    u16 k = node.Kind;
+    if (k == NK_BLOCK) {
+        usize saved;
+        unsafe { saved = c.LSP; }
+        bool terminates = false;
+        u32 s = node.A;
+        while (s != 0) {
+            if (CheckStmt(c, s)) terminates = true;
+            s = CNode(c, s).Next;
+        }
+        unsafe { c.LSP = saved; }     // leave the block's scope
+        return terminates;
+    }
+    if (k == NK_UNSAFE) {
+        unsafe { c.Unsafe++; }
+        bool t = CheckStmt(c, node.A);
+        unsafe { c.Unsafe--; }
+        return t;
+    }
+    if (k == NK_IF) {
+        ExpectType(c, node.A, T_BOOL);
+        bool then = CheckStmt(c, node.B);
+        if (node.C == 0) return false;
+        bool other = CheckStmt(c, node.C);
+        return then && other;
+    }
+    if (k == NK_WHILE) {
+        ExpectType(c, node.A, T_BOOL);
+        bool broke = CheckLoopBody(c, node.B);
+        // terminates: the condition is the literal true and nothing breaks out
+        if (broke) return false;
+        if (NKind(c, node.A) != NK_BOOL) return false;
+        return StrEq(TokText(c, NTok(c, node.A)), "true");
+    }
+    if (k == NK_FOR) {
+        usize saved;
+        unsafe { saved = c.LSP; }      // the init's variables live in the loop's scope
+        if (node.A != 0) CheckSimple(c, node.A);
+        if (node.B != 0) ExpectType(c, node.B, T_BOOL);
+        if (node.C != 0) CheckSimple(c, node.C);
+        bool broke = CheckLoopBody(c, node.D);
+        unsafe { c.LSP = saved; }
+        // terminates: no condition and nothing breaks out
+        return node.B == 0 && !broke;
+    }
+    if (k == NK_BREAK || k == NK_CONTINUE) {
+        usize loops;
+        unsafe { loops = c.Loops; }
+        if (loops == 0) CError(c, E_NOT_IN_LOOP, node.Tok);
+        if (k == NK_BREAK) unsafe { c.Brk = true; }
+        return false;
+    }
+    if (k == NK_RETURN) {
+        bool top;
+        u32 ret;
+        unsafe {
+            top = c.Top;
+            ret = c.Ret;
+        }
+        if (top) {
+            // top level: an optional exit code
+            if (node.A != 0) ExpectType(c, node.A, T_I32);
+            return true;
+        }
+        if (ret == T_INFER) {
+            // the first `return` of a lambda without a target result decides it ([fn.lam.2])
+            if (node.A == 0) unsafe { c.Ret = T_VOID; }
+            else unsafe { c.Ret = CheckValue(c, node.A, 0); }
+            return true;
+        }
+        if (ret == T_VOID) {
+            if (node.A != 0) CFail(c, node.Tok, E_BAD_RETURN, "this function returns nothing; remove the return value");
+            return true;
+        }
+        if (node.A == 0) {
+            Buf b = BufNew(64);
+            unsafe {
+                BufStr(&b, "this function returns `");
+                BufType(&b, c, ret);
+                BufStr(&b, "`; `return` needs a value");
+                CFail(c, node.Tok, E_BAD_RETURN, BufView(&b));
+            }
+        }
+        ExpectType(c, node.A, ret);
+        return true;
+    }
+    if (k == NK_MATCH) return CheckMatch(c, n);
+    if (k == NK_FOREACH) return CheckForeach(c, n);
+    return CheckSimple(c, n);
+}
+
+// A loop body with a fresh break flag; true if a break targets this loop.
+bool CheckLoopBody(*Checker c, u32 n) {
+    bool outer;
+    unsafe {
+        outer = c.Brk;
+        c.Brk = false;
+        c.Loops++;
+    }
+    CheckStmt(c, n);
+    bool broke;
+    unsafe {
+        c.Loops--;
+        broke = c.Brk;
+        c.Brk = outer;
+    }
+    return broke;
+}
+
+// Simple statements ([core.stmt.1]-[core.stmt.3]). Returns true if it terminates.
+bool CheckSimple(*Checker c, u32 n) {
+    Node node = CNode(c, n);
+    if (node.Kind == NK_VAR) {
+        u32 t = 0;
+        if (node.A != 0) {
+            t = ResolveType(c, node.A, false);
+            u64 align;
+            unsafe { SizeOf(c, t, node.Tok, &align); }
+            if (node.B != 0) ExpectType(c, node.B, t);
+        } else {
+            t = CheckValue(c, node.B, 0);
+        }
+        DeclareLocal(c, n, t);
+        SetNType(c, n, t);
+        return false;
+    }
+    if (node.Kind == NK_EXPR) {
+        if (NKind(c, node.A) != NK_CALL) CError(c, E_NO_EFFECT, node.Tok);
+        CheckExpr(c, node.A, 0);
+        return IsNoreturnCall(c, node.A);
+    }
+    if (node.Kind == NK_ASSIGN) {
+        u32 op = node.Tok;
+        u32 target = CheckValue(c, node.A, 0);
+        if (!IsMutable(c, node.A)) CError(c, E_NOT_ASSIGNABLE, op);
+        MarkMutation(c, node.A);
+        str opText = TokText(c, op);
+        if (opText.Len == 1) {
+            ExpectType(c, node.B, target);      // '=' is the only one-byte assignment
+            return false;
+        }
+        if (!IsIntType(c, target)) BadOperand(c, target, op);
+        if (opText[0] == '<' || opText[0] == '>') {
+            // '<<=' and '>>=': any integer on the right
+            u32 r = CheckValue(c, node.B, 0);
+            if (!IsIntType(c, r)) BadOperand(c, r, op);
+            return false;
+        }
+        ExpectType(c, node.B, target);
+        return false;
+    }
+    // NK_INC, NK_DEC
+    u32 t = CheckValue(c, node.A, 0);
+    if (!IsMutable(c, node.A)) CError(c, E_NOT_ASSIGNABLE, node.Tok);
+    MarkMutation(c, node.A);
+    if (!IsIntType(c, t)) BadOperand(c, t, node.Tok);
+    return false;
+}
+
+// Is call node n a call to exit or panic?
+bool IsNoreturnCall(*Checker c, u32 n) {
+    u32 callee = CNode(c, n).A;
+    if (NKind(c, callee) != NK_NAME) return false;
+    u32 s = Lookup(c, NTok(c, callee));
+    if (s == 0) return false;
+    Sym sym = SymGet(c, s);
+    if (sym.Kind != SK_BUILTIN) return false;
+    return sym.Aux2 == B_EXIT || sym.Aux2 == B_PANIC;
+}
+
+// [core.stmt.7]. Returns true if the match terminates.
+bool CheckMatch(*Checker c, u32 n) {
+    Node m = CNode(c, n);
+    u32 t = CheckValue(c, m.A, 0);
+    if (MatchIsS1(c, n, t)) return CheckMatchS1(c, n, t, 0, false) == 1;
+    u8 tk = TyKind(c, t);
+    if (tk == TYK_ENUM) {
+        EnumDeclare(c, TypeGet(c, t).Sym);
+    } else if (tk != TYK_INT) {
+        Buf b = BufNew(64);
+        unsafe {
+            BufStr(&b, "`match` needs an integer or enum value, found `");
+            BufType(&b, c, t);
+            BufByte(&b, '`');
+            CFail(c, NTok(c, m.A), E_BAD_OPERAND, BufView(&b));
+        }
+    }
+    bool wild = false;
+    bool open = false;      // an arm does not terminate
+    u32 arm = m.B;
+    while (arm != 0) {
+        Node a = CNode(c, arm);
+        u32 pat = a.A;
+        while (pat != 0) {
+            u16 pk = NKind(c, pat);
+            if (pk == NK_WILD) {
+                wild = true;
+            } else {
+                u64 value = 0;
+                u32 variant = 0;
+                // a bare variant name of the scrutinee's enum
+                if (pk == NK_NAME && tk == TYK_ENUM) variant = EnumVariantNamed(c, t, pat);
+                if (variant != 0) {
+                    value = NValue(c, variant);
+                    SetNType(c, pat, t);
+                } else {
+                    ExpectType(c, pat, t);
+                    value = ConstEval(c, pat);
+                }
+                // [core.stmt.7] each value once
+                if (MatchValueSeen(c, value, pat, n)) CError(c, E_DUPLICATE_PATTERN, NTok(c, pat));
+                SetNValue(c, pat, value);
+                SetNMatched(c, pat);
+            }
+            pat = CNode(c, pat).Next;
+        }
+        bool terminates = false;
+        if (NKind(c, a.B) == NK_BLOCK) terminates = CheckStmt(c, a.B);
+        else terminates = CheckSimple(c, a.B);
+        if (!terminates) open = true;
+        arm = a.Next;
+    }
+    if (!wild) {
+        if (tk != TYK_ENUM || !EnumAllMatched(c, t, n)) CError(c, E_NOT_EXHAUSTIVE, m.Tok);
+    }
+    return !open;
+}
+
+// Has a pattern of match m before `stop` (0: any) recorded value v?
+bool MatchValueSeen(*Checker c, u64 v, u32 stop, u32 m) {
+    u32 arm = CNode(c, m).B;
+    while (arm != 0) {
+        u32 pat = CNode(c, arm).A;
+        while (pat != 0) {
+            if (pat == stop) return false;
+            if (NMatched(c, pat) && NValue(c, pat) == v) return true;
+            pat = CNode(c, pat).Next;
+        }
+        arm = CNode(c, arm).Next;
+    }
+    return false;
+}
+
+// Does match m name every variant of enum type t?
+bool EnumAllMatched(*Checker c, u32 t, u32 m) {
+    u32 v = CNode(c, SymGet(c, TypeGet(c, t).Sym).Node).B;
+    while (v != 0) {
+        if (!MatchValueSeen(c, NValue(c, v), 0, m)) return false;
+        v = CNode(c, v).Next;
+    }
+    return true;
+}
+
+// The variant of enum type t named by node n's token, or 0 (variants not yet defined
+// are not found).
+u32 EnumVariantNamed(*Checker c, u32 t, u32 n) {
+    u32 tok = NTok(c, n);
+    u32 v = CNode(c, SymGet(c, TypeGet(c, t).Sym).Node).B;
+    while (v != 0) {
+        if (NType(c, v) != 0 && SameName(c, NTok(c, v), tok)) return v;
+        v = CNode(c, v).Next;
+    }
+    return 0;
+}
+
+// [core.stmt.3] may this checked expression be assigned to?
+bool IsMutable(*Checker c, u32 n) {
+    return PlaceCheck(c, n, true);
+}
+
+// [core.expr.5] may `&` be applied?
+bool IsAddressable(*Checker c, u32 n) {
+    return PlaceCheck(c, n, false);
+}
+
+// assign: slices and str are read-only; for `&` any element has an address.
+bool PlaceCheck(*Checker c, u32 n, bool assign) {
+    Node node = CNode(c, n);
+    if (node.Kind == NK_NAME || node.Kind == NK_THIS) {
+        u32 s = NSym(c, n);
+        if (s == 0) return false;
+        Sym sym = SymGet(c, s);
+        // an `in` parameter or receiver is read-only ([own.mode.1])
+        if (assign && sym.Flags & SF_READONLY != 0) return false;
+        return sym.Kind == SK_LOCAL || sym.Kind == SK_STATIC;
+    }
+    if (node.Kind == NK_MEMBER) {
+        u32 t = NType(c, node.A);
+        if (t == 0) return false;      // Enum.Variant
+        u8 k = TyKind(c, t);
+        if (k == TYK_PTR) return true;
+        if (k != TYK_STRUCT) return false;
+        return PlaceCheck(c, node.A, assign);
+    }
+    if (node.Kind == NK_INDEX) {
+        u8 k = TyKind(c, NType(c, node.A));
+        if (k == TYK_ARRAY) return PlaceCheck(c, node.A, assign);
+        if (k == TYK_PTR) return true;
+        if (k == TYK_SLICE && TypeGet(c, NType(c, node.A)).Count == 1) return true;     // `mut T[]`
+        return !assign;     // &s[i] of a slice or str is fine
+    }
+    return node.Kind == NK_UNARY && node.Op == TK_STAR;
+}

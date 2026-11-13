@@ -1,0 +1,104 @@
+// Source files and diagnostics. Messages use the same format as envoc0, so the two
+// compilers can be compared line for line (PLAN D14):
+//
+//     path:line:col: error[E0301]: message
+//
+// Lines count from 1 and end at LF; columns count Unicode scalar values from 1
+// ([lex.src.4]). Like envoc0, Stage 1 stops at the first error.
+
+struct SrcFile {
+    str Path;       // as given on the command line
+    str Text;       // the contents, without a leading byte order mark
+}
+
+// Exit codes (envo-core.md section 7).
+const i32 EXIT_OK = 0;
+const i32 EXIT_ERRORS = 1;
+const i32 EXIT_USAGE = 2;
+const i32 EXIT_INTERNAL = 70;
+
+*Vec Files() {
+    unsafe { return &TheCtx().Files; }
+}
+
+// Adds a source file and returns its index.
+u32 SrcAdd(str path, str text) {
+    if (text.Len >= 3 && text[0] == 0xEF && text[1] == 0xBB && text[2] == 0xBF) {
+        text = StrSub(text, 3, text.Len);
+    }
+    *Vec files = Files();
+    u32 index = VecLen(files) as u32;
+    unsafe {
+        *SrcFile f = VecPush(files) as *SrcFile;
+        f.Path = path;
+        f.Text = text;
+    }
+    return index;
+}
+
+SrcFile SrcGet(u32 index) {
+    unsafe { return *(VecAt(Files(), index as usize) as *SrcFile); }
+}
+
+// The line and column of byte offset off in text.
+void SrcPos(str text, usize off, *u32 line, *u32 col) {
+    u32 l = 1;
+    u32 c = 1;
+    if (off > text.Len) off = text.Len;
+    for (usize i = 0; i < off; i++) {
+        u8 b = text[i];
+        if (b == 10) {
+            l++;
+            c = 1;
+        } else if (b & 0xC0 != 0x80) {
+            c++;
+        }
+    }
+    unsafe {
+        *line = l;
+        *col = c;
+    }
+}
+
+void BufCode(*Buf b, u32 code) {
+    BufStr(b, "E");
+    if (code < 1000) BufByte(b, '0');
+    if (code < 100) BufByte(b, '0');
+    if (code < 10) BufByte(b, '0');
+    BufU64(b, code as u64);
+}
+
+// Reports error `code` at byte offset off of file `file` and ends the process.
+void Fail(u32 file, usize off, u32 code, str msg) {
+    SrcFile f = SrcGet(file);
+    u32 line;
+    u32 col;
+    unsafe { SrcPos(f.Text, off, &line, &col); }
+    *Buf e = Err();
+    BufStr(e, f.Path);
+    BufByte(e, ':');
+    BufU64(e, line as u64);
+    BufByte(e, ':');
+    BufU64(e, col as u64);
+    BufStr(e, ": error[");
+    BufCode(e, code);
+    BufStr(e, "]: ");
+    BufStr(e, msg);
+    BufByte(e, 10);
+    Exit(EXIT_ERRORS);
+}
+
+// A message about the command line or the environment, not about a source position:
+// "envoc1: error: msg", then exit with code.
+void ToolFail(str msg, i32 code) {
+    *Buf e = Err();
+    BufStr(e, "envoc1: error: ");
+    BufStr(e, msg);
+    BufByte(e, 10);
+    Exit(code);
+}
+
+// An internal error: a bug in Stage 1.
+void Bug(str msg) {
+    ToolFail(msg, EXIT_INTERNAL);
+}

@@ -1,0 +1,371 @@
+; =============================================================================
+; src/writer.eas - output executables (PE32+ and ELF64) and `envoc0 build`
+;
+; An output program has the same shape as envoc0 itself
+; (docs/architecture/bootstrap.md): one read+write+execute region at base
+; 0x400000 holding [runtime block][trap stubs][functions][data]:
+;   - Windows: 0x1000 bytes of headers, then the section at RVA 0x1000 (file
+;     alignment == section alignment, so file offsets equal RVAs);
+;   - Linux: the ELF header and two program headers (176 bytes), then the
+;     section, mapped from file offset 0.
+; The runtime block comes from envoc0's own image (platform/windows.eas or
+; platform/linux.eas). The copy is adjusted: its mutable data is zeroed, the
+; call in its entry point is pointed at __main, and on Windows the import
+; table's RVAs are moved to where the block now sits.
+; =============================================================================
+
+TARGET_WINDOWS  equ 0
+TARGET_LINUX    equ 1
+ELF_HEADERS     equ 176                 ; ELF header (64) + 2 program headers (56 each)
+
+; cmd_build - envoc0 build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]
+;   in: rdi = argv, rsi = argc. Does not return. The first file is the entry file.
+; rbx = argv, r12 = argc, r13 = input count, r14 = output, r15d = target
+cmd_build:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     rbx, rdi
+        mov     r12, rsi
+        xor     r13d, r13d
+        xor     r14d, r14d
+        mov     r15d, NATIVE_TARGET
+        mov     ecx, 2
+.arg:
+        cmp     rcx, r12
+        jae     near .args_done
+        mov     rdi, [rbx + rcx*8]
+        push    rcx
+        push    rcx
+        lea     rsi, [s_opt_output]
+        mov     edx, 2
+        call    cstr_eq
+        pop     rcx
+        pop     rcx
+        test    eax, eax
+        jnz     short .output
+        mov     rdi, [rbx + rcx*8]
+        push    rcx
+        push    rcx
+        lea     rsi, [s_opt_target]
+        mov     edx, 8
+        call    cstr_eq
+        pop     rcx
+        pop     rcx
+        test    eax, eax
+        jnz     short .target
+        mov     rax, [rbx + rcx*8]      ; an input file: inputs are packed
+        mov     [rbx + r13*8 + 16], rax ; in place at argv[2...]
+        inc     r13
+        inc     rcx
+        jmp     short .arg
+.output:
+        inc     rcx
+        cmp     rcx, r12
+        jae     near .usage
+        mov     r14, [rbx + rcx*8]
+        inc     rcx
+        jmp     short .arg
+.target:
+        inc     rcx
+        cmp     rcx, r12
+        jae     near .usage
+        mov     rdi, [rbx + rcx*8]
+        push    rcx
+        push    rdi
+        lea     rsi, [s_target_windows]
+        mov     edx, s_target_windows_len
+        call    cstr_eq
+        pop     rdi
+        pop     rcx
+        mov     r15d, TARGET_WINDOWS
+        test    eax, eax
+        jnz     short .target_ok
+        push    rcx
+        push    rcx
+        lea     rsi, [s_target_linux]
+        mov     edx, s_target_linux_len
+        call    cstr_eq
+        pop     rcx
+        pop     rcx
+        mov     r15d, TARGET_LINUX
+        test    eax, eax
+        jz      near .usage
+.target_ok:
+        inc     rcx
+        jmp     near .arg
+.args_done:
+        test    r13, r13
+        jz      near .usage
+        test    r14, r14
+        jz      near .usage
+        lea     rdi, [rbx + 16]
+        mov     rsi, r13
+        call    load_program
+        mov     ebx, eax
+        mov     edi, eax
+        call    check_program
+        mov     edi, ebx
+        mov     esi, r15d
+        call    build_image             ; rax = file bytes, rdx = length
+        mov     rdi, r14
+        mov     rsi, rax
+        call    write_file
+        xor     edi, edi
+        call    exit_process
+.usage:
+        lea     rdi, [w_err]
+        lea     rsi, [s_build_usage]
+        call    w_cstr
+        mov     edi, 2
+        call    exit_process
+
+; build_image - generate code and lay out the whole executable.
+;   in: edi = program node, esi = TARGET_*.  out: rax = file buffer, rdx = length
+; ebx = target, r12 = file buffer, r13 = header size, r14 = section length,
+; r15 = runtime block
+build_image:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     ebx, esi
+        lea     r15, [rtw_begin]
+        mov     edx, rtw_end - rtw_begin
+        cmp     ebx, TARGET_WINDOWS
+        je      short .generate
+        lea     r15, [rtl_begin]
+        mov     edx, rtl_end - rtl_begin
+.generate:
+        mov     rsi, r15
+        call    generate
+        ; the copied block starts fresh
+        mov     rdi, [g_code]
+        mov     ecx, rtw_data_end - rtw_data_begin
+        add     rdi, rtw_data_begin - rtw_begin
+        mov     eax, (rtw_start.after_main_call - rtw_begin) - 4
+        cmp     ebx, TARGET_WINDOWS
+        je      short .zero
+        mov     rdi, [g_code]
+        mov     ecx, rtl_data_end - rtl_data_begin
+        add     rdi, rtl_data_begin - rtl_begin
+        mov     eax, (rtl_start.after_main_call - rtl_begin) - 4
+.zero:
+        push    rax
+        push    rax
+        xor     eax, eax
+        rep stosb
+        pop     rdi
+        pop     rdi
+        mov     esi, [g_main]           ; the entry point calls __main
+        call    g_patch
+        ; layout
+        mov     r14, [g_data_base]
+        add     r14, [g_dlen]           ; section length
+        mov     r13d, 0x1000
+        cmp     ebx, TARGET_WINDOWS
+        je      short .windows_size
+        mov     r13d, ELF_HEADERS
+        lea     rdi, [r13 + r14]
+        jmp     short .allocate
+.windows_size:
+        add     r14, 0xFFF              ; Windows: the section is padded to 0x1000
+        and     r14, -0x1000
+        lea     rdi, [r13 + r14]
+.allocate:
+        mov     [b_file_size], rdi
+        call    arena_alloc
+        mov     r12, rax
+        ; addresses inside the data, now that the section's address is known
+        lea     rdi, [IMAGE_BASE + r13]
+        call    g_resolve_absolute
+        cmp     ebx, TARGET_WINDOWS
+        jne     short .linux
+        call    b_patch_imports
+        mov     rdi, r12
+        mov     rsi, r14
+        call    b_pe_header
+        jmp     short .copy
+.linux:
+        mov     rdi, r12
+        mov     rsi, [b_file_size]
+        call    b_elf_header
+.copy:
+        lea     rdi, [r12 + r13]        ; code, then data at g_data_base
+        mov     rsi, [g_code]
+        mov     rcx, [g_clen]
+        rep movsb
+        mov     rdi, r12
+        add     rdi, r13
+        add     rdi, [g_data_base]
+        mov     rsi, [g_data]
+        mov     rcx, [g_dlen]
+        rep movsb
+        mov     rax, r12
+        mov     rdx, [b_file_size]
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+
+; b_patch_imports - move the copied Windows block's import RVAs from where the
+; block sits in envoc0 to RVA 0x1000 (the start of the output section), and
+; reset its IAT from the lookup table (the loader overwrote envoc0's own).
+b_patch_imports:
+        mov     rdx, [g_code]
+        mov     eax, 0x1000 - (rtw_begin - $$)          ; delta ($$ is the image base)
+        lea     rcx, [rdx + (win_import_dir - rtw_begin)]
+        add     [rcx], eax              ; OriginalFirstThunk
+        add     [rcx + 12], eax         ; Name
+        add     [rcx + 16], eax         ; FirstThunk
+        lea     rcx, [rdx + (win_ilt - rtw_begin)]
+        lea     r8, [rdx + (win_iat - rtw_begin)]
+        cdqe
+.entry:
+        mov     r9, [rcx]
+        test    r9, r9
+        jz      short .done
+        add     r9, rax
+        mov     [rcx], r9
+        mov     [r8], r9
+        add     rcx, 8
+        add     r8, 8
+        jmp     short .entry
+.done:
+        mov     qword [r8], 0
+        ret
+
+; b_pe_header - the PE32+ headers (envoc0's own are in platform/pe.eas).
+;   in: rdi = file buffer (zeroed), rsi = section size (multiple of 0x1000)
+b_pe_header:
+        mov     word [rdi], 'MZ'
+        mov     dword [rdi + 0x3C], 0x40                ; e_lfanew
+        mov     dword [rdi + 0x40], 'PE'
+        mov     word [rdi + 0x44], 0x8664               ; AMD64
+        mov     word [rdi + 0x46], 1                    ; one section
+        mov     word [rdi + 0x54], 240                  ; SizeOfOptionalHeader
+        mov     word [rdi + 0x56], 0x0023               ; RELOCS_STRIPPED | EXECUTABLE | LARGE_ADDRESS_AWARE
+        mov     word [rdi + 0x58], 0x020B               ; PE32+
+        mov     [rdi + 0x5C], esi                       ; SizeOfCode
+        mov     dword [rdi + 0x68], 0x1000              ; entry: the block's jump table
+        mov     dword [rdi + 0x6C], 0x1000              ; BaseOfCode
+        mov     dword [rdi + 0x70], IMAGE_BASE          ; ImageBase (high half 0)
+        mov     dword [rdi + 0x78], 0x1000              ; SectionAlignment
+        mov     dword [rdi + 0x7C], 0x1000              ; FileAlignment
+        mov     word [rdi + 0x80], 6                    ; OS version 6.0
+        mov     word [rdi + 0x88], 6                    ; subsystem version 6.0
+        lea     eax, [rsi + 0x1000]
+        mov     [rdi + 0x90], eax                       ; SizeOfImage
+        mov     dword [rdi + 0x94], 0x1000              ; SizeOfHeaders
+        mov     word [rdi + 0x9C], 3                    ; console
+        mov     word [rdi + 0x9E], 0x8100               ; NX_COMPAT | TERMINAL_SERVER_AWARE
+        mov     dword [rdi + 0xA0], 0x100000            ; stack reserve
+        mov     dword [rdi + 0xA8], 0x1000              ; stack commit
+        mov     dword [rdi + 0xB0], 0x100000            ; heap reserve
+        mov     dword [rdi + 0xB8], 0x1000              ; heap commit
+        mov     dword [rdi + 0xC4], 16                  ; NumberOfRvaAndSizes
+        mov     dword [rdi + 0xD0], 0x1000 + (win_import_dir - rtw_begin)
+        mov     dword [rdi + 0xD4], win_import_dir_end - win_import_dir
+        mov     dword [rdi + 0x148], '.tex'             ; section table
+        mov     byte [rdi + 0x14C], 't'
+        mov     [rdi + 0x150], esi                      ; VirtualSize
+        mov     dword [rdi + 0x154], 0x1000             ; VirtualAddress
+        mov     [rdi + 0x158], esi                      ; SizeOfRawData
+        mov     dword [rdi + 0x15C], 0x1000             ; PointerToRawData
+        mov     dword [rdi + 0x16C], 0xE0000020         ; CODE | EXECUTE | READ | WRITE
+        ret
+
+; b_elf_header - the ELF64 header and program headers (envoc0's own are in
+; platform/elf.eas).  in: rdi = file buffer (zeroed), rsi = file size
+b_elf_header:
+        mov     dword [rdi], 0x464C457F                 ; 0x7F 'E' 'L' 'F'
+        mov     dword [rdi + 4], 0x00010102             ; 64-bit, little-endian, version 1
+        mov     word [rdi + 16], 2                      ; ET_EXEC
+        mov     word [rdi + 18], 0x3E                   ; x86-64
+        mov     dword [rdi + 20], 1
+        mov     dword [rdi + 24], IMAGE_BASE + ELF_HEADERS ; entry: the block's jump table
+        mov     dword [rdi + 32], 64                    ; program headers follow
+        mov     word [rdi + 52], 64
+        mov     word [rdi + 54], 56
+        mov     word [rdi + 56], 2
+        mov     dword [rdi + 64], 1                     ; PT_LOAD, R | W | X, the whole file
+        mov     dword [rdi + 68], 7
+        mov     dword [rdi + 80], IMAGE_BASE            ; p_vaddr
+        mov     dword [rdi + 88], IMAGE_BASE            ; p_paddr
+        mov     [rdi + 96], rsi                         ; p_filesz
+        mov     [rdi + 104], rsi                        ; p_memsz
+        mov     dword [rdi + 112], 0x1000
+        mov     dword [rdi + 120], 0x6474E551           ; PT_GNU_STACK, R | W
+        mov     dword [rdi + 124], 6
+        mov     dword [rdi + 168], 16
+        ret
+
+; write_file - write a buffer to a new executable file (or report and exit 1).
+;   in: rdi = NUL-terminated path, rsi = buffer, b_file_size = length
+write_file:
+        push    rbx
+        push    r12
+        push    r13
+        push    r14
+        sub     rsp, 8
+        mov     r13, rdi
+        mov     r12, rsi
+        mov     esi, 2                  ; create, executable
+        call    sys_open
+        test    rax, rax
+        js      short .failed
+        mov     rbx, rax
+        mov     r14, [b_file_size]
+.write:
+        test    r14, r14
+        jz      short .done
+        mov     rdi, rbx
+        mov     rsi, r12
+        mov     rdx, r14
+        call    sys_write
+        test    rax, rax
+        jle     short .failed
+        add     r12, rax
+        sub     r14, rax
+        jmp     short .write
+.done:
+        mov     rdi, rbx
+        call    sys_close
+        add     rsp, 8
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbx
+        ret
+.failed:
+        lea     rdi, [w_err]
+        lea     rsi, [s_cannot_write]
+        call    w_cstr
+        lea     rdi, [w_err]
+        mov     rsi, r13
+        call    w_cstr
+        lea     rdi, [w_err]
+        mov     esi, 0x27
+        call    w_byte
+        lea     rdi, [w_err]
+        mov     esi, 10
+        call    w_byte
+        mov     edi, 1
+        call    exit_process
+
+s_opt_output:       db '-o'
+s_opt_target:       db '--target'
+s_target_windows:   db 'x86_64-windows'
+s_target_windows_len equ $ - s_target_windows
+s_target_linux:     db 'x86_64-linux'
+s_target_linux_len  equ $ - s_target_linux
+s_cannot_write:     db "envoc0: error: cannot write '", 0
+s_build_usage:      db 'usage: envoc0 build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]', 10, 0
+
+        align   8, db 0
+b_file_size:    dq 0

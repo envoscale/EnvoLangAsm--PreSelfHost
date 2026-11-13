@@ -1,0 +1,98 @@
+// Envo-S1 ownership (chapter 5, [s1.own.*]; docs/architecture/stage1.md, "Ownership"):
+// which types are `Copy`, which need a drop, and the move checker.
+
+// Is node n an item of the S1 prelude?
+bool IsPreludeNode(*Checker c, u32 n) {
+    u32 file;
+    unsafe { file = c.PreludeFile; }
+    if (file == 0xFFFFFFFF) return false;
+    return CTok(c, NTok(c, n)).File == file;
+}
+
+// [type.copy.1], [s1.type.1]: primitives, `str` and shared views, raw pointers, fieldless
+// enums, and arrays and structs of `Copy` values without a drop are copied; function
+// values, types implementing `IDrop` and anything holding them are moved. A type
+// parameter is `Copy` when a bound says so (`where T : Copy`).
+bool IsCopy(*Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    u8 k = ty.Kind;
+    if (k == TYK_BOOL || k == TYK_INT || k == TYK_STR || k == TYK_PTR || k == TYK_ENUM) return true;
+    if (k == TYK_SLICE) return ty.Count == 0;      // a `mut T[]` is exclusive ([view.1])
+    if (k == TYK_ARRAY) return IsCopy(c, ty.Elem);
+    if (k == TYK_PARAM) {
+        u32 copy;
+        unsafe { copy = c.CopySym; }
+        return copy != 0 && Implements(c, t, SymGet(c, copy).Type);
+    }
+    if (k == TYK_UNION) {
+        if (HasDropImpl(c, t)) return false;
+        return PayloadsAll(c, t, 0);
+    }
+    if (k != TYK_STRUCT) return false;
+    if (HasDropImpl(c, t)) return false;
+    u32 f = CNode(c, SymGet(c, ty.Sym).Node).A;
+    while (f != 0) {
+        if (!IsCopy(c, FieldType(c, t, f))) return false;
+        f = CNode(c, f).Next;
+    }
+    return true;
+}
+
+// For tagged enum type t: what 0 (is `Copy`), 1 (needs a drop: any), 2 (needs a drop,
+// counting type parameters: any) holds of its payload fields.
+bool PayloadsAll(*Checker c, u32 t, u32 what) {
+    TaggedEnumDeclare(c, TypeGet(c, t).Sym);
+    u32 v = CNode(c, SymGet(c, TypeGet(c, t).Sym).Node).B;
+    while (v != 0) {
+        u32 f = CNode(c, v).E;
+        while (f != 0) {
+            u32 ft = PayloadType(c, t, f);
+            if (what == 0 && !IsCopy(c, ft)) return false;
+            if (what == 1 && NeedsDrop(c, ft)) return true;
+            if (what == 2 && NeedsDropAt(c, ft)) return true;
+            f = CNode(c, f).Next;
+        }
+        v = CNode(c, v).Next;
+    }
+    return what == 0;
+}
+
+// Does type t implement the prelude's `IDrop`?
+bool HasDropImpl(*Checker c, u32 t) {
+    u32 drop;
+    unsafe { drop = c.DropSym; }
+    if (drop == 0) return false;
+    return FindImpl(c, t, SymGet(c, drop).Type) != 0;
+}
+
+// NeedsDrop for a type that may still name type parameters: a parameter may need one.
+bool NeedsDropAt(*Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_PARAM) return true;
+    if (ty.Kind == TYK_ARRAY) return NeedsDropAt(c, ty.Elem);
+    if (ty.Kind == TYK_UNION) return HasDropImpl(c, t) || PayloadsAll(c, t, 2);
+    if (ty.Kind != TYK_STRUCT) return false;
+    if (HasDropImpl(c, t)) return true;
+    u32 f = CNode(c, SymGet(c, ty.Sym).Node).A;
+    while (f != 0) {
+        if (NeedsDropAt(c, FieldType(c, t, f))) return true;
+        f = CNode(c, f).Next;
+    }
+    return false;
+}
+
+// Does dropping a value of concrete type t run code ([own.drop.1])? Its own `Drop`, or
+// that of a field or element.
+bool NeedsDrop(*Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_ARRAY) return NeedsDrop(c, ty.Elem);
+    if (ty.Kind == TYK_UNION) return HasDropImpl(c, t) || PayloadsAll(c, t, 1);
+    if (ty.Kind != TYK_STRUCT) return false;
+    if (HasDropImpl(c, t)) return true;
+    u32 f = CNode(c, SymGet(c, ty.Sym).Node).A;
+    while (f != 0) {
+        if (NeedsDrop(c, FieldType(c, t, f))) return true;
+        f = CNode(c, f).Next;
+    }
+    return false;
+}

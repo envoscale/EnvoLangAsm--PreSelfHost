@@ -1,0 +1,264 @@
+// The Stage 1 runtime, part 1: the Envo-Core built-ins (envo-core.md section 6), the
+// heap and panics, with Stage 0's behaviour and messages (docs/architecture/stage1.md).
+// It is compiled into every program envoc1 builds, together with the OS layer
+// (runtime/linux.envo or runtime/windows.envo), which provides the __os_* functions.
+// Names starting with __rt_ and __os_ are reserved for the runtime.
+
+static usize __rt_heap_cur = 0;
+static usize __rt_heap_end = 0;
+static usize __rt_heap_meta = 0;       // *usize: the free lists and the chunk table (D76)
+static usize __rt_argc_value = 0;
+static usize __rt_argv_value = 0;      // *str, argc entries
+
+const usize __RT_HEAP_CHUNK = 0x4000000;      // 64 MiB, as in Stage 0
+
+// The heap's bookkeeping (PLAN D76), __rt_heap_meta words: 0-16 the free lists of
+// blocks of 16 << k bytes, 17 the list of larger blocks, 18 the number of chunks, then
+// each chunk's first and end addresses.
+const usize __RT_CLASSES = 17;
+const usize __RT_LARGE = 17;
+const usize __RT_NCHUNKS = 18;
+const usize __RT_CHUNK_MAX = 256;
+const usize __RT_META_BYTES = 4256;            // (19 + 2 * 256) * 8, rounded up to 16
+const usize __RT_MAGIC = 0x454E564F00000000;   // "ENVO" in a block header's high half
+const usize __RT_FREE_BIT = 0x100;
+
+// The entry point calls __rt_init with the initial stack pointer, then __main, then
+// __rt_exit with its result.
+void __rt_init(i64 sp) {
+    __os_init(sp);
+}
+
+void __rt_exit(i32 code) {
+    __os_exit(code);
+}
+
+// Writes all of a buffer, retrying partial writes; errors end the write silently.
+void __rt_write_all(i32 fd, *u8 p, usize n) {
+    while (n > 0) {
+        isize w = __os_write(fd, p, n);
+        if (w <= 0) return;
+        unsafe { p = &p[w as usize]; }
+        n -= w as usize;
+    }
+}
+
+void __rt_print(str s) {
+    __rt_write_all(1, s.Ptr, s.Len);
+    __rt_write_all(1, "\n".Ptr, 1);
+}
+
+void __rt_write(i32 fd, str s) {
+    __rt_write_all(fd, s.Ptr, s.Len);
+}
+
+isize __rt_read(i32 fd, *u8 buf, usize n) {
+    return __os_read(fd, buf, n);
+}
+
+i32 __rt_open(str path, i32 mode) {
+    return __os_open(path.Ptr, path.Len, mode);
+}
+
+void __rt_close(i32 fd) {
+    __os_close(fd);
+}
+
+// Fresh memory, zeroed by the system: a bump pointer over 64 MiB chunks. n is a multiple
+// of 16.
+*u8 __rt_bump(usize n) {
+    unsafe {
+        if (n > __rt_heap_end - __rt_heap_cur) {
+            usize chunk = __RT_HEAP_CHUNK;
+            if (n > chunk) chunk = (n + 0xFFF) & ~0xFFF;
+            *u8 p = __os_pages(chunk);
+            if (p as usize == 0) __rt_trap(3);
+            __rt_heap_cur = p as usize;
+            __rt_heap_end = p as usize + chunk;
+            __rt_heap_chunk(p as usize, p as usize + chunk);
+        }
+        usize at = __rt_heap_cur;
+        __rt_heap_cur = at + n;
+        return at as *u8;
+    }
+}
+
+// The bookkeeping block, made from the current chunk the first time (or after the
+// script runtime resets the statics: the chunk in use is then the only one known).
+*usize __rt_heap_book() {
+    unsafe {
+        if (__rt_heap_meta == 0) {
+            if (__RT_META_BYTES > __rt_heap_end - __rt_heap_cur) {
+                *u8 p = __os_pages(__RT_HEAP_CHUNK);
+                if (p as usize == 0) __rt_trap(3);
+                __rt_heap_cur = p as usize;
+                __rt_heap_end = p as usize + __RT_HEAP_CHUNK;
+            }
+            __rt_heap_meta = __rt_heap_cur;
+            __rt_heap_cur = __rt_heap_cur + __RT_META_BYTES;
+            *usize m = __rt_heap_meta as *usize;
+            m[__RT_NCHUNKS] = 1;
+            m[__RT_NCHUNKS + 1] = __rt_heap_meta;
+            m[__RT_NCHUNKS + 2] = __rt_heap_end;
+        }
+        return __rt_heap_meta as *usize;
+    }
+}
+
+// Records a new chunk [lo, hi), so frees can tell the heap's pointers from others.
+void __rt_heap_chunk(usize lo, usize hi) {
+    unsafe {
+        if (__rt_heap_meta == 0) return;      // the bookkeeping block records its own
+        *usize m = __rt_heap_meta as *usize;
+        usize n = m[__RT_NCHUNKS];
+        if (n >= __RT_CHUNK_MAX) return;      // more than 16 GiB: frees there are ignored
+        m[__RT_NCHUNKS + 1 + 2 * n] = lo;
+        m[__RT_NCHUNKS + 2 + 2 * n] = hi;
+        m[__RT_NCHUNKS] = n + 1;
+    }
+}
+
+// Zeroed, 16-byte-aligned memory (PLAN D76). Each block has a 16-byte header: the magic
+// number with the size class (and a free mark), then the room it has. A block comes from
+// its class's free list when one is waiting, else fresh from the bump pointer; blocks
+// over 1 MiB are kept on one list, first fit.
+*u8 __rt_alloc(usize n) {
+    n = (n + 15) & ~15;
+    if (n == 0) n = 16;
+    usize k = 0;
+    usize room = 16;
+    while (room < n && k < __RT_CLASSES - 1) {
+        room = room << 1;
+        k++;
+    }
+    if (room < n) {
+        k = __RT_LARGE;
+        room = (n + 0xFFF) & ~0xFFF;
+    }
+    unsafe {
+        *usize m = __rt_heap_book();
+        usize b = 0;
+        if (k < __RT_LARGE) {
+            b = m[k];
+            if (b != 0) {
+                *usize link = b as *usize;
+                m[k] = link[0];
+            }
+        } else {
+            usize prev = 0;
+            usize at = m[__RT_LARGE];
+            while (at != 0 && b == 0) {
+                *usize link = at as *usize;
+                *usize h = (at - 16) as *usize;
+                if (h[1] >= room) {
+                    b = at;
+                    if (prev == 0) m[__RT_LARGE] = link[0];
+                    else {
+                        *usize pl = prev as *usize;
+                        pl[0] = link[0];
+                    }
+                } else {
+                    prev = at;
+                    at = link[0];
+                }
+            }
+        }
+        if (b == 0) {
+            *u8 q = __rt_bump(room + 16);
+            *usize h = q as *usize;
+            h[0] = __RT_MAGIC | k;
+            h[1] = room;
+            return &q[16];
+        }
+        // a block given back before: mark it in use and clear what the caller gets
+        *usize h = (b - 16) as *usize;
+        h[0] = __RT_MAGIC | k;
+        *usize w = b as *usize;
+        usize words = n / 8;
+        for (usize i = 0; i < words; i++) w[i] = 0;
+        return b as *u8;
+    }
+}
+
+// `free` (Envo-S1): gives a block back to its free list. A pointer the heap did not hand
+// out, or one already given back, is ignored.
+void __rt_free(*u8 p) {
+    unsafe {
+        usize a = p as usize;
+        if (a == 0 || a & 15 != 0 || __rt_heap_meta == 0) return;
+        *usize m = __rt_heap_meta as *usize;
+        usize n = m[__RT_NCHUNKS];
+        bool inside = false;
+        for (usize i = 0; i < n && !inside; i++) {
+            if (a >= m[__RT_NCHUNKS + 1 + 2 * i] + 16 && a < m[__RT_NCHUNKS + 2 + 2 * i]) inside = true;
+        }
+        if (!inside) return;
+        *usize h = (a - 16) as *usize;
+        usize w = h[0];
+        if (w & ~0x1FF != __RT_MAGIC || w & __RT_FREE_BIT != 0) return;
+        usize k = w & 0xFF;
+        if (k > __RT_LARGE) return;
+        h[0] = w | __RT_FREE_BIT;
+        *usize link = a as *usize;
+        link[0] = m[k];
+        m[k] = a;
+    }
+}
+
+usize __rt_argc() {
+    unsafe { return __rt_argc_value; }
+}
+
+// Argument i, or an index-out-of-bounds panic.
+str __rt_arg(usize i) {
+    unsafe {
+        if (i >= __rt_argc_value) __rt_trap(1);
+        *str args = __rt_argv_value as *str;
+        return args[i];
+    }
+}
+
+// "panic: <msg>" on stderr, exit code 101.
+void __rt_panic(str msg) {
+    __rt_write_all(2, "panic: ".Ptr, 7);
+    __rt_write_all(2, msg.Ptr, msg.Len);
+    __rt_write_all(2, "\n".Ptr, 1);
+    __os_exit(101);
+}
+
+// A run-time check failed; reason as in eir.md [eir.panic.1].
+void __rt_trap(i64 reason) {
+    str msg = "unreachable code reached";
+    match reason {
+        0 => msg = "integer overflow",
+        1 => msg = "index out of bounds",
+        2 => msg = "division by zero",
+        3 => msg = "out of memory",
+        4 => msg = "shift amount out of range",
+        6 => msg = "str slice is not on a character boundary",
+        _ => msg = "unreachable code reached",
+    }
+    __rt_panic(msg);
+}
+
+// Records the arguments: count and a *str array (both runtime layers build one).
+void __rt_set_args(usize argc, *str argv) {
+    unsafe {
+        __rt_argc_value = argc;
+        __rt_argv_value = argv as usize;
+    }
+}
+
+// The length of a NUL-terminated byte string.
+usize __rt_cstr_len(*u8 p) {
+    usize n = 0;
+    unsafe {
+        while (p[n] != 0) n++;
+    }
+    return n;
+}
+
+// Room for n str values.
+*str __rt_str_array(usize n) {
+    unsafe { return __rt_alloc(n * 16) as *str; }
+}

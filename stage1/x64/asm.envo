@@ -1,0 +1,525 @@
+// An x86-64 encoder: machine code into a buffer, with labels and fixups. Encodings are
+// fixed (memory operands always use a 32-bit displacement, jumps a 32-bit offset), so the
+// output depends only on the instructions, never on a choice of short or long form.
+
+const u8 RAX = 0;
+const u8 RCX = 1;
+const u8 RDX = 2;
+const u8 RBX = 3;
+const u8 RSP = 4;
+const u8 RBP = 5;
+const u8 RSI = 6;
+const u8 RDI = 7;
+const u8 R8 = 8;
+const u8 R9 = 9;
+const u8 R10 = 10;
+const u8 R11 = 11;
+
+// Condition codes (the low nibble of Jcc / SETcc).
+const u8 CC_O = 0;
+const u8 CC_B = 2;      // unsigned <
+const u8 CC_AE = 3;     // unsigned >=
+const u8 CC_E = 4;
+const u8 CC_NE = 5;
+const u8 CC_BE = 6;     // unsigned <=
+const u8 CC_A = 7;      // unsigned >
+const u8 CC_L = 12;     // signed <
+const u8 CC_GE = 13;
+const u8 CC_LE = 14;
+const u8 CC_G = 15;
+
+// Two-operand ALU opcodes (op r/m64, r64).
+const u8 ALU_ADD = 0x01;
+const u8 ALU_OR = 0x09;
+const u8 ALU_AND = 0x21;
+const u8 ALU_SUB = 0x29;
+const u8 ALU_XOR = 0x31;
+const u8 ALU_CMP = 0x39;
+
+// Fixup kinds.
+const u8 FX_REL32 = 1;      // 32-bit offset from the end of the field to the label
+const u8 FX_ABS64 = 2;      // the label's absolute address (image base + RVA)
+const u8 FX_RVA32 = 3;      // the label's RVA, 32 bits (PE import structures)
+const u8 FX_RVA64 = 4;      // the label's RVA, 64 bits (PE import lookup entries)
+
+struct Fixup {
+    u32 At;         // offset of the field in its buffer
+    u32 Label;
+    u8 Kind;
+    bool InData;    // the field is in the data buffer
+}
+
+struct Asm {
+    Buf Code;
+    Buf Data;
+    Vec Labels;     // u64 per label: (in data << 63) | offset, or 0xFFFFFFFFFFFFFFFF if unbound
+    Vec Fixups;
+}
+
+const u64 UNBOUND = 18446744073709551615;
+const u64 DATA_BIT = 0x8000000000000000;
+
+void AsmInit(*Asm a) {
+    unsafe {
+        a.Code = BufNew(1 << 16);
+        a.Data = BufNew(1 << 12);
+        a.Labels = VecNew(8, 1024);
+        a.Fixups = VecNew(sizeof(Fixup), 1024);
+        VecPushU64(&a.Labels, UNBOUND);     // label 0: none
+    }
+}
+
+u32 NewLabel(*Asm a) {
+    unsafe {
+        u32 l = VecLen(&a.Labels) as u32;
+        VecPushU64(&a.Labels, UNBOUND);
+        return l;
+    }
+}
+
+// Binds label l to the current code offset.
+void Bind(*Asm a, u32 l) {
+    unsafe { VecSetU64(&a.Labels, l as usize, BufLen(&a.Code) as u64); }
+}
+
+// Binds label l to the current data offset.
+void BindData(*Asm a, u32 l) {
+    unsafe { VecSetU64(&a.Labels, l as usize, BufLen(&a.Data) as u64 | DATA_BIT); }
+}
+
+// Binds label l to the start of the data.
+void BindDataStart(*Asm a, u32 l) {
+    unsafe { VecSetU64(&a.Labels, l as usize, DATA_BIT); }
+}
+
+// The self-relocation stub at the entry of a Linux program (PLAN D68): the program is
+// position-independent and loaded anywhere, so it adds the load address to each 8-byte
+// absolute address in its data. table holds their count, then each one's data offset
+// (WriteImage fills it); data0 is the data's start. The stub sits at the start of the
+// code, which the image puts at ELF_HEADERS, so the image's base is that much before.
+// Stage 2 emits the same bytes (compiler/backend/x86_64/asm.envo).
+void RelocStub(*Asm a, u32 data0, u32 table) {
+    B(a, 0x4C);                                 // lea r8, [rip - (ELF_HEADERS + 7)]: the base
+    B(a, 0x8D);
+    B(a, 0x05);
+    U32(a, (0x100000000 - (ELF_HEADERS + 7)) as u32);
+    B(a, 0x4C);                                 // lea r9, [rip + data0]
+    B(a, 0x8D);
+    B(a, 0x0D);
+    Rel32(a, data0);
+    B(a, 0x48);                                 // lea rsi, [rip + table]
+    B(a, 0x8D);
+    B(a, 0x35);
+    Rel32(a, table);
+    B(a, 0x8B);                                 // mov ecx, [rsi]: the count
+    B(a, 0x0E);
+    B(a, 0x48);                                 // add rsi, 4
+    B(a, 0x83);
+    B(a, 0xC6);
+    B(a, 0x04);
+    B(a, 0x85);                                 // test ecx, ecx
+    B(a, 0xC9);
+    B(a, 0x74);                                 // jz +14: past the loop
+    B(a, 0x0E);
+    B(a, 0x8B);                                 // loop: mov eax, [rsi]
+    B(a, 0x06);
+    B(a, 0x4D);                                 // add [r9 + rax], r8
+    B(a, 0x01);
+    B(a, 0x04);
+    B(a, 0x01);
+    B(a, 0x48);                                 // add rsi, 4
+    B(a, 0x83);
+    B(a, 0xC6);
+    B(a, 0x04);
+    B(a, 0xFF);                                 // dec ecx
+    B(a, 0xC9);
+    B(a, 0x75);                                 // jnz loop
+    B(a, 0xF2);
+}
+
+usize CodeLen(*Asm a) {
+    unsafe { return BufLen(&a.Code); }
+}
+
+void B(*Asm a, u8 b) {
+    unsafe { BufByte(&a.Code, b); }
+}
+
+void U32(*Asm a, u32 v) {
+    B(a, (v & 0xFF) as u8);
+    B(a, (v >> 8 & 0xFF) as u8);
+    B(a, (v >> 16 & 0xFF) as u8);
+    B(a, (v >> 24) as u8);
+}
+
+void U64(*Asm a, u64 v) {
+    U32(a, (v & 0xFFFFFFFF) as u32);
+    U32(a, (v >> 32) as u32);
+}
+
+void AddFixup(*Asm a, u32 label, u8 kind, bool inData) {
+    unsafe {
+        *Fixup f = VecPush(&a.Fixups) as *Fixup;
+        if (inData) f.At = BufLen(&a.Data) as u32;
+        else f.At = BufLen(&a.Code) as u32;
+        f.Label = label;
+        f.Kind = kind;
+        f.InData = inData;
+    }
+}
+
+// A rel32 field referring to label l (the field is the last part of the instruction).
+void Rel32(*Asm a, u32 l) {
+    AddFixup(a, l, FX_REL32, false);
+    U32(a, 0);
+}
+
+// ------------------------------------------------------------------ encoding helpers
+
+// REX prefix for operand size w (1 = 64-bit), ModRM reg and rm/base register. byteReg: an 8-bit
+// register operand among spl, bpl, sil, dil needs a REX prefix to be addressable.
+void Rex(*Asm a, bool w, u8 reg, u8 rm, bool byteReg) {
+    u8 rex = 0x40;
+    if (w) rex = rex | 8;
+    if (reg >= 8) rex = rex | 4;
+    if (rm >= 8) rex = rex | 1;
+    if (rex != 0x40 || (byteReg && reg >= 4 && reg < 8)) B(a, rex);
+}
+
+// ModRM for a register operand.
+void ModRR(*Asm a, u8 reg, u8 rm) {
+    B(a, 0xC0 | (reg & 7) << 3 | rm & 7);
+}
+
+// ModRM (+ SIB) + disp32 for [base + disp].
+void ModMem(*Asm a, u8 reg, u8 rb, i32 disp) {
+    B(a, 0x80 | (reg & 7) << 3 | rb & 7);
+    if (rb & 7 == RSP) B(a, 0x24);       // SIB: rb only
+    U32(a, disp as u32);
+}
+
+// ------------------------------------------------------------------ moves
+
+// mov dst, src (64-bit)
+void MovRR(*Asm a, u8 dst, u8 src) {
+    Rex(a, true, src, dst, false);
+    B(a, 0x89);
+    ModRR(a, src, dst);
+}
+
+// mov dst, imm64 (shorter forms for small values, but always the same for a given value)
+void MovRI(*Asm a, u8 dst, u64 imm) {
+    if (imm <= 0xFFFFFFFF) {
+        // mov r32, imm32 zero-extends
+        Rex(a, false, 0, dst, false);
+        B(a, 0xB8 + (dst & 7));
+        U32(a, imm as u32);
+        return;
+    }
+    Rex(a, true, 0, dst, false);
+    B(a, 0xB8 + (dst & 7));
+    U64(a, imm);
+}
+
+// Load size bytes from [rb + disp] into dst, zero- or sign-extended to 64 bits.
+void Load(*Asm a, u8 dst, u8 rb, i32 disp, u32 size, bool signed) {
+    if (size == 8) {
+        Rex(a, true, dst, rb, false);
+        B(a, 0x8B);
+    } else if (size == 4 && !signed) {
+        Rex(a, false, dst, rb, false);
+        B(a, 0x8B);
+    } else if (size == 4) {
+        Rex(a, true, dst, rb, false);
+        B(a, 0x63);                     // movsxd
+    } else {
+        Rex(a, signed, dst, rb, false);
+        B(a, 0x0F);
+        if (size == 1 && !signed) B(a, 0xB6);
+        if (size == 2 && !signed) B(a, 0xB7);
+        if (size == 1 && signed) B(a, 0xBE);
+        if (size == 2 && signed) B(a, 0xBF);
+    }
+    ModMem(a, dst, rb, disp);
+}
+
+// Store the low size bytes of src to [rb + disp].
+void Store(*Asm a, u8 rb, i32 disp, u8 src, u32 size) {
+    if (size == 2) B(a, 0x66);
+    Rex(a, size == 8, src, rb, size == 1);
+    if (size == 1) B(a, 0x88);
+    else B(a, 0x89);
+    ModMem(a, src, rb, disp);
+}
+
+// lea dst, [rb + disp]
+void LeaRM(*Asm a, u8 dst, u8 rb, i32 disp) {
+    Rex(a, true, dst, rb, false);
+    B(a, 0x8D);
+    ModMem(a, dst, rb, disp);
+}
+
+// lea dst, [rip + label]
+void LeaLabel(*Asm a, u8 dst, u32 label) {
+    Rex(a, true, dst, 0, false);
+    B(a, 0x8D);
+    B(a, (dst & 7) << 3 | 5);
+    Rel32(a, label);
+}
+
+// ------------------------------------------------------------------ arithmetic
+
+// op dst, src (64-bit): ALU_ADD, ALU_SUB, ALU_AND, ALU_OR, ALU_XOR, ALU_CMP
+void Alu(*Asm a, u8 op, u8 dst, u8 src) {
+    Rex(a, true, src, dst, false);
+    B(a, op);
+    ModRR(a, src, dst);
+}
+
+// op r, imm32 (sign-extended): ext is the ModRM digit (0 add, 5 sub, 7 cmp, 4 and, 1 or)
+void AluImm(*Asm a, u8 ext, u8 r, i32 imm) {
+    Rex(a, true, 0, r, false);
+    B(a, 0x81);
+    ModRR(a, ext, r);
+    U32(a, imm as u32);
+}
+
+// imul dst, src (64-bit, sets OF on signed overflow)
+void ImulRR(*Asm a, u8 dst, u8 src) {
+    Rex(a, true, dst, src, false);
+    B(a, 0x0F);
+    B(a, 0xAF);
+    ModRR(a, dst, src);
+}
+
+// F7 group on r (64-bit): 2 not, 3 neg, 4 mul, 6 div, 7 idiv
+void Group3(*Asm a, u8 ext, u8 r) {
+    Rex(a, true, 0, r, false);
+    B(a, 0xF7);
+    ModRR(a, ext, r);
+}
+
+// D3 group on r by cl (64-bit): 4 shl, 5 shr, 7 sar
+void ShiftCl(*Asm a, u8 ext, u8 r) {
+    Rex(a, true, 0, r, false);
+    B(a, 0xD3);
+    ModRR(a, ext, r);
+}
+
+// test a, b (64-bit)
+void TestRR(*Asm a, u8 x, u8 y) {
+    Rex(a, true, y, x, false);
+    B(a, 0x85);
+    ModRR(a, y, x);
+}
+
+// cqo
+void Cqo(*Asm a) {
+    B(a, 0x48);
+    B(a, 0x99);
+}
+
+// setcc r8 then movzx r64, r8
+void SetCC(*Asm a, u8 cc, u8 r) {
+    Rex(a, false, 0, r, true);
+    B(a, 0x0F);
+    B(a, 0x90 + cc);
+    ModRR(a, 0, r);
+    Extend(a, r, 1, false);
+}
+
+// Re-normalize r to its low size bytes, zero- or sign-extended to 64 bits.
+void Extend(*Asm a, u8 r, u32 size, bool signed) {
+    if (size == 8) return;
+    if (size == 4 && !signed) {
+        // mov r32, r32 zero-extends
+        Rex(a, false, r, r, false);
+        B(a, 0x89);
+        ModRR(a, r, r);
+        return;
+    }
+    if (size == 4) {
+        Rex(a, true, r, r, false);
+        B(a, 0x63);
+        ModRR(a, r, r);
+        return;
+    }
+    Rex(a, true, r, r, size == 1);
+    B(a, 0x0F);
+    if (size == 1 && !signed) B(a, 0xB6);
+    if (size == 2 && !signed) B(a, 0xB7);
+    if (size == 1 && signed) B(a, 0xBE);
+    if (size == 2 && signed) B(a, 0xBF);
+    ModRR(a, r, r);
+}
+
+// ------------------------------------------------------------------ control flow
+
+void Jmp(*Asm a, u32 label) {
+    B(a, 0xE9);
+    Rel32(a, label);
+}
+
+void Jcc(*Asm a, u8 cc, u32 label) {
+    B(a, 0x0F);
+    B(a, 0x80 + cc);
+    Rel32(a, label);
+}
+
+void CallLabel(*Asm a, u32 label) {
+    B(a, 0xE8);
+    Rel32(a, label);
+}
+
+// call [rip + label] (through an import address table entry)
+void CallIndirectLabel(*Asm a, u32 label) {
+    B(a, 0xFF);
+    B(a, 0x15);
+    Rel32(a, label);
+}
+
+// call [r]
+void CallMem(*Asm a, u8 r) {
+    Rex(a, false, 0, r, false);
+    B(a, 0xFF);
+    ModMem(a, 2, r, 0);
+}
+
+// call r
+void CallR(*Asm a, u8 r) {
+    Rex(a, false, 0, r, false);
+    B(a, 0xFF);
+    ModRR(a, 2, r);
+}
+
+void Ret(*Asm a) {
+    B(a, 0xC3);
+}
+
+void Push(*Asm a, u8 r) {
+    Rex(a, false, 0, r, false);
+    B(a, 0x50 + (r & 7));
+}
+
+void Pop(*Asm a, u8 r) {
+    Rex(a, false, 0, r, false);
+    B(a, 0x58 + (r & 7));
+}
+
+void Syscall(*Asm a) {
+    B(a, 0x0F);
+    B(a, 0x05);
+}
+
+void RepMovsb(*Asm a) {
+    B(a, 0xF3);
+    B(a, 0xA4);
+}
+
+void RepStosb(*Asm a) {
+    B(a, 0xF3);
+    B(a, 0xAA);
+}
+
+void Ud2(*Asm a) {
+    B(a, 0x0F);
+    B(a, 0x0B);
+}
+
+// ------------------------------------------------------------------ data
+
+// Data bytes; returns their label.
+u32 DataBytes(*Asm a, str bytes, usize align) {
+    u32 l = NewLabel(a);
+    unsafe {
+        while (BufLen(&a.Data) % align != 0) BufByte(&a.Data, 0);
+        BindData(a, l);
+        BufStr(&a.Data, bytes);
+    }
+    return l;
+}
+
+// size zero bytes of data; returns their label.
+u32 DataZero(*Asm a, usize size, usize align) {
+    u32 l = NewLabel(a);
+    unsafe {
+        while (BufLen(&a.Data) % align != 0) BufByte(&a.Data, 0);
+        BindData(a, l);
+        BufRepeat(&a.Data, 0, size);
+    }
+    return l;
+}
+
+// An 8-byte data field holding label l's absolute address.
+void DataAddr(*Asm a, u32 l) {
+    AddFixup(a, l, FX_ABS64, true);
+    unsafe { BufRepeat(&a.Data, 0, 8); }
+}
+
+// A 4- or 8-byte data field holding label l's RVA.
+void DataRva(*Asm a, u32 l, u32 size) {
+    if (size == 4) AddFixup(a, l, FX_RVA32, true);
+    else AddFixup(a, l, FX_RVA64, true);
+    unsafe { BufRepeat(&a.Data, 0, size as usize); }
+}
+
+void DataU32(*Asm a, u32 v) {
+    unsafe {
+        BufByte(&a.Data, (v & 0xFF) as u8);
+        BufByte(&a.Data, (v >> 8 & 0xFF) as u8);
+        BufByte(&a.Data, (v >> 16 & 0xFF) as u8);
+        BufByte(&a.Data, (v >> 24) as u8);
+    }
+}
+
+void DataAlign(*Asm a, usize align) {
+    unsafe {
+        while (BufLen(&a.Data) % align != 0) BufByte(&a.Data, 0);
+    }
+}
+
+// The offset of label l in the linked section (after AsmLink).
+u64 LabelOffset(*Asm a, u32 l, u64 dataStart) {
+    unsafe {
+        u64 lv = VecGetU64(&a.Labels, l as usize);
+        if (lv & DATA_BIT != 0) return (lv & ~DATA_BIT) + dataStart;
+        return lv;
+    }
+}
+
+// ------------------------------------------------------------------ linking
+
+// Lays img [code][data] at section RVA rva and resolves every fixup. Returns the section
+// bytes; *dataStart receives the data's offset in the section.
+str AsmLink(*Asm a, u64 imageBase, u64 rva, *u64 dataStart) {
+    unsafe {
+        usize codeLen = BufLen(&a.Code);
+        // the data starts on a page of its own, so code and data get their own protections
+        usize dataOff = ((rva as usize + codeLen + 0xFFF) & ~0xFFF) - rva as usize;
+        *dataStart = dataOff as u64;
+        Buf img = BufNew(dataOff + BufLen(&a.Data));
+        BufStr(&img, BufView(&a.Code));
+        BufRepeat(&img, 0, dataOff - codeLen);
+        BufStr(&img, BufView(&a.Data));
+        for (usize i = 0; i < VecLen(&a.Fixups); i++) {
+            Fixup f = *(VecAt(&a.Fixups, i) as *Fixup);
+            u64 lv = VecGetU64(&a.Labels, f.Label as usize);
+            if (lv == UNBOUND) Bug("x64: a label is used but never bound");
+            u64 target = lv & ~DATA_BIT;
+            if (lv & DATA_BIT != 0) target += dataOff as u64;
+            u64 at = f.At as u64;
+            if (f.InData) at += dataOff as u64;
+            if (f.Kind == FX_REL32) {
+                u64 rel = target -% (at + 4);
+                MemStoreU32(&img.Ptr[at as usize], (rel & 0xFFFFFFFF) as u32);
+            } else if (f.Kind == FX_ABS64) {
+                MemStoreU64(&img.Ptr[at as usize], imageBase + rva + target);
+            } else if (f.Kind == FX_RVA32) {
+                MemStoreU32(&img.Ptr[at as usize], (rva + target) as u32);
+            } else {
+                MemStoreU64(&img.Ptr[at as usize], rva + target);
+            }
+        }
+        return BufView(&img);
+    }
+}

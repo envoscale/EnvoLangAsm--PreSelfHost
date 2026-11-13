@@ -1,0 +1,128 @@
+// Process-wide state, buffered output, files and the host.
+//
+// Envo-Core statics can only hold constants, so the state lives in one Ctx struct on the
+// heap, found through a static address. Nothing else in Stage 1 touches a static.
+
+struct Ctx {
+    Buf Out;        // standard output, flushed at exit and when large
+    Buf Err;        // standard error
+    Vec Files;      // SrcFile, in command-line order (diag.envo)
+}
+
+static usize g_ctx = 0;
+
+*Ctx TheCtx() {
+    unsafe {
+        if (g_ctx == 0) {
+            *Ctx c = alloc(sizeof(Ctx)) as *Ctx;
+            c.Out = BufNew(1 << 16);
+            c.Err = BufNew(1 << 12);
+            c.Files = VecNew(sizeof(SrcFile), 8);
+            g_ctx = c as usize;
+        }
+        return g_ctx as *Ctx;
+    }
+}
+
+*Buf Out() {
+    unsafe { return &TheCtx().Out; }
+}
+
+*Buf Err() {
+    unsafe { return &TheCtx().Err; }
+}
+
+void Flush() {
+    *Buf o = Out();
+    *Buf e = Err();
+    if (BufLen(o) > 0) {
+        write(1, BufView(o));
+        BufClear(o);
+    }
+    if (BufLen(e) > 0) {
+        write(2, BufView(e));
+        BufClear(e);
+    }
+}
+
+// Flushes output and ends the process.
+void Exit(i32 code) {
+    Flush();
+    exit(code);
+}
+
+void OutStr(str s) {
+    *Buf o = Out();
+    BufStr(o, s);
+    if (BufLen(o) >= 1 << 16) Flush();
+}
+
+void OutLine(str s) {
+    OutStr(s);
+    OutStr("\n");
+}
+
+void OutU64(u64 v) {
+    BufU64(Out(), v);
+}
+
+void ErrStr(str s) {
+    BufStr(Err(), s);
+}
+
+// ------------------------------------------------------------------ files
+
+// Appends the whole file at path to into. Returns false if it cannot be opened or read.
+bool FileRead(str path, *Buf into) {
+    i32 fd = open(path, 0);
+    if (fd < 0) return false;
+    while (true) {
+        BufReserve(into, 1 << 16);
+        isize n;
+        unsafe { n = read(fd, &into.Ptr[into.Len], into.Cap - into.Len); }
+        if (n < 0) {
+            close(fd);
+            return false;
+        }
+        if (n == 0) break;
+        unsafe { into.Len += n as usize; }
+    }
+    close(fd);
+    return true;
+}
+
+// Writes data to path, replacing it. executable marks the file executable where the OS
+// has such a flag. `write` reports no errors (a full disk just stops it), so the file is
+// read back: false unless it holds exactly data.
+bool FileWrite(str path, str data, bool executable) {
+    i32 mode = 1;
+    if (executable) mode = 2;
+    i32 fd = open(path, mode);
+    if (fd < 0) return false;
+    write(fd, data);
+    close(fd);
+    Buf back = BufNew(data.Len + 1);
+    str got = "";
+    unsafe {
+        if (!FileRead(path, &back)) return false;
+        got = BufView(&back);
+    }
+    if (got.Len != data.Len) return false;
+    for (usize i = 0; i < data.Len; i++) {
+        if (got[i] != data[i]) return false;
+    }
+    return true;
+}
+
+// ------------------------------------------------------------------ host
+
+// The target this process runs on: "x86_64-linux" or "x86_64-windows". Envo-Core has
+// no way to ask, so Stage 1 looks for /proc/self/exe, which exists only on Linux.
+str HostTarget() {
+    i32 fd = open("/proc/self/exe", 0);
+    if (fd >= 0) {
+        close(fd);
+        return "x86_64-linux";
+    }
+    return "x86_64-windows";
+}

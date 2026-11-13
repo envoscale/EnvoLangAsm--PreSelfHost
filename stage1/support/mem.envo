@@ -1,0 +1,73 @@
+// Raw memory helpers. Envo-Core has no slicing and no generics, so Stage 1 handles
+// memory through *u8 pointers inside unsafe blocks, and keeps those blocks here and in
+// the other support files as far as it can.
+
+*u8 MemNull() {
+    unsafe { return 0 as usize as *u8; }
+}
+
+bool MemIsNull(*u8 p) {
+    unsafe { return p as usize == 0; }
+}
+
+// The address n bytes after p.
+*u8 MemAt(*u8 p, usize n) {
+    unsafe { return &p[n]; }
+}
+
+// Copies n bytes from src to dst. The regions must not overlap.
+void MemCopy(*u8 dst, *u8 src, usize n) {
+    unsafe {
+        usize i = 0;
+        // Eight bytes at a time while both addresses allow it.
+        if ((dst as usize | src as usize) & 7 == 0) {
+            *u64 d = dst as *u64;
+            *u64 s = src as *u64;
+            usize words = n / 8;
+            for (usize w = 0; w < words; w++) d[w] = s[w];
+            i = words * 8;
+        }
+        while (i < n) {
+            dst[i] = src[i];
+            i++;
+        }
+    }
+}
+
+void MemZero(*u8 p, usize n) {
+    unsafe {
+        for (usize i = 0; i < n; i++) p[i] = 0;
+    }
+}
+
+bool MemEqual(*u8 a, *u8 b, usize n) {
+    unsafe {
+        for (usize i = 0; i < n; i++) {
+            if (a[i] != b[i]) return false;
+        }
+    }
+    return true;
+}
+
+// New memory holding a copy of the n bytes at p.
+*u8 MemDup(*u8 p, usize n) {
+    *u8 q = alloc(n);
+    MemCopy(q, p, n);
+    return q;
+}
+
+u64 MemLoadU64(*u8 p) {
+    unsafe { return *(p as *u64); }
+}
+
+void MemStoreU64(*u8 p, u64 v) {
+    unsafe { *(p as *u64) = v; }
+}
+
+u32 MemLoadU32(*u8 p) {
+    unsafe { return *(p as *u32); }
+}
+
+void MemStoreU32(*u8 p, u32 v) {
+    unsafe { *(p as *u32) = v; }
+}

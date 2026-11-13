@@ -1,0 +1,268 @@
+// Token kinds and their spellings. Generated from bootstrap/stage0/src/tokens.eas, so
+// both compilers number kinds the same way; keep the two in step. Kinds are ordered:
+// literals and EOF, then keywords (TK_KW_FIRST..TK_KW_LAST), then punctuation
+// (TK_PUNCT_FIRST..TK_PUNCT_LAST), longest spellings first.
+
+struct Token {
+    u16 Kind;
+    u16 Flags;      // TF_SPACE_BEFORE | TF_NEWLINE_BEFORE ([lex.flags.*])
+    u32 Start;      // byte offset in its file (after any BOM)
+    u32 Len;
+    u32 Line;
+    u32 File;       // index into the source file table (diag.envo)
+}
+
+const u16 TF_SPACE_BEFORE = 1;
+const u16 TF_NEWLINE_BEFORE = 2;
+
+const u16 TK_EOF = 0;
+const u16 TK_IDENT = 1;
+const u16 TK_INT = 2;
+const u16 TK_FLOAT = 3;
+const u16 TK_CHAR = 4;
+const u16 TK_STRING = 5;
+const u16 TK_KW_UNDERSCORE = 6;
+const u16 TK_KW_ABSTRACT = 7;
+const u16 TK_KW_ALIGNOF = 8;
+const u16 TK_KW_AS = 9;
+const u16 TK_KW_ASM = 10;
+const u16 TK_KW_ASYNC = 11;
+const u16 TK_KW_AWAIT = 12;
+const u16 TK_KW_BASE = 13;
+const u16 TK_KW_BREAK = 14;
+const u16 TK_KW_CATCH = 15;
+const u16 TK_KW_CLASS = 16;
+const u16 TK_KW_COMPTIME = 17;
+const u16 TK_KW_CONST = 18;
+const u16 TK_KW_CONTINUE = 19;
+const u16 TK_KW_DO = 20;
+const u16 TK_KW_ELSE = 21;
+const u16 TK_KW_ENUM = 22;
+const u16 TK_KW_EXTERN = 23;
+const u16 TK_KW_FALSE = 24;
+const u16 TK_KW_FOR = 25;
+const u16 TK_KW_FOREACH = 26;
+const u16 TK_KW_GOTO = 27;
+const u16 TK_KW_IF = 28;
+const u16 TK_KW_IMPL = 29;
+const u16 TK_KW_IN = 30;
+const u16 TK_KW_INTERFACE = 31;
+const u16 TK_KW_INTERNAL = 32;
+const u16 TK_KW_MACRO = 33;
+const u16 TK_KW_MATCH = 34;
+const u16 TK_KW_NAMESPACE = 35;
+const u16 TK_KW_NEW = 36;
+const u16 TK_KW_NULL = 37;
+const u16 TK_KW_OUT = 38;
+const u16 TK_KW_OVERRIDE = 39;
+const u16 TK_KW_PRIVATE = 40;
+const u16 TK_KW_PROTECTED = 41;
+const u16 TK_KW_PUBLIC = 42;
+const u16 TK_KW_REF = 43;
+const u16 TK_KW_RETURN = 44;
+const u16 TK_KW_SEALED = 45;
+const u16 TK_KW_SIZEOF = 46;
+const u16 TK_KW_STATIC = 47;
+const u16 TK_KW_STRUCT = 48;
+const u16 TK_KW_THIS = 49;
+const u16 TK_KW_THROW = 50;
+const u16 TK_KW_TRUE = 51;
+const u16 TK_KW_TRY = 52;
+const u16 TK_KW_UNSAFE = 53;
+const u16 TK_KW_USE = 54;
+const u16 TK_KW_USING = 55;
+const u16 TK_KW_VAR = 56;
+const u16 TK_KW_VIRTUAL = 57;
+const u16 TK_KW_WEAK = 58;
+const u16 TK_KW_WHERE = 59;
+const u16 TK_KW_WHILE = 60;
+const u16 TK_KW_YIELD = 61;
+const u16 TK_SHL_EQ = 62;
+const u16 TK_SHR_EQ = 63;
+const u16 TK_DOT_DOT_EQ = 64;
+const u16 TK_QQ_EQ = 65;
+const u16 TK_WRAP_ADD_EQ = 66;
+const u16 TK_WRAP_SUB_EQ = 67;
+const u16 TK_WRAP_MUL_EQ = 68;
+const u16 TK_EQ_EQ = 69;
+const u16 TK_NOT_EQ = 70;
+const u16 TK_LT_EQ = 71;
+const u16 TK_GT_EQ = 72;
+const u16 TK_AND_AND = 73;
+const u16 TK_OR_OR = 74;
+const u16 TK_SHL = 75;
+const u16 TK_SHR = 76;
+const u16 TK_PLUS_EQ = 77;
+const u16 TK_MINUS_EQ = 78;
+const u16 TK_STAR_EQ = 79;
+const u16 TK_SLASH_EQ = 80;
+const u16 TK_PERCENT_EQ = 81;
+const u16 TK_AMP_EQ = 82;
+const u16 TK_PIPE_EQ = 83;
+const u16 TK_CARET_EQ = 84;
+const u16 TK_FAT_ARROW = 85;
+const u16 TK_ARROW = 86;
+const u16 TK_COLON_COLON = 87;
+const u16 TK_DOT_DOT = 88;
+const u16 TK_QQ = 89;
+const u16 TK_PLUS_PLUS = 90;
+const u16 TK_MINUS_MINUS = 91;
+const u16 TK_WRAP_ADD = 92;
+const u16 TK_WRAP_SUB = 93;
+const u16 TK_WRAP_MUL = 94;
+const u16 TK_PLUS = 95;
+const u16 TK_MINUS = 96;
+const u16 TK_STAR = 97;
+const u16 TK_SLASH = 98;
+const u16 TK_PERCENT = 99;
+const u16 TK_EQ = 100;
+const u16 TK_LT = 101;
+const u16 TK_GT = 102;
+const u16 TK_BANG = 103;
+const u16 TK_TILDE = 104;
+const u16 TK_AMP = 105;
+const u16 TK_PIPE = 106;
+const u16 TK_CARET = 107;
+const u16 TK_QUESTION = 108;
+const u16 TK_COLON = 109;
+const u16 TK_SEMI = 110;
+const u16 TK_COMMA = 111;
+const u16 TK_DOT = 112;
+const u16 TK_LPAREN = 113;
+const u16 TK_RPAREN = 114;
+const u16 TK_LBRACKET = 115;
+const u16 TK_RBRACKET = 116;
+const u16 TK_LBRACE = 117;
+const u16 TK_RBRACE = 118;
+
+const u16 TK_KW_FIRST = 6;
+const u16 TK_KW_LAST = 61;
+const u16 TK_PUNCT_FIRST = 62;
+const u16 TK_PUNCT_LAST = 118;
+const u16 TK_COUNT = 119;
+
+// The spelling of each kind (for literals and EOF, the class name used by `lex`).
+str TokSpelling(u16 kind) {
+    match kind {
+        TK_EOF => { return "eof"; }
+        TK_IDENT => { return "ident"; }
+        TK_INT => { return "int"; }
+        TK_FLOAT => { return "float"; }
+        TK_CHAR => { return "char"; }
+        TK_STRING => { return "string"; }
+        TK_KW_UNDERSCORE => { return "_"; }
+        TK_KW_ABSTRACT => { return "abstract"; }
+        TK_KW_ALIGNOF => { return "alignof"; }
+        TK_KW_AS => { return "as"; }
+        TK_KW_ASM => { return "asm"; }
+        TK_KW_ASYNC => { return "async"; }
+        TK_KW_AWAIT => { return "await"; }
+        TK_KW_BASE => { return "base"; }
+        TK_KW_BREAK => { return "break"; }
+        TK_KW_CATCH => { return "catch"; }
+        TK_KW_CLASS => { return "class"; }
+        TK_KW_COMPTIME => { return "comptime"; }
+        TK_KW_CONST => { return "const"; }
+        TK_KW_CONTINUE => { return "continue"; }
+        TK_KW_DO => { return "do"; }
+        TK_KW_ELSE => { return "else"; }
+        TK_KW_ENUM => { return "enum"; }
+        TK_KW_EXTERN => { return "extern"; }
+        TK_KW_FALSE => { return "false"; }
+        TK_KW_FOR => { return "for"; }
+        TK_KW_FOREACH => { return "foreach"; }
+        TK_KW_GOTO => { return "goto"; }
+        TK_KW_IF => { return "if"; }
+        TK_KW_IMPL => { return "impl"; }
+        TK_KW_IN => { return "in"; }
+        TK_KW_INTERFACE => { return "interface"; }
+        TK_KW_INTERNAL => { return "internal"; }
+        TK_KW_MACRO => { return "macro"; }
+        TK_KW_MATCH => { return "match"; }
+        TK_KW_NAMESPACE => { return "namespace"; }
+        TK_KW_NEW => { return "new"; }
+        TK_KW_NULL => { return "null"; }
+        TK_KW_OUT => { return "out"; }
+        TK_KW_OVERRIDE => { return "override"; }
+        TK_KW_PRIVATE => { return "private"; }
+        TK_KW_PROTECTED => { return "protected"; }
+        TK_KW_PUBLIC => { return "public"; }
+        TK_KW_REF => { return "ref"; }
+        TK_KW_RETURN => { return "return"; }
+        TK_KW_SEALED => { return "sealed"; }
+        TK_KW_SIZEOF => { return "sizeof"; }
+        TK_KW_STATIC => { return "static"; }
+        TK_KW_STRUCT => { return "struct"; }
+        TK_KW_THIS => { return "this"; }
+        TK_KW_THROW => { return "throw"; }
+        TK_KW_TRUE => { return "true"; }
+        TK_KW_TRY => { return "try"; }
+        TK_KW_UNSAFE => { return "unsafe"; }
+        TK_KW_USE => { return "use"; }
+        TK_KW_USING => { return "using"; }
+        TK_KW_VAR => { return "var"; }
+        TK_KW_VIRTUAL => { return "virtual"; }
+        TK_KW_WEAK => { return "weak"; }
+        TK_KW_WHERE => { return "where"; }
+        TK_KW_WHILE => { return "while"; }
+        TK_KW_YIELD => { return "yield"; }
+        TK_SHL_EQ => { return "<<="; }
+        TK_SHR_EQ => { return ">>="; }
+        TK_DOT_DOT_EQ => { return "..="; }
+        TK_QQ_EQ => { return "??="; }
+        TK_WRAP_ADD_EQ => { return "+%="; }
+        TK_WRAP_SUB_EQ => { return "-%="; }
+        TK_WRAP_MUL_EQ => { return "*%="; }
+        TK_EQ_EQ => { return "=="; }
+        TK_NOT_EQ => { return "!="; }
+        TK_LT_EQ => { return "<="; }
+        TK_GT_EQ => { return ">="; }
+        TK_AND_AND => { return "&&"; }
+        TK_OR_OR => { return "||"; }
+        TK_SHL => { return "<<"; }
+        TK_SHR => { return ">>"; }
+        TK_PLUS_EQ => { return "+="; }
+        TK_MINUS_EQ => { return "-="; }
+        TK_STAR_EQ => { return "*="; }
+        TK_SLASH_EQ => { return "/="; }
+        TK_PERCENT_EQ => { return "%="; }
+        TK_AMP_EQ => { return "&="; }
+        TK_PIPE_EQ => { return "|="; }
+        TK_CARET_EQ => { return "^="; }
+        TK_FAT_ARROW => { return "=>"; }
+        TK_ARROW => { return "->"; }
+        TK_COLON_COLON => { return "::"; }
+        TK_DOT_DOT => { return ".."; }
+        TK_QQ => { return "??"; }
+        TK_PLUS_PLUS => { return "++"; }
+        TK_MINUS_MINUS => { return "--"; }
+        TK_WRAP_ADD => { return "+%"; }
+        TK_WRAP_SUB => { return "-%"; }
+        TK_WRAP_MUL => { return "*%"; }
+        TK_PLUS => { return "+"; }
+        TK_MINUS => { return "-"; }
+        TK_STAR => { return "*"; }
+        TK_SLASH => { return "/"; }
+        TK_PERCENT => { return "%"; }
+        TK_EQ => { return "="; }
+        TK_LT => { return "<"; }
+        TK_GT => { return ">"; }
+        TK_BANG => { return "!"; }
+        TK_TILDE => { return "~"; }
+        TK_AMP => { return "&"; }
+        TK_PIPE => { return "|"; }
+        TK_CARET => { return "^"; }
+        TK_QUESTION => { return "?"; }
+        TK_COLON => { return ":"; }
+        TK_SEMI => { return ";"; }
+        TK_COMMA => { return ","; }
+        TK_DOT => { return "."; }
+        TK_LPAREN => { return "("; }
+        TK_RPAREN => { return ")"; }
+        TK_LBRACKET => { return "["; }
+        TK_RBRACKET => { return "]"; }
+        TK_LBRACE => { return "{"; }
+        TK_RBRACE => { return "}"; }
+        _ => { return "?"; }
+    }
+}

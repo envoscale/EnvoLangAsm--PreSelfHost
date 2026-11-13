@@ -1,0 +1,253 @@
+; =============================================================================
+; src/nodes.eas - syntax tree node kinds and parser lookup tables
+;
+; A node is 32 bytes:
+;   +0 u16 kind   +2 u16 op (token kind of an operator)   +4 u32 token index
+;   +8 u32 a  +12 u32 b  +16 u32 c  +20 u32 d   (children: node indices, 0 = none)
+;   +24 u32 next (next node in the same list)  +28 u32 flags (NF_*)
+; Node 0 is never used, so 0 means "no node". A child slot may hold a list:
+; its first node, with the rest linked through next.
+;
+; node_table: 16 bytes per kind: length, dump name (<= 11 bytes), then at +12
+; the number of child slots the dump prints and at +13 whether the dump shows
+; the node's token text. tok_class: one byte per token kind (see TC_*).
+; =============================================================================
+
+N_KIND          equ 0
+N_OP            equ 2
+N_TOK           equ 4
+N_A             equ 8
+N_B             equ 12
+N_C             equ 16
+N_D             equ 20
+N_NEXT          equ 24
+N_FLAGS         equ 28
+N_SIZE          equ 32
+
+NF_PAREN        equ 1                   ; expression was written in parentheses
+
+NT_SLOTS        equ 12                  ; offsets inside a node_table entry
+NT_TEXT         equ 13
+
+NK_NONE         equ 0
+NK_PROGRAM      equ 1
+NK_FN           equ 2
+NK_PARAM        equ 3
+NK_STRUCT       equ 4
+NK_FIELD        equ 5
+NK_ENUM         equ 6
+NK_VARIANT      equ 7
+NK_CONST        equ 8
+NK_STATIC       equ 9
+NK_TNAME        equ 10
+NK_TPTR         equ 11
+NK_TARRAY       equ 12
+NK_TSLICE       equ 13
+NK_BLOCK        equ 14
+NK_UNSAFE       equ 15
+NK_IF           equ 16
+NK_WHILE        equ 17
+NK_FOR          equ 18
+NK_MATCH        equ 19
+NK_ARM          equ 20
+NK_WILD         equ 21
+NK_BREAK        equ 22
+NK_CONTINUE     equ 23
+NK_RETURN       equ 24
+NK_VAR          equ 25
+NK_EXPR         equ 26
+NK_ASSIGN       equ 27
+NK_INC          equ 28
+NK_DEC          equ 29
+NK_INT          equ 30
+NK_CHAR         equ 31
+NK_STRING       equ 32
+NK_BOOL         equ 33
+NK_NAME         equ 34
+NK_CALL         equ 35
+NK_INDEX        equ 36
+NK_MEMBER       equ 37
+NK_UNARY        equ 38
+NK_BINARY       equ 39
+NK_CAST         equ 40
+NK_SIZEOF       equ 41
+NK_ALIGNOF      equ 42
+NK_NEW          equ 43
+NK_INIT         equ 44
+NK_COUNT        equ 45
+
+TC_PREC         equ 0x0F                ; binary operator level 1-9 ([core.syntax.*]); 0 = not binary
+TC_ASSIGN       equ 0x10                ; assignment operator
+TC_NOT_CORE     equ 0x20                ; operator that only full Envo has
+TC_CORE_KW      equ 0x40                ; keyword that Envo-Core uses
+PREC_COMPARE    equ 3                   ; comparisons do not associate
+
+        align   16, db 0
+node_table:
+        db      4, 'none', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   ;  0 NK_NONE
+        db      7, 'program', 0, 0, 0, 0, 1, 0, 0, 0   ;  1 NK_PROGRAM
+        db      2, 'fn', 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0   ;  2 NK_FN
+        db      5, 'param', 0, 0, 0, 0, 0, 0, 1, 1, 0, 0   ;  3 NK_PARAM
+        db      6, 'struct', 0, 0, 0, 0, 0, 1, 1, 0, 0   ;  4 NK_STRUCT
+        db      5, 'field', 0, 0, 0, 0, 0, 0, 1, 1, 0, 0   ;  5 NK_FIELD
+        db      4, 'enum', 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0   ;  6 NK_ENUM
+        db      7, 'variant', 0, 0, 0, 0, 1, 1, 0, 0   ;  7 NK_VARIANT
+        db      5, 'const', 0, 0, 0, 0, 0, 0, 2, 1, 0, 0   ;  8 NK_CONST
+        db      6, 'static', 0, 0, 0, 0, 0, 2, 1, 0, 0   ;  9 NK_STATIC
+        db      4, 'type', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0   ; 10 NK_TNAME
+        db      3, 'ptr', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 11 NK_TPTR
+        db      5, 'array', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 12 NK_TARRAY
+        db      5, 'slice', 0, 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 13 NK_TSLICE
+        db      5, 'block', 0, 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 14 NK_BLOCK
+        db      6, 'unsafe', 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 15 NK_UNSAFE
+        db      2, 'if', 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0   ; 16 NK_IF
+        db      5, 'while', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 17 NK_WHILE
+        db      3, 'for', 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0   ; 18 NK_FOR
+        db      5, 'match', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 19 NK_MATCH
+        db      3, 'arm', 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 20 NK_ARM
+        db      4, 'wild', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   ; 21 NK_WILD
+        db      5, 'break', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   ; 22 NK_BREAK
+        db      8, 'continue', 0, 0, 0, 0, 0, 0, 0   ; 23 NK_CONTINUE
+        db      6, 'return', 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 24 NK_RETURN
+        db      3, 'var', 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0   ; 25 NK_VAR
+        db      4, 'expr', 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 26 NK_EXPR
+        db      6, 'assign', 0, 0, 0, 0, 0, 2, 1, 0, 0   ; 27 NK_ASSIGN
+        db      3, 'inc', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 28 NK_INC
+        db      3, 'dec', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 29 NK_DEC
+        db      3, 'int', 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0   ; 30 NK_INT
+        db      4, 'char', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0   ; 31 NK_CHAR
+        db      6, 'string', 0, 0, 0, 0, 0, 0, 1, 0, 0   ; 32 NK_STRING
+        db      4, 'bool', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0   ; 33 NK_BOOL
+        db      4, 'name', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0   ; 34 NK_NAME
+        db      4, 'call', 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 35 NK_CALL
+        db      5, 'index', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 36 NK_INDEX
+        db      6, 'member', 0, 0, 0, 0, 0, 1, 1, 0, 0   ; 37 NK_MEMBER
+        db      5, 'unary', 0, 0, 0, 0, 0, 0, 1, 1, 0, 0   ; 38 NK_UNARY
+        db      6, 'binary', 0, 0, 0, 0, 0, 2, 1, 0, 0   ; 39 NK_BINARY
+        db      2, 'as', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 40 NK_CAST
+        db      6, 'sizeof', 0, 0, 0, 0, 0, 1, 0, 0, 0   ; 41 NK_SIZEOF
+        db      7, 'alignof', 0, 0, 0, 0, 1, 0, 0, 0   ; 42 NK_ALIGNOF
+        db      3, 'new', 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0   ; 43 NK_NEW
+        db      4, 'init', 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0   ; 44 NK_INIT
+
+tok_class:
+        db      0x00                 ;   0 TK_EOF eof
+        db      0x00                 ;   1 TK_IDENT ident
+        db      0x00                 ;   2 TK_INT int
+        db      0x00                 ;   3 TK_FLOAT float
+        db      0x00                 ;   4 TK_CHAR char
+        db      0x00                 ;   5 TK_STRING string
+        db      0x40                 ;   6 TK_KW_UNDERSCORE _
+        db      0x00                 ;   7 TK_KW_ABSTRACT abstract
+        db      0x40                 ;   8 TK_KW_ALIGNOF alignof
+        db      0x40                 ;   9 TK_KW_AS as
+        db      0x00                 ;  10 TK_KW_ASM asm
+        db      0x00                 ;  11 TK_KW_ASYNC async
+        db      0x00                 ;  12 TK_KW_AWAIT await
+        db      0x00                 ;  13 TK_KW_BASE base
+        db      0x40                 ;  14 TK_KW_BREAK break
+        db      0x00                 ;  15 TK_KW_CATCH catch
+        db      0x00                 ;  16 TK_KW_CLASS class
+        db      0x00                 ;  17 TK_KW_COMPTIME comptime
+        db      0x40                 ;  18 TK_KW_CONST const
+        db      0x40                 ;  19 TK_KW_CONTINUE continue
+        db      0x00                 ;  20 TK_KW_DO do
+        db      0x40                 ;  21 TK_KW_ELSE else
+        db      0x40                 ;  22 TK_KW_ENUM enum
+        db      0x00                 ;  23 TK_KW_EXTERN extern
+        db      0x40                 ;  24 TK_KW_FALSE false
+        db      0x40                 ;  25 TK_KW_FOR for
+        db      0x00                 ;  26 TK_KW_FOREACH foreach
+        db      0x00                 ;  27 TK_KW_GOTO goto
+        db      0x40                 ;  28 TK_KW_IF if
+        db      0x00                 ;  29 TK_KW_IMPL impl
+        db      0x00                 ;  30 TK_KW_IN in
+        db      0x00                 ;  31 TK_KW_INTERFACE interface
+        db      0x00                 ;  32 TK_KW_INTERNAL internal
+        db      0x00                 ;  33 TK_KW_MACRO macro
+        db      0x40                 ;  34 TK_KW_MATCH match
+        db      0x00                 ;  35 TK_KW_NAMESPACE namespace
+        db      0x40                 ;  36 TK_KW_NEW new
+        db      0x00                 ;  37 TK_KW_NULL null
+        db      0x00                 ;  38 TK_KW_OUT out
+        db      0x00                 ;  39 TK_KW_OVERRIDE override
+        db      0x40                 ;  40 TK_KW_PRIVATE private
+        db      0x00                 ;  41 TK_KW_PROTECTED protected
+        db      0x40                 ;  42 TK_KW_PUBLIC public
+        db      0x00                 ;  43 TK_KW_REF ref
+        db      0x40                 ;  44 TK_KW_RETURN return
+        db      0x00                 ;  45 TK_KW_SEALED sealed
+        db      0x40                 ;  46 TK_KW_SIZEOF sizeof
+        db      0x40                 ;  47 TK_KW_STATIC static
+        db      0x40                 ;  48 TK_KW_STRUCT struct
+        db      0x00                 ;  49 TK_KW_THIS this
+        db      0x00                 ;  50 TK_KW_THROW throw
+        db      0x40                 ;  51 TK_KW_TRUE true
+        db      0x00                 ;  52 TK_KW_TRY try
+        db      0x40                 ;  53 TK_KW_UNSAFE unsafe
+        db      0x00                 ;  54 TK_KW_USE use
+        db      0x00                 ;  55 TK_KW_USING using
+        db      0x40                 ;  56 TK_KW_VAR var
+        db      0x00                 ;  57 TK_KW_VIRTUAL virtual
+        db      0x00                 ;  58 TK_KW_WEAK weak
+        db      0x00                 ;  59 TK_KW_WHERE where
+        db      0x40                 ;  60 TK_KW_WHILE while
+        db      0x00                 ;  61 TK_KW_YIELD yield
+        db      0x10                 ;  62 TK_SHL_EQ <<=
+        db      0x10                 ;  63 TK_SHR_EQ >>=
+        db      0x20                 ;  64 TK_DOT_DOT_EQ ..=
+        db      0x20                 ;  65 TK_QQ_EQ ??=
+        db      0x10                 ;  66 TK_WRAP_ADD_EQ +%=
+        db      0x10                 ;  67 TK_WRAP_SUB_EQ -%=
+        db      0x10                 ;  68 TK_WRAP_MUL_EQ *%=
+        db      0x03                 ;  69 TK_EQ_EQ ==
+        db      0x03                 ;  70 TK_NOT_EQ !=
+        db      0x03                 ;  71 TK_LT_EQ <=
+        db      0x03                 ;  72 TK_GT_EQ >=
+        db      0x02                 ;  73 TK_AND_AND &&
+        db      0x01                 ;  74 TK_OR_OR ||
+        db      0x07                 ;  75 TK_SHL <<
+        db      0x07                 ;  76 TK_SHR >>
+        db      0x10                 ;  77 TK_PLUS_EQ +=
+        db      0x10                 ;  78 TK_MINUS_EQ -=
+        db      0x10                 ;  79 TK_STAR_EQ *=
+        db      0x10                 ;  80 TK_SLASH_EQ /=
+        db      0x10                 ;  81 TK_PERCENT_EQ %=
+        db      0x10                 ;  82 TK_AMP_EQ &=
+        db      0x10                 ;  83 TK_PIPE_EQ |=
+        db      0x10                 ;  84 TK_CARET_EQ ^=
+        db      0x20                 ;  85 TK_FAT_ARROW =>
+        db      0x20                 ;  86 TK_ARROW ->
+        db      0x20                 ;  87 TK_COLON_COLON ::
+        db      0x20                 ;  88 TK_DOT_DOT ..
+        db      0x20                 ;  89 TK_QQ ??
+        db      0x00                 ;  90 TK_PLUS_PLUS ++
+        db      0x00                 ;  91 TK_MINUS_MINUS --
+        db      0x08                 ;  92 TK_WRAP_ADD +%
+        db      0x08                 ;  93 TK_WRAP_SUB -%
+        db      0x09                 ;  94 TK_WRAP_MUL *%
+        db      0x08                 ;  95 TK_PLUS +
+        db      0x08                 ;  96 TK_MINUS -
+        db      0x09                 ;  97 TK_STAR *
+        db      0x09                 ;  98 TK_SLASH /
+        db      0x09                 ;  99 TK_PERCENT %
+        db      0x10                 ; 100 TK_EQ =
+        db      0x03                 ; 101 TK_LT <
+        db      0x03                 ; 102 TK_GT >
+        db      0x00                 ; 103 TK_BANG !
+        db      0x00                 ; 104 TK_TILDE ~
+        db      0x06                 ; 105 TK_AMP &
+        db      0x04                 ; 106 TK_PIPE |
+        db      0x05                 ; 107 TK_CARET ^
+        db      0x20                 ; 108 TK_QUESTION ?
+        db      0x00                 ; 109 TK_COLON :
+        db      0x00                 ; 110 TK_SEMI ;
+        db      0x00                 ; 111 TK_COMMA ,
+        db      0x00                 ; 112 TK_DOT .
+        db      0x00                 ; 113 TK_LPAREN (
+        db      0x00                 ; 114 TK_RPAREN )
+        db      0x00                 ; 115 TK_LBRACKET [
+        db      0x00                 ; 116 TK_RBRACKET ]
+        db      0x00                 ; 117 TK_LBRACE {
+        db      0x00                 ; 118 TK_RBRACE }
+

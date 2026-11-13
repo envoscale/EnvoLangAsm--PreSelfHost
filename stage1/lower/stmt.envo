@@ -1,0 +1,386 @@
+// Lowering statements ([core.stmt.*]).
+
+void LowerStmt(*Lower l, u32 n) {
+    *Checker c = LC(l);
+    Node node = CNode(c, n);
+    u16 k = node.Kind;
+    if (k == NK_BLOCK) {
+        usize mark = DropMark(l);
+        u32 s = node.A;
+        while (s != 0) {
+            LowerStmt(l, s);
+            s = CNode(c, s).Next;
+        }
+        DropDownTo(l, mark, false);
+        return;
+    }
+    if (k == NK_UNSAFE) {
+        LowerStmt(l, node.A);
+        return;
+    }
+    if (k == NK_IF) {
+        u32 then = LNewBlock(l);
+        u32 join = LNewBlock(l);
+        u32 other = join;
+        if (node.C != 0) other = LNewBlock(l);
+        u32 cv = LowerExpr(l, node.A);
+        DropTemps(l);
+        LCondBr(l, cv, then, other);
+        LStart(l, then);
+        LowerStmt(l, node.B);
+        LJumpIfOpen(l, join);
+        if (node.C != 0) {
+            LStart(l, other);
+            LowerStmt(l, node.C);
+            LJumpIfOpen(l, join);
+        }
+        LStart(l, join);
+        return;
+    }
+    if (k == NK_WHILE) {
+        u32 head = LNewBlock(l);
+        u32 body = LNewBlock(l);
+        u32 exit = LNewBlock(l);
+        LBr(l, head);
+        LStart(l, head);
+        u32 cv = LowerExpr(l, node.A);
+        DropTemps(l);
+        LCondBr(l, cv, body, exit);
+        LStart(l, body);
+        PushLoop(l, head, exit);
+        LowerStmt(l, node.B);
+        PopLoop(l);
+        LJumpIfOpen(l, head);
+        LStart(l, exit);
+        return;
+    }
+    if (k == NK_FOR) {
+        usize mark = DropMark(l);      // the init's variables live in the loop's scope
+        if (node.A != 0) LowerStmt(l, node.A);
+        u32 head = LNewBlock(l);
+        u32 body = LNewBlock(l);
+        u32 step = LNewBlock(l);
+        u32 exit = LNewBlock(l);
+        LBr(l, head);
+        LStart(l, head);
+        if (node.B != 0) {
+            u32 cv = LowerExpr(l, node.B);
+            DropTemps(l);
+            LCondBr(l, cv, body, exit);
+        } else LBr(l, body);
+        LStart(l, body);
+        PushLoop(l, step, exit);
+        LowerStmt(l, node.D);
+        PopLoop(l);
+        LJumpIfOpen(l, step);
+        LStart(l, step);
+        if (node.C != 0) LowerStmt(l, node.C);
+        LBr(l, head);
+        LStart(l, exit);
+        DropDownTo(l, mark, false);
+        return;
+    }
+    if (k == NK_BREAK || k == NK_CONTINUE) {
+        unsafe {
+            usize top = VecLen(&l.Loops);
+            u32 target = MemLoadU32(VecAt(&l.Loops, top - 1));
+            if (k == NK_CONTINUE) target = MemLoadU32(VecAt(&l.Loops, top - 2));
+            // leave the loop body's scopes
+            DropDownTo(l, MemLoadU32(VecAt(&l.Loops, top - 3)) as usize, true);
+            LBr(l, target);
+        }
+        return;
+    }
+    if (k == NK_RETURN) {
+        if (node.A == 0) {
+            DropDownTo(l, 0, true);
+            bool top;
+            unsafe { top = l.Top; }
+            if (top) LEmit(l, 58, 0, 0, 0, 0, 1, OpV(LConst(l, ET_I32, 0)), NoOp(), NoOp());
+            else LEmit(l, 58, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+            return;
+        }
+        LowerReturnValue(l, node.A);
+        return;
+    }
+    if (k == NK_FOREACH) {
+        LowerForeach(l, n);
+        return;
+    }
+    if (k == NK_MATCH) {
+        if (NValue(c, n) != 0) LowerMatchS1(l, n, false);     // the Envo-S1 form
+        else LowerMatch(l, n);
+        return;
+    }
+    LowerSimple(l, n);
+}
+
+void LJumpIfOpen(*Lower l, u32 b) {
+    bool open;
+    unsafe { open = l.Block != 0; }
+    if (open) LBr(l, b);
+}
+
+void PushLoop(*Lower l, u32 cont, u32 brk) {
+    unsafe {
+        MemStoreU32(VecPush(&l.Loops), VecLen(&l.Drops) as u32);
+        MemStoreU32(VecPush(&l.Loops), cont);
+        MemStoreU32(VecPush(&l.Loops), brk);
+    }
+}
+
+void PopLoop(*Lower l) {
+    unsafe {
+        VecPop(&l.Loops);
+        VecPop(&l.Loops);
+        VecPop(&l.Loops);
+    }
+}
+
+// return e: a scalar is returned; an aggregate is copied through the hidden pointer.
+void LowerReturnValue(*Lower l, u32 e) {
+    u32 rs;
+    u32 rt;
+    unsafe {
+        rs = l.RetSlot;
+        rt = l.RetType;
+    }
+    u32 v = LowerExpr(l, e);
+    if (rs != 0) {
+        LCopy(l, rs, v, ESizeOf(l, LType(l, rt)) as u64);
+        DropTemps(l);
+        DropDownTo(l, 0, true);
+        LEmit(l, 58, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+        return;
+    }
+    DropTemps(l);
+    DropDownTo(l, 0, true);
+    LEmit(l, 58, 0, 0, 0, 0, 1, OpV(v), NoOp(), NoOp());
+}
+
+// A local's slot, created at its declaration.
+u32 LocalSlotFor(*Lower l, u32 varNode, u32 t) {
+    *Checker c = LC(l);
+    u32 s = VarSym(l, varNode);
+    u32 slot = LSlot(l, LType(l, t));
+    SetSymSlot(l, s, slot);
+    return slot;
+}
+
+// Before an assignment replaces the value of type t at place p (target node a): drop the
+// old value. A local's goes by its drop flag, which the new value then sets; a field of a
+// local only while the local holds a value; any other place always holds one.
+void LowerDropOld(*Lower l, u32 a, u32 t, u32 p) {
+    *Checker c = LC(l);
+    if (!NeedsDrop(c, t)) return;
+    // raw memory may hold nothing yet: a write through a pointer only stores
+    // ([own.unsafe.1]; envo-s1.md section 6)
+    if (ThroughPointer(c, a)) return;
+    u16 k = NKind(c, a);
+    if ((k == NK_NAME || k == NK_THIS) && DropFlag(l, NSym(c, a)) != 0) {
+        DropLocal(l, NSym(c, a));
+        SetDropFlag(l, NSym(c, a), true);
+        return;
+    }
+    u32 top = 0;
+    u32 s;
+    unsafe { s = MemberRoot(c, a, &top); }
+    if (s != 0 && DropFlag(l, s) != 0) {
+        u32 yes = LNewBlock(l);
+        u32 join = LNewBlock(l);
+        LCondBr(l, LLoad(l, ET_BOOL, DropFlag(l, s)), yes, join);
+        LStart(l, yes);
+        DropValue(l, t, p);
+        LBr(l, join);
+        LStart(l, join);
+        return;
+    }
+    DropValue(l, t, p);
+}
+
+// Is place a reached through a raw pointer?
+bool ThroughPointer(*Checker c, u32 a) {
+    while (true) {
+        Node node = CNode(c, a);
+        if (node.Kind == NK_UNARY) return true;      // *p
+        if (node.Kind != NK_MEMBER && node.Kind != NK_INDEX) return false;
+        u8 k = TyKind(c, NType(c, node.A));
+        if (k == TYK_PTR) return true;
+        if (node.Kind == NK_INDEX && k == TYK_SLICE) return false;
+        a = node.A;
+    }
+    return false;
+}
+
+// The local symbol the checker declared for var node n.
+u32 VarSym(*Lower l, u32 n) {
+    unsafe { return MemLoadU32(VecAt(&l.NodeLocals, n as usize)); }
+}
+
+// Stores value v (a scalar, or the address of an aggregate) of checker type t to p.
+void StoreTo(*Lower l, u32 t, u32 v, u32 p) {
+    u32 et = LType(l, t);
+    if (IsAggregate(l, t)) LCopy(l, p, v, ESizeOf(l, et) as u64);
+    else LStore(l, et, v, p);
+}
+
+void LowerSimple(*Lower l, u32 n) {
+    *Checker c = LC(l);
+    Node node = CNode(c, n);
+    u16 k = node.Kind;
+    if (k == NK_VAR) {
+        u32 t = LNType(l, n);
+        u32 v = 0;
+        if (node.B != 0) v = LowerExpr(l, node.B);
+        u32 slot = LocalSlotFor(l, n, t);
+        if (node.B != 0) StoreTo(l, t, v, slot);
+        else LZero(l, slot, ESizeOf(l, LType(l, t)) as u64);
+        // a local without an initializer holds nothing to drop until it is assigned
+        TrackDrop(l, VarSym(l, n), t, node.B != 0, node.Tok);
+        KeepTemps(l, t, false);
+        DropTemps(l);
+        return;
+    }
+    if (k == NK_EXPR) {
+        LowerExpr(l, node.A);
+        DropTemps(l);
+        return;
+    }
+    if (k == NK_ASSIGN) {
+        u32 t = LNType(l, node.A);
+        str op = TokText(c, node.Tok);
+        if (op.Len == 1) {
+            u32 v = LowerExpr(l, node.B);
+            u32 p = LowerPlace(l, node.A);
+            LowerDropOld(l, node.A, t, p);
+            StoreTo(l, t, v, p);
+            DropTemps(l);
+            return;
+        }
+        u32 p = LowerPlace(l, node.A);
+        u32 et = LType(l, t);
+        u32 old = LLoad(l, et, p);
+        u32 r = LowerExpr(l, node.B);
+        u32 v = 0;
+        // compound: the operator is the text before '='
+        str opBase = StrSub(op, 0, op.Len - 1);
+        if (StrEq(opBase, "<<") || StrEq(opBase, ">>")) v = LowerShift(l, StrEq(opBase, "<<"), t, old, r, LNType(l, node.B));
+        else v = LBin(l, ArithOp(opBase, IsSignedType(c, t)), et, old, r);
+        LStore(l, et, v, p);
+        return;
+    }
+    // NK_INC, NK_DEC
+    u32 t = LNType(l, node.A);
+    u32 et = LType(l, t);
+    u32 p = LowerPlace(l, node.A);
+    u32 old = LLoad(l, et, p);
+    u32 one = LConst(l, et, 1);
+    u16 op = 8;
+    if (k == NK_DEC) op = 9;
+    LStore(l, et, LBin(l, op, et, old, one), p);
+}
+
+bool IsSignedType(*Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_ENUM) return TypeGet(c, SymGet(c, ty.Sym).Aux).Signed;
+    return ty.Signed;
+}
+
+// The EIR opcode of an arithmetic or bitwise operator spelling.
+u16 ArithOp(str op, bool signed) {
+    if (StrEq(op, "+")) return 8;
+    if (StrEq(op, "-")) return 9;
+    if (StrEq(op, "*")) return 10;
+    if (StrEq(op, "+%")) return 5;
+    if (StrEq(op, "-%")) return 6;
+    if (StrEq(op, "*%")) return 7;
+    if (StrEq(op, "/")) return 12;
+    if (StrEq(op, "%")) return 13;
+    if (StrEq(op, "&")) return 14;
+    if (StrEq(op, "|")) return 15;
+    if (StrEq(op, "^")) return 16;
+    Bug("lower: unknown operator");
+    return 0;
+}
+
+// match: a switch on the scrutinee; arm bodies in their own blocks.
+void LowerMatch(*Lower l, u32 n) {
+    *Checker c = LC(l);
+    *Module m = LM(l);
+    Node mt = CNode(c, n);
+    u32 st = LNType(l, mt.A);
+    u32 et = LType(l, st);
+    u32 v = LowerExpr(l, mt.A);
+    DropTemps(l);
+    u32 join = LNewBlock(l);
+    u32 dflt = 0;
+    // the switch is emitted by hand: keys and targets for every pattern
+    Vec keys = VecNew(8, 16);
+    Vec targets = VecNew(4, 16);
+    Vec bodies = VecNew(4, 16);
+    u32 arm = mt.B;
+    while (arm != 0) {
+        Node a = CNode(c, arm);
+        u32 b = LNewBlock(l);
+        unsafe { MemStoreU32(VecPush(&bodies), b); }
+        u32 pat = a.A;
+        while (pat != 0) {
+            if (NKind(c, pat) == NK_WILD) dflt = b;
+            else {
+                unsafe {
+                    VecPushU64(&keys, WrapValue(c, NValue(c, pat), IntReprType(c, st)));
+                    MemStoreU32(VecPush(&targets), b);
+                }
+            }
+            pat = CNode(c, pat).Next;
+        }
+        arm = a.Next;
+    }
+    bool hasDefault = dflt != 0;
+    if (!hasDefault) dflt = LNewBlock(l);
+    unsafe {
+        EInst inst;
+        inst.Op = 57;
+        inst.Ty = et;
+        inst.Block = l.Block;
+        inst.FirstOp = ECount(&m.Ops);
+        *(VecPush(&m.Ops) as *EOp) = OpV(v);
+        for (usize i = 0; i < VecLen(&keys); i++) {
+            EOp key;
+            key.Kind = OK_CASE;
+            key.Int = VecGetU64(&keys, i);
+            *(VecPush(&m.Ops) as *EOp) = key;
+            *(VecPush(&m.Ops) as *EOp) = OpTargetOf(MemLoadU32(VecAt(&targets, i)));
+        }
+        *(VecPush(&m.Ops) as *EOp) = OpTargetOf(dflt);
+        inst.NOps = ECount(&m.Ops) - inst.FirstOp;
+        *(VecPush(&m.Insts) as *EInst) = inst;
+        *EBlock blk = EBlockPtr(m, l.Block);
+        blk.NInsts = ECount(&m.Insts) - blk.FirstInst;
+        l.Block = 0;
+    }
+    arm = mt.B;
+    usize i = 0;
+    while (arm != 0) {
+        Node a = CNode(c, arm);
+        unsafe { LStart(l, MemLoadU32(VecAt(&bodies, i))); }
+        LowerStmt(l, a.B);
+        LJumpIfOpen(l, join);
+        i++;
+        arm = a.Next;
+    }
+    if (!hasDefault) {
+        // an exhaustive enum match: no other value can occur
+        LStart(l, dflt);
+        LEmit(l, 60, 0, 0, 0, 0, 0, NoOp(), NoOp(), NoOp());
+    }
+    LStart(l, join);
+}
+
+// The integer type whose bit pattern represents values of type t (an enum's
+// representation, or t itself).
+u32 IntReprType(*Checker c, u32 t) {
+    Type ty = TypeGet(c, t);
+    if (ty.Kind == TYK_ENUM) return SymGet(c, ty.Sym).Aux;
+    return t;
+}
