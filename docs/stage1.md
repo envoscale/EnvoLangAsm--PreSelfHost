@@ -35,7 +35,7 @@ its operands into fixed registers, computes, and stores its result. Block parame
 slots written by the branch that jumps there. There is no register allocator and no
 optimizer; speed is Stage 2's job.
 
-**Calling convention** (the "Envo convention" of [eir.ssa.5], for Stage 1 output): the
+**Calling convention** (the "Envol convention" of [eir.ssa.5], for Stage 1 output): the
 caller reserves `8 × n` bytes, stores argument *i* at `[rsp + 8i]`, keeps `rsp` 16-byte
 aligned, and calls; the callee reads argument *i* at `[rbp + 16 + 8i]`; the result is in
 `rax`; the caller releases the space.
@@ -46,10 +46,10 @@ Stage 0 copies its own assembled runtime block into each program. `envoc1` canno
 **the Stage 1 runtime is written in Envo-Core** (`stage1/runtime/`) and compiled
 into every program it builds, like any other source file:
 
-- `runtime/common.envo`: the heap (a bump allocator over page-sized chunks), the
+- `runtime/common.envol`: the heap (a bump allocator over page-sized chunks), the
   built-ins (`print`, `write`, `read`, `open`, `close`, `alloc`, `exit`, `argc`, `arg`,
   `panic`), panic messages and exit codes, all with Stage 0's behaviour and messages.
-- `runtime/linux.envo` and `runtime/windows.envo`: the OS layer, including Windows'
+- `runtime/linux.envol` and `runtime/windows.envol`: the OS layer, including Windows'
   UTF-16 conversion of paths and its command-line splitting.
 
 The OS layer needs two operations Envo-Core cannot express, which the backend encodes as
@@ -66,12 +66,12 @@ calls into this runtime, so EIR itself stays target-independent and the script V
 implement them directly.
 
 The runtime's source is embedded in `envoc1` as string constants generated from
-`runtime/*.envo` by `envoc1 embed`; `bootstrap.* test` fails if the generated file is out
+`runtime/*.envol` by `envoc1 embed`; `bootstrap.* test` fails if the generated file is out
 of date, so the readable sources and what `envoc1` compiles cannot drift apart.
 
 ## Generics, methods and interfaces (M2.8)
 
-`check/generic.envo` adds Envo-S1's generics to the checker, and lowering compiles each
+`check/generic.envol` adds Envo-S1's generics to the checker, and lowering compiles each
 instantiation separately (monomorphization, PLAN D13).
 
 **Environments.** A generic item has a list of type arguments, its *environment*: the
@@ -132,7 +132,7 @@ Envo-S1 and reported as E0950.
 
 ## Closures (M2.9)
 
-`check/closure.envo` and `lower/closure.envo` implement RFC 0003 with one representation
+`check/closure.envol` and `lower/closure.envol` implement RFC 0003 with one representation
 for every function-typed value: the function value `$fnv = { code: ptr, env: ptr }`
 ([fn.abi.2]). Code takes the hidden result pointer (for an aggregate result), then
 `env`, then the parameters, and is called with `call.ind`. Stage 2 adds the per-closure
@@ -169,26 +169,26 @@ parameter that borrows its caller's variables; M2.10 reports that as E0504
 
 Chapter 5 for Envo-S1 ([s1.own.*]), in four parts:
 
-- **`Copy` and drops** (`check/own.envo`). A type is `Copy` by [type.copy.1]: primitives,
+- **`Copy` and drops** (`check/own.envol`). A type is `Copy` by [type.copy.1]: primitives,
   `str`, shared views, raw pointers, fieldless enums, and arrays and structs of `Copy`
   values that do not implement `IDrop`. Function values are moved. A type parameter is
   `Copy` only under a `where T : Copy` bound, so a generic body that copies a `T` says so.
   A type *needs a drop* when it, a field or an element implements the prelude's `IDrop`.
-- **The move checker** (`check/move.envo`) runs over each body after type checking. It
+- **The move checker** (`check/move.envol`) runs over each body after type checking. It
   follows the structured control flow with a state per tracked place: a local that is not
   `Copy`, or one first-level field of one (a partial move). Where paths meet, a place moved
   on one of them is *maybe moved*; a loop body is rechecked from the join of its entry and
   its back edges until that join is stable. Using a moved place is E0501. Moving out of an
   `in` or `ref` parameter or receiver, an array element, a temporary's field or a lambda's
   capture is E0502. Each move of a whole local is recorded for lowering.
-- **Drops** (`lower/drop.envo`). Each local whose type needs a drop gets a drop flag, set
+- **Drops** (`lower/drop.envol`). Each local whose type needs a drop gets a drop flag, set
   when it is initialized and cleared where it is moved, so conditional moves need no
   analysis at run time. Leaving a scope (the end of a block, `break`, `continue`,
   `return`, the end of a function or of `__main`) drops the live locals it owns, newest
   first: the type's `Drop`, then its fields in declaration order ([own.drop.1]). An
   assignment drops the old value first; a temporary that needs a drop is dropped at the
   end of its statement. `Drop` methods are instantiated on demand during lowering.
-- **Borrows** (`check/borrow.envo`). Borrows created by a call last for the call: a local
+- **Borrows** (`check/borrow.envol`). Borrows created by a call last for the call: a local
   passed `ref`, or captured by a lambda argument that changes it, may not be used any
   other way in that call (E0503), and a local the call borrows may not be moved by it
   (E0504). A function-typed parameter may hold a lambda that borrows its caller's
@@ -207,7 +207,7 @@ heap never frees.
 
 ## Enums (M2.11)
 
-`check/enums.envo` and `lower/enums.envo`. An enum with a payload on any variant, or with
+`check/enums.envol` and `lower/enums.envol`. An enum with a payload on any variant, or with
 type parameters, is a *tagged enum* (`TYK_UNION`): a `u32` tag holding the variant's
 index, then the payload of the variant it holds. In EIR it is `{ u32, [K x word] }`,
 where `word` is the largest payload alignment and K words fit the largest payload; each
@@ -238,7 +238,7 @@ integers, exactly as in Envo-Core, so Core programs are unchanged.
 
 ## Views (M2.12)
 
-`check/views.envo` and `lower/views.envo` implement RFC 0002 and RFC 0004's views. `T[]`
+`check/views.envol` and `lower/views.envol` implement RFC 0002 and RFC 0004's views. `T[]`
 and `mut T[]` share `str`'s representation `{ ptr, u64 }`; `mut T[]` is a separate
 interned type that is not `Copy`, may be written through, converts to `T[]`, and is
 reborrowed (not moved) when passed to a `mut T[]` parameter. Slicing checks its bounds in
@@ -261,7 +261,7 @@ prelude always mean the prelude's own items, whatever a program defines.
 
 ## Namespaces (M2.12)
 
-`check/names.envo`. A file's `namespace a.b;` puts its items in program scope as
+`check/names.envol`. A file's `namespace a.b;` puts its items in program scope as
 `a.b.X`; files without one share the root. An unqualified name is looked up in the
 file's namespace and those around it, then in the file's `use` imports, then in the
 root. A qualified name in an expression (`a.b.F(x)`, `alias.T.Make()`) is resolved when it

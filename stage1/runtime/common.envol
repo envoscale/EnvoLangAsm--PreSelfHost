@@ -1,7 +1,7 @@
 // The Stage 1 runtime, part 1: the Envo-Core built-ins (envo-core.md section 6), the
 // heap and panics, with Stage 0's behaviour and messages (docs/architecture/stage1.md).
 // It is compiled into every program envoc1 builds, together with the OS layer
-// (runtime/linux.envo or runtime/windows.envo), which provides the __os_* functions.
+// (runtime/linux.envol or runtime/windows.envol), which provides the __os_* functions.
 // Names starting with __rt_ and __os_ are reserved for the runtime.
 
 static usize __rt_heap_cur = 0;

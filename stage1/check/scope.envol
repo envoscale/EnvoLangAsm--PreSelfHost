@@ -1,5 +1,5 @@
 // Checker state, symbols, scopes, types and diagnostics. Follows Stage 0's check.eas;
-// see check/decl.envo, check/stmt.envo and check/expr.envo for the passes.
+// see check/decl.envol, check/stmt.envol and check/expr.envol for the passes.
 
 struct Checker {
     *Vec Toks;
@@ -8,7 +8,7 @@ struct Checker {
     Vec NValue;         // u64 per node: constant value (expressions, enum variants), field offset
     Vec NSym;           // u32 per node: the symbol a name resolved to; an item's symbol
     Vec NMatched;       // u8 per node: a match pattern whose value was recorded
-    Vec NMove;          // u8 per node: 1 where a use moves a whole local (check/move.envo)
+    Vec NMove;          // u8 per node: 1 where a use moves a whole local (check/move.envol)
     Vec NConv;          // u8 per node: 1 where a `string` is used as a `str`
     Vec Types;          // Type
     Vec Syms;           // Sym
@@ -25,7 +25,7 @@ struct Checker {
     Vec ParamTypes;     // u32: parameter types of functions and built-ins
     bool Core;          // --core
     bool Runtime;       // compiling with the runtime: the target built-ins exist
-    // Envo-S1 generics, methods and interfaces (check/generic.envo)
+    // Envo-S1 generics, methods and interfaces (check/generic.envol)
     Vec TypeArgs;       // u32: type arguments of instances and of call environments
     Map Instances;      // interned generic instance types
     Map Methods;        // "<owner key>.<name>" -> method symbol | (impl index + 1) << 32
@@ -40,11 +40,11 @@ struct Checker {
     u32 CurFn;          // the function whose body is being checked (0: top level)
     u32 CurBounds;      // its bounds
     u32 NCurBounds;
-    // lambdas (check/closure.envo)
+    // lambdas (check/closure.envol)
     Vec LamStack;       // u32 triples for the lambdas being checked: node, locals start, first change
     Vec CapTmp;         // u32 pairs (lambda, local) found so far
     Vec Captures;       // u32 locals, each lambda's contiguous (its NValue: first | count << 32)
-    // ownership (check/own.envo)
+    // ownership (check/own.envol)
     u32 PreludeFile;    // the source file of the S1 prelude (0xFFFFFFFF: none)
     u32 CopySym;        // the built-in auto-interface `Copy`
     u32 DropSym;        // the prelude's `IDrop`
@@ -52,12 +52,12 @@ struct Checker {
     u32 ResultSym;      // the prelude's `Result`
     u32 StringSym;      // the prelude's `string`
     Map PreludeScope;   // the prelude's items by name, hidden or not
-    // namespaces (check/names.envo)
+    // namespaces (check/names.envol)
     Vec FileNs;         // str per source file: its namespace
     Map NsSet;          // every namespace and namespace prefix
     Vec Uses;           // u32: the `use` items
     Map TokSym;         // token index -> the item a qualified name resolved to
-    Map Summaries;      // function symbol -> its storage summary (check/views.envo)
+    Map Summaries;      // function symbol -> its storage summary (check/views.envol)
 }
 
 // ------------------------------------------------------------------ side tables

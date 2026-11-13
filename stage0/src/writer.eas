@@ -18,7 +18,7 @@ TARGET_WINDOWS  equ 0
 TARGET_LINUX    equ 1
 ELF_HEADERS     equ 176                 ; ELF header (64) + 2 program headers (56 each)
 
-; cmd_build - envoc0 build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]
+; cmd_build - envoc0 build <file.envol>... -o <output> [--target x86_64-windows|x86_64-linux]
 ;   in: rdi = argv, rsi = argc. Does not return. The first file is the entry file.
 ; rbx = argv, r12 = argc, r13 = input count, r14 = output, r15d = target
 cmd_build:
@@ -365,7 +365,7 @@ s_target_windows_len equ $ - s_target_windows
 s_target_linux:     db 'x86_64-linux'
 s_target_linux_len  equ $ - s_target_linux
 s_cannot_write:     db "envoc0: error: cannot write '", 0
-s_build_usage:      db 'usage: envoc0 build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]', 10, 0
+s_build_usage:      db 'usage: envoc0 build <file.envol>... -o <output> [--target x86_64-windows|x86_64-linux]', 10, 0
 
         align   8, db 0
 b_file_size:    dq 0

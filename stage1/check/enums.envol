@@ -176,7 +176,7 @@ u32 CheckVariantValue(*Checker c, u32 n, u32 s, u32 v, u32 t, u32 args, bool has
     if (t != 0 && TypeGet(c, t).Sym == s) {
         for (u32 i = 0; i < ne; i++) EnvSet(c, env, i, EnvGet(c, TypeGet(c, t).Args, i));
     }
-    // the payload, like the arguments of a call (check/expr.envo, CheckCallTo)
+    // the payload, like the arguments of a call (check/expr.envol, CheckCallTo)
     u32 a = args;
     u32 f = CNode(c, v).E;
     while (a != 0) {

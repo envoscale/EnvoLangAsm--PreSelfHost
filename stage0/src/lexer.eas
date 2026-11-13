@@ -1,7 +1,7 @@
 ; =============================================================================
 ; src/lexer.eas - the Envo-Core lexer (docs/spec/01-lexical.md)
 ;
-; Implements the full Envo lexical grammar where that is cheap (every keyword is
+; Implements the full Envol lexical grammar where that is cheap (every keyword is
 ; reserved and every operator is lexed), and rejects the few constructs Envo-Core
 ; leaves out with E09xx errors. Literal values are validated but not computed:
 ; the parser converts the literals it needs.

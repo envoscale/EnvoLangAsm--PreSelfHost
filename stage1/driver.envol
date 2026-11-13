@@ -29,7 +29,7 @@ void LoadSources(usize first, usize count) {
     }
 }
 
-// `envoc1 lex <file.envo>`
+// `envoc1 lex <file.envol>`
 void CmdLex(usize argi, bool core) {
     if (argc() != argi + 1) {
         Usage(2);
@@ -53,7 +53,7 @@ void LexAll(*Vec toks, *Vec starts, bool core) {
     }
 }
 
-// `envoc1 parse <file.envo>`
+// `envoc1 parse <file.envol>`
 void CmdParse(usize argi, bool core) {
     if (argc() != argi + 1) {
         Usage(2);
@@ -71,7 +71,7 @@ void CmdParse(usize argi, bool core) {
     Exit(EXIT_OK);
 }
 
-// `envoc1 check <file.envo>...`: names and types; prints the typed syntax tree.
+// `envoc1 check <file.envol>...`: names and types; prints the typed syntax tree.
 void CmdCheck(usize argi, bool core) {
     if (argc() <= argi) {
         Usage(2);
@@ -79,7 +79,7 @@ void CmdCheck(usize argi, bool core) {
     }
     LoadSources(argi, argc() - argi);
     u32 prelude = 0xFFFFFFFF;
-    if (!core) prelude = SrcAdd("<prelude>/prelude.envo", RUNTIME_3);
+    if (!core) prelude = SrcAdd("<prelude>/prelude.envol", RUNTIME_3);
     Vec toks = VecNew(sizeof(Token), 1024);
     Vec starts = VecNew(8, 4);
     Vec nodes = VecNew(sizeof(Node), 4096);
@@ -114,7 +114,7 @@ void CmdEirCheck(usize argi) {
 }
 
 // `envoc1 embed <file>...`: prints an Envo-Core source file that holds each file's text as
-// a string constant (RUNTIME_0, RUNTIME_1, …). bootstrap/stage1/runtime/embedded.envo is
+// a string constant (RUNTIME_0, RUNTIME_1, …). bootstrap/stage1/runtime/embedded.envol is
 // made this way from the runtime sources, and the bootstrap tests check it is current.
 void CmdEmbed(usize argi) {
     usize count = argc() - argi;
@@ -187,7 +187,7 @@ Checker NewChecker(*Vec toks, *Vec nodes, bool core, bool runtime) {
 }
 
 void BuildUsage() {
-    write(2, "usage: envoc1 build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]\n");
+    write(2, "usage: envoc1 build <file.envol>... -o <output> [--target x86_64-windows|x86_64-linux]\n");
     Exit(EXIT_USAGE);
 }
 
@@ -195,11 +195,11 @@ void BuildUsage() {
 // target, to a verified EIR module.
 void CompileProgram(*Vec fileArgs, u32 target, bool core, *Module m, bool verify) {
     for (usize i = 0; i < VecLen(fileArgs); i++) LoadSources(VecGetU64(fileArgs, i) as usize, 1);
-    SrcAdd("<runtime>/common.envo", RUNTIME_0);
-    if (target == TARGET_WINDOWS) SrcAdd("<runtime>/windows.envo", RUNTIME_2);
-    else SrcAdd("<runtime>/linux.envo", RUNTIME_1);
+    SrcAdd("<runtime>/common.envol", RUNTIME_0);
+    if (target == TARGET_WINDOWS) SrcAdd("<runtime>/windows.envol", RUNTIME_2);
+    else SrcAdd("<runtime>/linux.envol", RUNTIME_1);
     u32 prelude = 0xFFFFFFFF;
-    if (!core) prelude = SrcAdd("<prelude>/prelude.envo", RUNTIME_3);
+    if (!core) prelude = SrcAdd("<prelude>/prelude.envol", RUNTIME_3);
     Vec toks = VecNew(sizeof(Token), 1024);
     Vec starts = VecNew(8, 4);
     Vec nodes = VecNew(sizeof(Node), 4096);
@@ -245,7 +245,7 @@ u32 ParseBuildArgs(usize argi, *Vec files, *str output) {
     return target;
 }
 
-// `envoc1 build <file.envo>... -o <output> [--target …]`
+// `envoc1 build <file.envol>... -o <output> [--target …]`
 void CmdBuild(usize argi, bool core) {
     Vec files = VecNew(8, 4);
     str output = "";
@@ -269,7 +269,7 @@ void CmdBuild(usize argi, bool core) {
     Exit(EXIT_OK);
 }
 
-// `envoc1 eir <file.envo>... [--target …]`: the program's EIR, runtime included.
+// `envoc1 eir <file.envol>... [--target …]`: the program's EIR, runtime included.
 void CmdEir(usize argi, bool core) {
     Vec files = VecNew(8, 4);
     str output = "";

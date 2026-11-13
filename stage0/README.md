@@ -56,10 +56,10 @@ How it fits together, and why it is built this way:
 ## Usage (today)
 
 ```
-envoc0 lex <file.envo>     print the token stream
-envoc0 parse <file.envo>   print the syntax tree
-envoc0 check <file.envo>   check names and types; print the typed tree
-envoc0 build <file.envo> -o <exe> [--target x86_64-windows|x86_64-linux]
+envoc0 lex <file.envol>     print the token stream
+envoc0 parse <file.envol>   print the syntax tree
+envoc0 check <file.envol>   check names and types; print the typed tree
+envoc0 build <file.envol> -o <exe> [--target x86_64-windows|x86_64-linux]
 envoc0 version             print the version
 envoc0 help                print usage
 ```

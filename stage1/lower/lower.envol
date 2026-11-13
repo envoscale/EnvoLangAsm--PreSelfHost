@@ -25,13 +25,13 @@ struct Lower {
     u32 Target;
     u32 Env;            // the generic environment of the function being lowered
     u32 NEnv;
-    // function values (lower/closure.envo)
+    // function values (lower/closure.envol)
     u32 FnvType;        // $fnv = { ptr, ptr }
     u32 LamCount;
     Vec PendingLams;    // u32 quintuples: lambda node, EIR function, env struct, Env, NEnv
     Vec PendingThunks;  // u32 pairs: function symbol, thunk
     Map Thunks;         // function symbol -> thunk
-    // drops (lower/drop.envo)
+    // drops (lower/drop.envol)
     Vec DropFlags;      // u32 per checker symbol: a local's drop flag slot
     Vec Drops;          // u32: the locals with a drop flag, in scope order
     Vec Temps;          // u32 pairs (type, address): the statement's temporaries to drop

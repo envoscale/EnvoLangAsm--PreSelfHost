@@ -1,5 +1,5 @@
 #!/bin/sh
-# EnvoScaleAsm: builds the Envo compiler up from assembly, for Linux and Windows
+# EnvoScaleAsm: builds the Envol compiler up from assembly, for Linux and Windows
 # (Git Bash). bootstrap.ps1 is the Windows PowerShell twin; keep the two in step.
 #
 #   ./bootstrap.sh build       stage 0 from assembly (NASM, or the hex seed without it),
@@ -240,34 +240,34 @@ do_test() {
     if [ "$rc" -eq 2 ] && grep -q '^usage: envoc0' "$TMP/err"; then pass; else bad 'no arguments' "exit $rc"; fi
     run "$ROOT" frobnicate
     if [ "$rc" -eq 2 ] && grep -q "^envoc0: error: unknown command 'frobnicate'" "$TMP/err"; then pass; else bad 'unknown command' "exit $rc"; fi
-    run "$ROOT" lex 'no such file.envo'
-    if [ "$rc" -eq 1 ] && grep -q "^envoc0: error: cannot open 'no such file.envo'" "$TMP/err"; then pass; else bad 'missing file' "exit $rc"; fi
+    run "$ROOT" lex 'no such file.envol'
+    if [ "$rc" -eq 1 ] && grep -q "^envoc0: error: cannot open 'no such file.envol'" "$TMP/err"; then pass; else bad 'missing file' "exit $rc"; fi
     # Paths are UTF-8 on every OS: a name with a space, a Latin, a CJK and a non-BMP character.
-    uname=$(printf 'u\303\274nicode \346\227\245\360\237\230\200.envo')
+    uname=$(printf 'u\303\274nicode \346\227\245\360\237\230\200.envol')
     printf 'print("hi")\n' > "$TMP/$uname"
     run "$TMP" lex "$uname"
     if [ "$rc" -eq 0 ] && head -n 1 "$TMP/out" | grep -q '^1:1 n ident print'; then pass; else bad 'unicode path' "exit $rc: $(cat "$TMP/err")"; fi
     # Cross-compilation: this host builds the other OS's executable (it can only check the header).
     printf 'print("hi")
-' > "$TMP/cross.envo"
+' > "$TMP/cross.envol"
     case "$EXE" in
         *.exe) other=x86_64-linux; magic='7f454c46' ;;
         *) other=x86_64-windows; magic='4d5a' ;;
     esac
-    run "$TMP" build cross.envo -o cross-out --target "$other"
+    run "$TMP" build cross.envol -o cross-out --target "$other"
     got=$(od -A n -t x1 -N 4 "$TMP/cross-out" 2>/dev/null | tr -d ' \n')
     case "$got" in "$magic"*) pass ;; *) bad "cross build ($other)" "exit $rc, header $got" ;; esac
 
-    # Golden suites: tests/golden/<dir>/<name>.envo -> <name><ext>, produced by
+    # Golden suites: tests/golden/<dir>/<name>.envol -> <name><ext>, produced by
     # `envoc0 <command>`. Keep this list in step with bootstrap.ps1.
     for suite in lexer:lex:.tokens parser:parse:.ast check:check:.check; do
       sdir=${suite%%:*}; rest=${suite#*:}; cmd=${rest%%:*}; ext=${rest#*:}
       say "golden tests: tests/golden/$sdir"
       dir="$ES/tests/golden/$sdir"
-      for f in "$dir"/*.envo; do
+      for f in "$dir"/*.envol; do
         base=$(basename "$f")
         name="golden/$sdir/$base"
-        expected="${f%.envo}$ext"
+        expected="${f%.envol}$ext"
         [ -f "$expected" ] || { bad "$name" "missing $ext file"; continue; }
         run "$dir" "$cmd" "$base"
         if [ "$rc" -ne 0 ]; then bad "$name" "exit $rc: $(tr -d '\r' < "$TMP/err")"; continue; fi
@@ -284,7 +284,7 @@ do_test() {
     for sdir in 01-lexical core-syntax core-types; do
       say "spec tests: tests/spec/$sdir"
       dir="$ES/tests/spec/$sdir"
-      for f in "$dir"/*.envo; do
+      for f in "$dir"/*.envol; do
         base=$(basename "$f")
         name="spec/$sdir/$base"
         line=$(LC_ALL=C grep -a -m1 '^// expect-error: ' "$f" | tr -d '\r' || true)
@@ -322,9 +322,9 @@ do_test() {
         [ "$compiler" = envoc ] && run_suites="core-run s1-run s2-run"
         for suite in $run_suites; do
         say "run tests ($compiler): tests/spec/$suite"
-        for f in "$ES"/tests/spec/$suite/*.envo; do
-            base=$(basename "$f" .envo)
-            name="$compiler spec/$suite/$base.envo"
+        for f in "$ES"/tests/spec/$suite/*.envol; do
+            base=$(basename "$f" .envol)
+            name="$compiler spec/$suite/$base.envol"
             sed -n 's|^// expect: \(.*\)$|\1|p' "$f" | tr -d '\r' > "$TMP/expected"
             want_code=$(sed -n 's|^// expect-exit: \([0-9]*\).*|\1|p' "$f" | head -n 1)
             panic=$(sed -n 's|^// expect-panic: \(.*\)$|\1|p' "$f" | tr -d '\r' | head -n 1)
@@ -381,8 +381,8 @@ do_test() {
         done
         done
 
-        # Multi-file programs: one folder per test. main.envo is the entry file and holds
-        # the annotations; the other .envo files follow in name order. Either
+        # Multi-file programs: one folder per test. main.envol is the entry file and holds
+        # the annotations; the other .envol files follow in name order. Either
         # `// expect-error: E#### @ <file>:L:C` (envoc0 check) or `// expect:` lines (build, run).
         # Envo-S1 programs of several files (tests/spec/s1-multi) under Stages 1 and 2 only.
         multi_suites="core-multi s1-multi"
@@ -393,12 +393,12 @@ do_test() {
             d=${d%/}
             base=$(basename "$d")
             name="$compiler spec/$msuite/$base"
-            set -- main.envo
-            for f in "$d"/*.envo; do
+            set -- main.envol
+            for f in "$d"/*.envol; do
                 f=$(basename "$f")
-                [ "$f" = main.envo ] || set -- "$@" "$f"
+                [ "$f" = main.envol ] || set -- "$@" "$f"
             done
-            line=$(grep -m1 '^// expect-error: ' "$d/main.envo" | tr -d '\r' || true)
+            line=$(grep -m1 '^// expect-error: ' "$d/main.envol" | tr -d '\r' || true)
             if [ -n "$line" ]; then
                 code=$(printf '%s\n' "$line" | sed 's|^// expect-error: \(E[0-9]*\) @ .*|\1|')
                 want="${line##* @ }: error[$code]"
@@ -407,7 +407,7 @@ do_test() {
                 else bad "$name" "expected exit 1 with '$want'; got exit $rc: $(tr -d '\r' < "$TMP/err")"; fi
                 continue
             fi
-            sed -n 's|^// expect: \(.*\)$|\1|p' "$d/main.envo" | tr -d '\r' > "$TMP/expected"
+            sed -n 's|^// expect: \(.*\)$|\1|p' "$d/main.envol" | tr -d '\r' > "$TMP/expected"
             program="$rundir/$msuite-$base"
             case "$EXE" in *.exe) program="$program.exe" ;; esac
             run "$d" build "$@" -o "$program"
@@ -455,11 +455,11 @@ do_test() {
     if [ "$rc" -eq 2 ] && grep -q "^envoc1: error: unknown command 'frobnicate'" "$TMP/err"; then pass; else bad 'envoc1 unknown command' "exit $rc"; fi
 
     # The runtime embedded in envoc1 must be generated from the current runtime sources.
-    run "$STAGE1" embed runtime/common.envo runtime/linux.envo runtime/windows.envo prelude/prelude.envo
-    tr -d '\r' < "$STAGE1/runtime/embedded.envo" > "$TMP/expected"
+    run "$STAGE1" embed runtime/common.envol runtime/linux.envol runtime/windows.envol prelude/prelude.envol
+    tr -d '\r' < "$STAGE1/runtime/embedded.envol" > "$TMP/expected"
     tr -d '\r' < "$TMP/out" > "$TMP/actual"
     if [ "$rc" -eq 0 ] && cmp -s "$TMP/expected" "$TMP/actual"; then pass
-    else bad 'envoc1 embedded runtime' "stage1/runtime/embedded.envo is stale: regenerate it with envoc1 embed (see docs/stage1.md)"; fi
+    else bad 'envoc1 embedded runtime' "stage1/runtime/embedded.envol is stale: regenerate it with envoc1 embed (see docs/stage1.md)"; fi
 
     # The x86-64 encoder and image writer: a minimal native program must exit with 42.
     case "$ENVOC1" in *.exe) host_os=windows ;; *) host_os=linux ;; esac
@@ -485,12 +485,12 @@ do_test() {
         [ "$modes" = s1 ] && [ "$mode" = --core ] && continue
         say "stage 1 golden tests ($mode): tests/golden/$sdir"
         dir="$ES/tests/golden/$sdir"
-        for f in "$dir"/*.envo; do
+        for f in "$dir"/*.envol; do
             base=$(basename "$f")
             name="stage1 $mode golden/$sdir/$base"
             if [ "$mode" = --core ]; then run "$dir" --core "$cmd" "$base"; else run "$dir" "$cmd" "$base"; fi
             if [ "$rc" -ne 0 ]; then bad "$name" "exit $rc: $(tr -d '\r' < "$TMP/err")"; continue; fi
-            tr -d '\r' < "${f%.envo}$ext" > "$TMP/expected"
+            tr -d '\r' < "${f%.envol}$ext" > "$TMP/expected"
             tr -d '\r' < "$TMP/out" > "$TMP/actual"
             if cmp -s "$TMP/expected" "$TMP/actual"; then pass
             else bad "$name" 'output differs:'; diff "$TMP/expected" "$TMP/actual" | head -n 10 || true; fi
@@ -504,7 +504,7 @@ do_test() {
         [ "$modes" = s1 ] && [ "$mode" = --core ] && continue
         say "stage 1 spec tests ($mode): tests/spec/$sdir"
         dir="$ES/tests/spec/$sdir"
-        for f in "$dir"/*.envo; do
+        for f in "$dir"/*.envol; do
             base=$(basename "$f")
             name="stage1 $mode spec/$sdir/$base"
             line=$(LC_ALL=C grep -a -m1 '^// expect-error: ' "$f" | tr -d '\r' || true)
@@ -523,12 +523,12 @@ do_test() {
     # Multi-file error tests, and Stage 1 checking its own source (D14).
     say "stage 1 multi-file tests (--core): tests/spec/core-multi"
     for d in "$ES"/tests/spec/core-multi/*/; do
-        line=$(grep -m1 '^// expect-error: ' "$d/main.envo" | tr -d '\r' || true)
+        line=$(grep -m1 '^// expect-error: ' "$d/main.envol" | tr -d '\r' || true)
         [ -n "$line" ] || continue
-        set -- main.envo
-        for f in "$d"*.envo; do
+        set -- main.envol
+        for f in "$d"*.envol; do
             f=$(basename "$f")
-            [ "$f" = main.envo ] || set -- "$@" "$f"
+            [ "$f" = main.envol ] || set -- "$@" "$f"
         done
         code=$(printf '%s\n' "$line" | sed 's|^// expect-error: \(E[0-9]*\) @ .*|\1|')
         want="${line##* @ }: error[$code]"
@@ -574,8 +574,8 @@ do_test() {
     say ''
     say 'stage 2: built by stage 1, it must behave as it does built by itself'
     envoc2="$BUILD2/envoc$(host_suffix)"
-    say 'stage 2 against envoc1: lex and parse on every .envo file in compiler/, stage1/, tests/; check on the run programs and goldens; eir on the run programs'
-    for f in $( (cd "$ES" && find compiler tests -name '*.envo'; cd "$ROOT" && find stage1 -name '*.envo') | LC_ALL=C sort); do
+    say 'stage 2 against envoc1: lex and parse on every .envol file in compiler/, stage1/, tests/; check on the run programs and goldens; eir on the run programs'
+    for f in $( (cd "$ES" && find compiler tests -name '*.envol'; cd "$ROOT" && find stage1 -name '*.envol') | LC_ALL=C sort); do
         case "$f" in stage1/*) froot=$ROOT ;; *) froot=$ES ;; esac
         dir="$froot/$(dirname "$f")"
         base=$(basename "$f")

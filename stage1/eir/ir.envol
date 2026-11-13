@@ -73,7 +73,7 @@ struct EInit {
 struct EFunc {
     str Name;       // without `@`
     bool Extern;
-    str Abi;        // "" for the Envo convention
+    str Abi;        // "" for the Envol convention
     u32 Ret;
     u32 NParams;
     u32 FirstBlock;

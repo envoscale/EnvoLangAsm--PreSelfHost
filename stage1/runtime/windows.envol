@@ -1,6 +1,6 @@
 // The Stage 1 runtime, part 2 for Windows: the OS layer over KERNEL32.dll, with Stage 0's
 // behaviour (bootstrap/stage0/platform/windows.eas). __wincall(k, a1, …, a10) is a target
-// intrinsic the backend encodes: it calls import k (x64/image.envo, WinImport) with the
+// intrinsic the backend encodes: it calls import k (x64/image.envol, WinImport) with the
 // Microsoft x64 convention. BOOL and DWORD results are 32 bits: only the low half of the
 // result is meaningful for them.
 

@@ -467,7 +467,7 @@ parse_function:
         call    p_kind
         cmp     eax, TK_RPAREN
         je      short .params_done
-        cmp     eax, TK_KW_IN           ; parameter modes and receivers are full Envo
+        cmp     eax, TK_KW_IN           ; parameter modes and receivers are full Envol
         je      near .not_core_keyword
         cmp     eax, TK_KW_REF
         je      near .not_core_keyword
@@ -867,7 +867,7 @@ parse_type:
         lea     rdi, [s_a_type]
         jmp     near p_error_expected
 
-; parse_decl_type - a Type in a declaration, where full Envo could continue
+; parse_decl_type - a Type in a declaration, where full Envol could continue
 ; with '?' (optional) or '<' (generic arguments): both are E0905 in Core.
 parse_decl_type:
         push    rbx
@@ -1668,7 +1668,7 @@ parse_primary:
         je      near .float
         cmp     eax, TK_LBRACKET
         je      near .array_literal
-        ; [core.syntax.5] a keyword only full Envo has
+        ; [core.syntax.5] a keyword only full Envol has
         cmp     eax, TK_KW_FIRST
         jb      short .expected
         cmp     eax, TK_KW_LAST

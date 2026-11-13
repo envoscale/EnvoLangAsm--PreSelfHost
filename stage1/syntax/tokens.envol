@@ -9,7 +9,7 @@ struct Token {
     u32 Start;      // byte offset in its file (after any BOM)
     u32 Len;
     u32 Line;
-    u32 File;       // index into the source file table (diag.envo)
+    u32 File;       // index into the source file table (diag.envol)
 }
 
 const u16 TF_SPACE_BEFORE = 1;

@@ -1,4 +1,4 @@
-# EAS — Envo Assembly (`.eas`)
+# EAS — Envol Assembly (`.eas`)
 
 > **Status:** Normative for the **Stage 0 subset** (§2–§6), which the Phase A adapter
 > (NASM), the hex seed's asm0 (`seed/`), and `envo asm` must all assemble to
@@ -130,6 +130,6 @@ document and, once it exists, the seed.
 
 `envo asm` will extend the subset with: sections and symbols for object output, all
 instruction set extensions through per-architecture encoding tables (SSE/AVX/AVX-512,
-AArch64, RISC-V), macros written in Envo `comptime` instead of a text preprocessor, and
-`{name}` operand bindings for inline `asm` blocks. Inline `asm { }` blocks use Envo
+AArch64, RISC-V), macros written in Envol `comptime` instead of a text preprocessor, and
+`{name}` operand bindings for inline `asm` blocks. Inline `asm { }` blocks use Envol
 comments (`//`) instead of `;`. This section becomes normative with M3.

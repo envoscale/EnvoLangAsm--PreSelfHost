@@ -97,7 +97,7 @@ void BindDataStart(*Asm a, u32 l) {
 // absolute address in its data. table holds their count, then each one's data offset
 // (WriteImage fills it); data0 is the data's start. The stub sits at the start of the
 // code, which the image puts at ELF_HEADERS, so the image's base is that much before.
-// Stage 2 emits the same bytes (compiler/backend/x86_64/asm.envo).
+// Stage 2 emits the same bytes (compiler/backend/x86_64/asm.envol).
 void RelocStub(*Asm a, u32 data0, u32 table) {
     B(a, 0x4C);                                 // lea r8, [rip - (ELF_HEADERS + 7)]: the base
     B(a, 0x8D);

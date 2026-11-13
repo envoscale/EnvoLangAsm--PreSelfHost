@@ -29,7 +29,7 @@ struct Parser {
     *Vec Nodes;     // Node
     bool Core;      // Envo-Core only (--core)
     bool InPattern; // parsing a match pattern: `_` allowed, no lambdas
-    Vec Undo;       // token splits to undo when backtracking (parser_s1.envo)
+    Vec Undo;       // token splits to undo when backtracking (parser_s1.envol)
 }
 
 struct NodeList {
@@ -310,7 +310,7 @@ u32 ParseFunction(*Parser p) {
     PExpect(p, TK_LPAREN);
     while (PKind(p) != TK_RPAREN) {
         u16 k = PKind(p);
-        // parameter modes and receivers are full Envo
+        // parameter modes and receivers are full Envol
         if (k == TK_KW_IN || k == TK_KW_REF || k == TK_KW_OUT || k == TK_KW_THIS) PErrNotCore(p, "", PPos(p));
         u32 ptype = ParseDeclType(p);
         u32 param = NodeNew(p, NK_PARAM, PExpect(p, TK_IDENT));
@@ -470,7 +470,7 @@ u32 ParseType(*Parser p) {
     return t;
 }
 
-// A Type in a declaration, where full Envo could continue with '?' or '<'.
+// A Type in a declaration, where full Envol could continue with '?' or '<'.
 u32 ParseDeclType(*Parser p) {
     u32 t = ParseType(p);
     bool core;
@@ -882,7 +882,7 @@ u32 ParsePrimary(*Parser p) {
     }
     if (k == TK_FLOAT) PErrNotCore(p, "floating-point literals", PPos(p));
     if (k == TK_LBRACKET) PErrNotCore(p, "array literals", PPos(p));
-    // [core.syntax.5] a keyword only full Envo has
+    // [core.syntax.5] a keyword only full Envol has
     if (k >= TK_KW_FIRST && k <= TK_KW_LAST && TokClass(k) & TC_CORE_KW == 0) PErrNotCore(p, "", PPos(p));
     PErrExpected(p, "an expression");
     return 0;

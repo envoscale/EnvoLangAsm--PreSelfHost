@@ -28,7 +28,7 @@ void SelfTestBuf() {
 void SelfTestText() {
     Expect(StrEq("abc", "abc") && !StrEq("abc", "abd") && !StrEq("ab", "abc"), "StrEq");
     Expect(StrStartsWith("envoc1", "envo") && !StrStartsWith("en", "envo"), "StrStartsWith");
-    Expect(StrEndsWith("main.envo", ".envo") && !StrEndsWith("main.eir", ".envo"), "StrEndsWith");
+    Expect(StrEndsWith("main.envol", ".envol") && !StrEndsWith("main.eir", ".envol"), "StrEndsWith");
     Expect(StrEq(StrSub("hello world", 6, 11), "world"), "StrSub");
     Expect(StrFind("a.b.c", '.', 2) == 3 && StrFind("abc", '.', 0) == 3, "StrFind");
     Expect(StrHash("") == 14695981039346656037 && StrHash("a") == 12638187200555641996, "StrHash (FNV-1a)");
@@ -79,7 +79,7 @@ void SelfTestDiag() {
         SrcPos("ab\ncd\u{e9}f", 8, &line, &col);
     }
     Expect(line == 2 && col == 5, "SrcPos counts characters");
-    u32 f = SrcAdd("bom.envo", "\u{feff}x");
+    u32 f = SrcAdd("bom.envol", "\u{feff}x");
     Expect(StrEq(SrcGet(f).Text, "x"), "SrcAdd drops a byte order mark");
 }
 

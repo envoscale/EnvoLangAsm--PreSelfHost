@@ -6,7 +6,7 @@
 struct Ctx {
     Buf Out;        // standard output, flushed at exit and when large
     Buf Err;        // standard error
-    Vec Files;      // SrcFile, in command-line order (diag.envo)
+    Vec Files;      // SrcFile, in command-line order (diag.envol)
 }
 
 static usize g_ctx = 0;

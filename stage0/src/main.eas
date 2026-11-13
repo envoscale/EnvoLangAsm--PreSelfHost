@@ -1,10 +1,10 @@
 ; =============================================================================
 ; src/main.eas - envoc0 command dispatch
 ;
-;   envoc0 lex <file.envo>     print the token stream
-;   envoc0 parse <file.envo>   print the syntax tree
-;   envoc0 check <file.envo>...   check names and types; print the typed tree
-;   envoc0 build <file.envo>... -o <output> [--target T]   compile to an executable
+;   envoc0 lex <file.envol>     print the token stream
+;   envoc0 parse <file.envol>   print the syntax tree
+;   envoc0 check <file.envol>...   check names and types; print the typed tree
+;   envoc0 build <file.envol>... -o <output> [--target T]   compile to an executable
 ;   (several files are one program; the first is the entry file)
 ;   envoc0 version            print the version (also --version)
 ;   envoc0 help                print usage (also --help)
@@ -455,11 +455,11 @@ s_usage:
         db      'usage: envoc0 <command> [arguments]', 10
         db      10
         db      'commands:', 10
-        db      '  lex <file.envo>     print the token stream of an Envo-Core source file', 10
-        db      '  parse <file.envo>   print the syntax tree of an Envo-Core source file', 10
-        db      '  check <file.envo>...', 10
+        db      '  lex <file.envol>     print the token stream of an Envo-Core source file', 10
+        db      '  parse <file.envol>   print the syntax tree of an Envo-Core source file', 10
+        db      '  check <file.envol>...', 10
         db      '                      check names and types; print the typed syntax tree', 10
-        db      '  build <file.envo>... -o <output> [--target x86_64-windows|x86_64-linux]', 10
+        db      '  build <file.envol>... -o <output> [--target x86_64-windows|x86_64-linux]', 10
         db      '                      compile to an executable (default: this OS)', 10
         db      '                      (several files are one program; the first is the entry file)', 10
         db      '  version             print the version', 10

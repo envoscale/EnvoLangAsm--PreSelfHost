@@ -78,7 +78,7 @@ NK_COUNT        equ 45
 
 TC_PREC         equ 0x0F                ; binary operator level 1-9 ([core.syntax.*]); 0 = not binary
 TC_ASSIGN       equ 0x10                ; assignment operator
-TC_NOT_CORE     equ 0x20                ; operator that only full Envo has
+TC_NOT_CORE     equ 0x20                ; operator that only full Envol has
 TC_CORE_KW      equ 0x40                ; keyword that Envo-Core uses
 PREC_COMPARE    equ 3                   ; comparisons do not associate
 

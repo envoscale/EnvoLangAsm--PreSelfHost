@@ -1,4 +1,4 @@
-// The Envo-S1 grammar (docs/spec/envo-s1.md). parser.envo calls these where Stage 0
+// The Envo-S1 grammar (docs/spec/envo-s1.md). parser.envol calls these where Stage 0
 // reports E0905 and the parser is not in --core mode, so Envo-Core programs parse exactly
 // as before ([s1.subset.2]).
 

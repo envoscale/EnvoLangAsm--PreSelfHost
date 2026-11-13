@@ -26,8 +26,8 @@ const u8 TYK_STRUCT = 8;
 const u8 TYK_ENUM = 9;
 const u8 TYK_PARAM = 10;    // a generic type parameter (Envo-S1)
 const u8 TYK_IFACE = 11;    // an interface, only as a bound or in `impl` (Envo-S1)
-const u8 TYK_FN = 12;       // a function type (Envo-S1, RFC 0003; check/closure.envo)
-const u8 TYK_UNION = 13;    // a tagged enum: payloads or type parameters (check/enums.envo)
+const u8 TYK_FN = 12;       // a function type (Envo-S1, RFC 0003; check/closure.envol)
+const u8 TYK_UNION = 13;    // a tagged enum: payloads or type parameters (check/enums.envol)
 
 // Fixed type indices, in Stage 0's order. 0 means "no type".
 const u32 T_VOID = 1;
@@ -57,7 +57,7 @@ struct Sym {
     u32 Aux;        // struct size; enum representation type; parameter count
     u32 Aux2;       // struct alignment; built-in id
     u32 Params;     // index of the first parameter type in Checker.ParamTypes
-    // Envo-S1 (check/generic.envo)
+    // Envo-S1 (check/generic.envol)
     u32 Flags;      // SF_*
     u32 NEnv;       // generic environment size: the owner's parameters, then the item's own
     u32 NOwn;       // how many of them come from the owner (struct, impl or interface)

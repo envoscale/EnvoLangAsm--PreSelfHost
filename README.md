@@ -1,16 +1,18 @@
+<img src="https://raw.githubusercontent.com/envoscale/EnvoScale/main/docs/images/logo.svg" alt="" width="56" align="left">
+
 # EnvoScaleAsm
 
-The Envo compiler, built up from assembly.
+The Envol compiler, built up from assembly.
 
 [EnvoScale](https://github.com/envoscale/EnvoScale) compiles itself. A compiler that
 compiles itself has to start from *some* binary, and you have to trust that binary. This
-repository is how you don't have to: it rebuilds the Envo compiler from a few kilobytes of
+repository is how you don't have to: it rebuilds the Envol compiler from a few kilobytes of
 assembly you can read, and checks the result.
 
 ```
 seed/     asm0, a tiny assembler written as hex you can check by eye
   ↓ assembles
-stage0/   envoc0, a compiler for a small subset of Envo, in x86-64 assembly
+stage0/   envoc0, a compiler for a small subset of Envol, in x86-64 assembly
   ↓ compiles
 stage1/   envoc1, a bigger compiler, written in that subset
   ↓ compiles

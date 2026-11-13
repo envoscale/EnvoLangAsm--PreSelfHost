@@ -159,7 +159,7 @@ u32 ViewOfLocal(*Checker c, *MoveCx x, u32 e) {
         return ViewOfLocal(c, x, node.C);
     }
     if (k == NK_CALL) {
-        // what the callee's result may view: its storage summary (check/views.envo); a
+        // what the callee's result may view: its storage summary (check/views.envol); a
         // built-in or a function value may view any argument
         u32 cs = NSym(c, e);
         u64 sum = 0xFFFFFFFFFFFFFFFF;
@@ -673,7 +673,7 @@ void MvCall(*Checker c, *MoveCx x, u32 n) {
     }
 }
 
-// MvCall, then the borrows the call holds while it runs (check/borrow.envo).
+// MvCall, then the borrows the call holds while it runs (check/borrow.envol).
 void MvCallChecked(*Checker c, *MoveCx x, u32 n) {
     MvCall(c, x, n);
     CheckCallBorrows(c, n);
